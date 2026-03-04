@@ -7,7 +7,7 @@
 import { Hono } from 'hono';
 import { drizzle } from 'drizzle-orm/d1';
 import { eq } from 'drizzle-orm';
-import { users } from '../db/schema';
+import { users, organizations, organizationUsers } from '../db/schema';
 import { authMiddleware } from '../middleware/auth';
 import { BadRequestError, NotFoundError } from '../middleware/error';
 import { generateSecureRandomString, verifyPassword } from '../services/crypto';
@@ -71,7 +71,35 @@ accounts.get('/profile', async (c) => {
         throw new NotFoundError('User not found.');
     }
 
-    return c.json(toProfileResponse(user));
+    // 获取组织数据
+    const orgsData = await db
+        .select({
+            org: organizations,
+            orgUser: organizationUsers,
+        })
+        .from(organizationUsers)
+        .innerJoin(organizations, eq(organizations.id, organizationUsers.organizationId))
+        .where(eq(organizationUsers.userId, userId))
+        .all();
+
+    const profileOrgs = orgsData.map(d => ({
+        id: d.org.id,
+        name: d.org.name,
+        useTotp: d.org.useTotp,
+        seats: d.org.seats,
+        maxStorageGb: d.org.maxStorageGb,
+        key: d.orgUser.key,
+        status: d.orgUser.status,
+        type: d.orgUser.type,
+        enabled: d.org.enabled,
+        permissions: d.orgUser.permissions ? JSON.parse(d.orgUser.permissions) : null,
+        object: 'profileOrganization',
+    }));
+
+    const response = toProfileResponse(user);
+    response.organizations = profileOrgs;
+
+    return c.json(response);
 });
 
 /**

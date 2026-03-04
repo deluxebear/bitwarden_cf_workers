@@ -7,6 +7,7 @@
  * /api/accounts/* - 用户账户管理
  * /api/ciphers/* - 密码条目 CRUD
  * /api/folders/* - 文件夹 CRUD
+ * /api/sends/* - Send 安全分享
  * /api/sync - 全量同步
  * /api/config - 服务端配置
  */
@@ -19,6 +20,11 @@ import identityRoutes from './routes/identity';
 import accountsRoutes from './routes/accounts';
 import ciphersRoutes from './routes/ciphers';
 import foldersRoutes from './routes/folders';
+import sendsRoutes from './routes/sends';
+import twoFactorRoutes from './routes/two-factor';
+import organizationsRoutes from './routes/organizations';
+import collectionsRoutes from './routes/collections';
+import eventsRoutes from './routes/events';
 import syncRoutes from './routes/sync';
 import configRoutes from './routes/config';
 import type { Bindings, Variables } from './types';
@@ -49,6 +55,11 @@ app.route('/identity', identityRoutes);
 app.route('/api/accounts', accountsRoutes);
 app.route('/api/ciphers', ciphersRoutes);
 app.route('/api/folders', foldersRoutes);
+app.route('/api/sends', sendsRoutes);
+app.route('/api/two-factor', twoFactorRoutes);
+app.route('/api/organizations', organizationsRoutes);
+app.route('/api/collections', collectionsRoutes);
+app.route('/api/events', eventsRoutes);
 app.route('/api/sync', syncRoutes);
 app.route('/api/config', configRoutes);
 

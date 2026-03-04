@@ -6,9 +6,11 @@
 
 import { Hono } from 'hono';
 import { drizzle } from 'drizzle-orm/d1';
-import { eq, and, isNull } from 'drizzle-orm';
-import { ciphers, users } from '../db/schema';
+import { eq, and, desc, isNull } from 'drizzle-orm';
+import { users, ciphers, folders, collectionCiphers, events } from '../db/schema';
 import { authMiddleware } from '../middleware/auth';
+import { logEvent } from '../services/events';
+import { toEventResponse } from './events';
 import { BadRequestError, NotFoundError } from '../middleware/error';
 import { generateUuid } from '../services/crypto';
 import type { Bindings, Variables, CipherRequest, CipherResponse, CipherType, CipherRepromptType } from '../types';
@@ -25,6 +27,22 @@ function toCipherResponse(cipher: any, userId: string): CipherResponse {
     const data = JSON.parse(cipher.data || '{}');
     const favorites = cipher.favorites ? JSON.parse(cipher.favorites) : {};
     const folders = cipher.folders ? JSON.parse(cipher.folders) : {};
+    const attachmentsMap = cipher.attachments ? JSON.parse(cipher.attachments) : {};
+    const attachments = Object.keys(attachmentsMap).map(id => {
+        const a = attachmentsMap[id];
+        const sizeBytes = parseInt(a.size || '0');
+        const sizeName = sizeBytes >= 1048576 ? `${(sizeBytes / 1048576).toFixed(2)} MB` :
+            sizeBytes >= 1024 ? `${(sizeBytes / 1024).toFixed(2)} KB` :
+                `${sizeBytes} Bytes`;
+        return {
+            id: id,
+            fileName: a.fileName,
+            key: a.key,
+            size: a.size || '0',
+            sizeName: sizeName,
+            url: `/api/ciphers/${cipher.id}/attachment/${id}` // 也可以使用真实 R2 代理路径
+        };
+    });
 
     return {
         id: cipher.id,
@@ -43,7 +61,7 @@ function toCipherResponse(cipher: any, userId: string): CipherResponse {
         sshKey: cipher.type === 5 ? data.sshKey : undefined,
         fields: data.fields || null,
         passwordHistory: data.passwordHistory || null,
-        attachments: null,
+        attachments: attachments.length > 0 ? attachments : null,
         organizationUseTotp: false,
         revisionDate: cipher.revisionDate,
         creationDate: cipher.creationDate,
@@ -104,6 +122,164 @@ ciphersRoute.get('/:id', async (c) => {
 });
 
 /**
+ * GET /api/ciphers/:id/events
+ * 对应 CiphersController.GetEvents
+ */
+ciphersRoute.get('/:id/events', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const cipherId = c.req.param('id');
+
+    const cipher = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
+    if (!cipher) throw new NotFoundError('Cipher not found');
+    if (cipher.userId !== userId && !cipher.organizationId) {
+        throw new NotFoundError('Cipher not found');
+    }
+
+    const cipherEvents = await db.select().from(events)
+        .where(eq(events.cipherId, cipherId))
+        .orderBy(desc(events.date))
+        .limit(50)
+        .all();
+
+    return c.json({
+        data: cipherEvents.map(toEventResponse),
+        object: 'list',
+        continuationToken: null,
+    });
+});
+
+/**
+ * POST /api/ciphers/:id/attachment
+ * 对应 CiphersController.PostAttachmentV1 (及 V2 等上传附件 API)
+ */
+const uploadAttachmentHandler = async (c: any) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const cipherId = c.req.param('id');
+
+    const cipher = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
+    if (!cipher) throw new NotFoundError('Cipher not found');
+    if (cipher.userId !== userId && !cipher.organizationId) {
+        throw new NotFoundError('Cipher not found');
+    }
+
+    const body = await c.req.parseBody();
+    const file = body['data'] as File; // 原始 Bitwarden 客户端上传 FormData 时往往将附件放在 `data` 属性内
+    if (!file) {
+        throw new BadRequestError('File data is required.');
+    }
+
+    const attachmentId = generateUuid();
+    // 存储在 R2 的 key = {cipherId}/{attachmentId}
+    const r2Key = `${cipherId}/${attachmentId}`;
+
+    await c.env.ATTACHMENTS.put(r2Key, file.stream(), {
+        httpMetadata: { contentType: file.type }
+    });
+
+    const attachmentsMap = cipher.attachments ? JSON.parse(cipher.attachments) : {};
+    attachmentsMap[attachmentId] = {
+        fileName: body.filename || file.name || 'file',
+        key: body.key || '',
+        size: file.size.toString()
+    };
+
+    const now = new Date().toISOString();
+    await db.update(ciphers).set({
+        attachments: JSON.stringify(attachmentsMap),
+        revisionDate: now
+    }).where(eq(ciphers.id, cipherId));
+
+    await logEvent(c.env.DB, 1103, { userId, cipherId });
+
+    const updated = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
+    return c.json(toCipherResponse(updated!, userId));
+};
+
+ciphersRoute.post('/:id/attachment', uploadAttachmentHandler);
+ciphersRoute.post('/:id/attachment-v2', uploadAttachmentHandler);
+ciphersRoute.post('/:id/attachment-admin', uploadAttachmentHandler);
+
+/**
+ * GET /api/ciphers/:id/attachment/:attachmentId
+ * 下载附件
+ */
+ciphersRoute.get('/:id/attachment/:attachmentId', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const cipherId = c.req.param('id');
+    const attachmentId = c.req.param('attachmentId');
+
+    const cipher = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
+    if (!cipher) throw new NotFoundError('Cipher not found');
+    if (cipher.userId !== userId && !cipher.organizationId) {
+        throw new NotFoundError('Cipher not found');
+    }
+
+    const attachmentsMap = cipher.attachments ? JSON.parse(cipher.attachments) : {};
+    if (!attachmentsMap[attachmentId]) {
+        throw new NotFoundError('Attachment metadata not found.');
+    }
+
+    const r2Key = `${cipherId}/${attachmentId}`;
+    const file = await c.env.ATTACHMENTS.get(r2Key);
+
+    if (!file) {
+        throw new NotFoundError('File not found in storage.');
+    }
+
+    const headers = new Headers();
+    if (file.httpMetadata?.contentType) {
+        headers.set('Content-Type', file.httpMetadata.contentType);
+    }
+    headers.set('Content-Disposition', `attachment; filename="${encodeURIComponent(attachmentsMap[attachmentId].fileName)}"`);
+    headers.set('Cache-Control', 'public, max-age=31536000');
+
+    return new Response(file.body, { headers });
+});
+
+/**
+ * DELETE /api/ciphers/:id/attachment/:attachmentId
+ * 删除附件
+ */
+const deleteAttachmentHandler = async (c: any) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const cipherId = c.req.param('id');
+    const attachmentId = c.req.param('attachmentId');
+
+    const cipher = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
+    if (!cipher) throw new NotFoundError('Cipher not found');
+    if (cipher.userId !== userId && !cipher.organizationId) {
+        throw new NotFoundError('Cipher not found');
+    }
+
+    const attachmentsMap = cipher.attachments ? JSON.parse(cipher.attachments) : {};
+    if (!attachmentsMap[attachmentId]) {
+        throw new NotFoundError('Attachment not found.');
+    }
+
+    const r2Key = `${cipherId}/${attachmentId}`;
+    await c.env.ATTACHMENTS.delete(r2Key);
+
+    delete attachmentsMap[attachmentId];
+
+    const now = new Date().toISOString();
+    await db.update(ciphers).set({
+        attachments: Object.keys(attachmentsMap).length > 0 ? JSON.stringify(attachmentsMap) : null,
+        revisionDate: now
+    }).where(eq(ciphers.id, cipherId));
+
+    await logEvent(c.env.DB, 1104, { userId, cipherId });
+
+    return c.json(null, 200);
+};
+
+ciphersRoute.delete('/:id/attachment/:attachmentId', deleteAttachmentHandler);
+ciphersRoute.delete('/:id/attachment/:attachmentId/admin', deleteAttachmentHandler);
+
+/**
  * POST /api/ciphers
  * 对应 CiphersController.Post
  */
@@ -155,10 +331,22 @@ ciphersRoute.post('/', async (c) => {
         revisionDate: now,
     });
 
-    // 更新用户的 account revision date
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
 
     const created = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
+
+    // 更新 CollectionCiphers
+    if (body.organizationId && body.collectionIds && body.collectionIds.length > 0) {
+        for (const colId of body.collectionIds) {
+            await db.insert(collectionCiphers).values({
+                collectionId: colId,
+                cipherId: cipherId,
+            }).onConflictDoNothing();
+        }
+    }
+
+    await logEvent(c.env.DB, 1100, { userId, cipherId });
+
     return c.json(toCipherResponse(created!, userId));
 });
 
@@ -212,6 +400,8 @@ ciphersRoute.post('/create', async (c) => {
     });
 
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+
+    await logEvent(c.env.DB, 1100, { userId, cipherId });
 
     const created = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
     return c.json(toCipherResponse(created!, userId));
@@ -330,6 +520,9 @@ ciphersRoute.post('/:id', async (c) => {
     }).where(eq(ciphers.id, id));
 
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+
+    await logEvent(c.env.DB, 1101, { userId, cipherId: id });
+
     const updated = await db.select().from(ciphers).where(eq(ciphers.id, id)).get();
     return c.json(toCipherResponse(updated!, userId));
 });
@@ -360,6 +553,8 @@ ciphersRoute.delete('/:id', async (c) => {
 
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
 
+    await logEvent(c.env.DB, 1115, { userId, cipherId });
+
     return c.json(null, 200);
 });
 
@@ -380,6 +575,8 @@ ciphersRoute.put('/:id/delete', async (c) => {
     await db.update(ciphers).set({ deletedDate: now, revisionDate: now }).where(eq(ciphers.id, cipherId));
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
 
+    await logEvent(c.env.DB, 1115, { userId, cipherId });
+
     return c.json(null, 200);
 });
 
@@ -399,6 +596,8 @@ ciphersRoute.put('/:id/restore', async (c) => {
     const now = new Date().toISOString();
     await db.update(ciphers).set({ deletedDate: null, revisionDate: now }).where(eq(ciphers.id, cipherId));
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+
+    await logEvent(c.env.DB, 1116, { userId, cipherId });
 
     const updated = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
     return c.json(toCipherResponse(updated!, userId));
@@ -421,6 +620,7 @@ ciphersRoute.post('/delete', async (c) => {
     for (const id of body.ids) {
         await db.update(ciphers).set({ deletedDate: now, revisionDate: now })
             .where(and(eq(ciphers.id, id), eq(ciphers.userId, userId)));
+        await logEvent(c.env.DB, 1115, { userId, cipherId: id });
     }
 
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));

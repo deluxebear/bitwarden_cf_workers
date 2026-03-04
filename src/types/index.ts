@@ -10,6 +10,7 @@ export type Bindings = {
     JWT_SECRET: string;
     JWT_EXPIRATION: string;
     JWT_REFRESH_EXPIRATION: string;
+    ATTACHMENTS: R2Bucket;
 };
 
 // Hono 应用变量
@@ -146,6 +147,11 @@ export interface TokenRequest {
     deviceIdentifier?: string;
     deviceName?: string;
     refresh_token?: string;
+    TwoFactorProvider?: number;
+    TwoFactorToken?: string;
+    TwoFactorRemember?: number;
+    twoFactorProvider?: number;
+    twoFactorToken?: string;
 }
 
 export interface TokenResponse {
@@ -219,7 +225,8 @@ export interface CipherRequest {
     sshKey?: any;
     fields?: any[];
     passwordHistory?: any[];
-    key?: string | null;
+    key?: string;
+    collectionIds?: string[];
 }
 
 export interface CipherResponse {
@@ -281,7 +288,7 @@ export interface SyncResponse {
     collections: any[];
     domains: DomainsResponse | null;
     policies: any[];
-    sends: any[];
+    sends: SendResponse[];
     userDecryption: UserDecryptionResponse | null;
     object: string;
 }
@@ -308,4 +315,96 @@ export interface GlobalEquivalentDomain {
     type: number;
     domains: string[];
     excluded: boolean;
+}
+
+// ------------- Send 类型 - 对应 Core/Tools/Entities/Send.cs -------------
+
+export enum SendType {
+    Text = 0,
+    File = 1,
+}
+
+export interface SendRequest {
+    type: SendType;
+    key: string;
+    name?: string;
+    notes?: string;
+    text?: { text: string; hidden: boolean } | null;
+    file?: any | null;
+    maxAccessCount?: number | null;
+    expirationDate?: string | null;
+    deletionDate: string;
+    password?: string | null;
+    disabled?: boolean;
+    hideEmail?: boolean;
+}
+
+export interface SendResponse {
+    id: string;
+    accessId: string;
+    userId: string | null;
+    type: SendType;
+    authType: number;
+    name: string | null;
+    notes: string | null;
+    text?: { text: string; hidden: boolean } | null;
+    file?: { id: string | null; fileName: string | null; size: number | null; sizeName: string | null } | null;
+    key: string | null;
+    maxAccessCount: number | null;
+    accessCount: number;
+    revisionDate: string;
+    expirationDate: string | null;
+    deletionDate: string;
+    password: string | null; // 客户端只需知道是否有密码
+    disabled: boolean;
+    hideEmail: boolean | null;
+    object: string;
+}
+
+export interface SendAccessResponse {
+    id: string;
+    type: SendType;
+    name: string | null;
+    text?: { text: string; hidden: boolean } | null;
+    file?: { id: string | null; fileName: string | null; size: number | null; sizeName: string | null } | null;
+    key: string | null;
+    expirationDate: string | null;
+    creatorIdentifier?: string;
+    object: string;
+}
+
+// ------------- 两步验证 (2FA) 类型 -------------
+
+export enum TwoFactorProviderType {
+    Authenticator = 0,
+    Email = 1,
+    Duo = 2,
+    YubiKey = 3,
+    U2f = 4,
+    Remember = 5,
+    OrganizationDuo = 6,
+    WebAuthn = 7
+}
+
+export interface TwoFactorProvider {
+    metaData: Record<string, any>;
+    enabled: boolean;
+}
+
+export interface TwoFactorProviderResponse {
+    type: number;
+    enabled: boolean;
+    object: string;
+}
+
+export interface TwoFactorAuthenticatorResponse {
+    enabled: boolean;
+    key: string;
+    userVerificationToken?: string | null;
+    object: string;
+}
+
+export interface TwoFactorRecoverResponse {
+    code: string;
+    object: string;
 }

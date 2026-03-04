@@ -69,6 +69,29 @@ export async function verifyPassword(
 }
 
 /**
+ * Hash Send 密码 - 使用 PBKDF2-SHA256
+ * Send 密码与 master password 不同，客户端直接发送原始密码
+ */
+export async function hashSendPassword(password: string): Promise<string> {
+    const encoder = new TextEncoder();
+    const keyMaterial = await crypto.subtle.importKey(
+        'raw', encoder.encode(password), 'PBKDF2', false, ['deriveBits']
+    );
+    const hash = await crypto.subtle.deriveBits({
+        name: 'PBKDF2',
+        salt: encoder.encode('bitwarden-send'),
+        iterations: 100000,
+        hash: 'SHA-256',
+    }, keyMaterial, 256);
+    return uint8ArrayToBase64(new Uint8Array(hash));
+}
+
+export async function verifySendPassword(password: string, storedHash: string): Promise<boolean> {
+    const hash = await hashSendPassword(password);
+    return hash === storedHash;
+}
+
+/**
  * 生成安全的随机 UUID v4
  */
 export function generateUuid(): string {

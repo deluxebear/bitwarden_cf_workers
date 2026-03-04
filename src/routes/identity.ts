@@ -10,8 +10,10 @@ import { eq } from 'drizzle-orm';
 import { users, devices, refreshTokens } from '../db/schema';
 import { signJwt } from '../middleware/auth';
 import { generateUuid, generateSecureRandomString, generateRefreshToken, sha256, verifyPassword } from '../services/crypto';
+import { verifyAuthenticatorCode } from '../services/totp';
+import { logEvent } from '../services/events';
 import { BadRequestError } from '../middleware/error';
-import type { Bindings, Variables, KdfType, PreloginRequest, PreloginResponse, RegisterRequest, TokenRequest } from '../types';
+import type { Bindings, Variables, KdfType, PreloginRequest, PreloginResponse, RegisterRequest, TokenRequest, TokenResponse } from '../types';
 
 const identity = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
@@ -131,6 +133,8 @@ identity.post('/connect/token', async (c) => {
             deviceIdentifier: formData['deviceIdentifier'] as string,
             deviceName: formData['deviceName'] as string,
             refresh_token: formData['refresh_token'] as string,
+            TwoFactorProvider: formData['TwoFactorProvider'] ? Number(formData['TwoFactorProvider']) : (formData['twoFactorProvider'] ? Number(formData['twoFactorProvider']) : undefined),
+            TwoFactorToken: (formData['TwoFactorToken'] || formData['twoFactorToken']) as string,
         };
     } else {
         body = await c.req.json<TokenRequest>();
@@ -188,6 +192,58 @@ async function handlePasswordGrant(c: any, db: any, body: TokenRequest) {
         lastFailedLoginDate: null,
     }).where(eq(users.id, user.id));
 
+    // ================= 检查二步验证 =================
+    let providers: any = {};
+    if (user.twoFactorProviders) {
+        try {
+            providers = JSON.parse(user.twoFactorProviders);
+        } catch { }
+    }
+
+    const enabledProviders = Object.keys(providers).filter(k => providers[k].enabled).map(Number);
+    if (enabledProviders.length > 0) {
+        // 支持大小写
+        const twoFactorProvider = body.TwoFactorProvider ?? body.twoFactorProvider;
+        const twoFactorToken = body.TwoFactorToken ?? body.twoFactorToken;
+
+        if (twoFactorProvider === undefined || !twoFactorToken) {
+            // 需要进行 2FA
+            return c.json({
+                error: 'invalid_grant',
+                error_description: 'TwoFactorProviders2',
+                TwoFactorProviders: enabledProviders,
+                TwoFactorProviders2: Object.fromEntries(enabledProviders.map(p => [p, null]))
+            }, 400);
+        }
+
+        const providerType = Number(twoFactorProvider);
+        if (!enabledProviders.includes(providerType)) {
+            return c.json({ error: 'invalid_grant', error_description: 'invalid_two_factor_provider', ErrorModel: { Message: 'Invalid 2FA provider.', Object: 'error' } }, 400);
+        }
+
+        const token = twoFactorToken;
+        const isRecoveryCode = token === user.twoFactorRecoveryCode;
+        let isValid = isRecoveryCode;
+
+        if (!isRecoveryCode) {
+            if (providerType === 0) { // Authenticator
+                const authProvider = providers[0];
+                isValid = verifyAuthenticatorCode(authProvider.metaData.Key, token);
+            } else {
+                return c.json({ error: 'invalid_grant', error_description: 'unsupported_provider', ErrorModel: { Message: 'Unsupported 2FA provider.', Object: 'error' } }, 400);
+            }
+        }
+
+        if (!isValid) {
+            return c.json({
+                error: 'invalid_grant',
+                error_description: 'invalid_totp_code',
+                ErrorModel: { Message: 'Invalid TOTP code.', Object: 'error' }
+            }, 400);
+        }
+    }
+    // ================= 2FA 检查完毕 =================
+
     // 处理设备
     let deviceId = generateUuid();
     if (body.deviceIdentifier) {
@@ -238,6 +294,13 @@ async function handlePasswordGrant(c: any, db: any, body: TokenRequest) {
         tokenHash: refreshTokenHash,
         expirationDate: new Date(Date.now() + refreshExpiresIn * 1000).toISOString(),
         creationDate: new Date().toISOString(),
+    });
+
+    // 记录审计日志
+    await logEvent(c.env.DB, 1000, {
+        userId: user.id,
+        deviceType: body.deviceType,
+        ipAddress: c.req.header('CF-Connecting-IP') || c.req.header('x-forwarded-for') || null,
     });
 
     return c.json({

@@ -16,3 +16,7 @@ migrations_dir = "drizzle"
 
 [dev]
 port = 8787
+
+[[r2_buckets]]
+binding = "ATTACHMENTS"
+bucket_name = "bitwarden-attachments"
