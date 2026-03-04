@@ -56,11 +56,15 @@ sync.get('/', async (c) => {
     const activeSends = userSends.filter(s => s.deletionDate > now);
 
     // 构建 accountKeys
-    const accountKeys: AccountKeysResponse | null = (user.publicKey || user.privateKey) ? {
-        publicKey: user.publicKey || null,
-        encPrivateKey: user.privateKey || null,
-        signedPublicKey: user.signedPublicKey || null,
-        object: 'accountKeys',
+    const accountKeys: AccountKeysResponse | null = (user.publicKey && user.privateKey) ? {
+        publicKeyEncryptionKeyPair: {
+            publicKey: user.publicKey,
+            wrappedPrivateKey: user.privateKey,
+            signedPublicKey: user.signedPublicKey || null,
+        },
+        signatureKeyPair: null,
+        securityState: null,
+        object: 'privateKeys',
     } : null;
 
     // 计算 twoFactorEnabled
@@ -200,6 +204,10 @@ sync.get('/', async (c) => {
         type: d.orgUser.type,
         enabled: d.org.enabled,
         useTotp: d.org.useTotp,
+        keyConnectorEnabled: false,
+        useEvents: false,
+        usePolicies: false,
+        usersGetPremium: false,
         object: 'profileOrganization',
     }));
 
@@ -222,6 +230,8 @@ sync.get('/', async (c) => {
                 organizationId: col.organizationId,
                 name: col.name,
                 revisionDate: col.revisionDate,
+                hidePasswords: false,
+                readOnly: false,
                 object: 'collection',
             });
 
@@ -313,9 +323,9 @@ sync.get('/', async (c) => {
             userId: send.userId,
             type: send.type as SendType,
             authType,
-            name: data?.name || null,
+            name: data?.name || '',
             notes: data?.notes || null,
-            key: send.key,
+            key: send.key || '',
             maxAccessCount: send.maxAccessCount,
             accessCount: send.accessCount,
             revisionDate: send.revisionDate,
@@ -335,7 +345,7 @@ sync.get('/', async (c) => {
         } else if (send.type === 1) {
             baseResponse.file = {
                 id: data?.id || null,
-                fileName: data?.file?.fileName || null,
+                fileName: data?.file?.fileName || '',
                 size: data?.file?.size || null,
                 sizeName: data?.file?.sizeName || null,
             };

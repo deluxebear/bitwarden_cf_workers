@@ -107,13 +107,17 @@ function toProfileResponse(user: any): ProfileResponse {
 }
 
 function buildAccountKeys(user: any): AccountKeysResponse | null {
-    if (!user.publicKey && !user.privateKey) return null;
-    return {
-        publicKey: user.publicKey || null,
-        encPrivateKey: user.privateKey || null,
-        signedPublicKey: user.signedPublicKey || null,
-        object: 'accountKeys',
-    };
+    const accountKeys: AccountKeysResponse | null = (user.publicKey && user.privateKey) ? {
+        publicKeyEncryptionKeyPair: {
+            publicKey: user.publicKey,
+            wrappedPrivateKey: user.privateKey,
+            signedPublicKey: user.signedPublicKey || null,
+        },
+        signatureKeyPair: null,
+        securityState: null,
+        object: 'privateKeys',
+    } : null;
+    return accountKeys;
 }
 
 /**

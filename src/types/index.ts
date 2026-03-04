@@ -204,10 +204,16 @@ export interface ProfileResponse {
     providerOrganizations: any[];
 }
 
-export interface AccountKeysResponse {
-    publicKey: string | null;
-    encPrivateKey: string | null;
+export interface PublicKeyEncryptionKeyPairResponse {
+    publicKey: string;
+    wrappedPrivateKey: string;
     signedPublicKey: string | null;
+}
+
+export interface AccountKeysResponse {
+    publicKeyEncryptionKeyPair: PublicKeyEncryptionKeyPairResponse;
+    signatureKeyPair: any | null;
+    securityState: any | null;
     object: string;
 }
 
