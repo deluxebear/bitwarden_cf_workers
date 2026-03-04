@@ -63,55 +63,6 @@ identity.post('/accounts/prelogin', async (c) => {
 });
 
 /**
- * POST /identity/accounts/register
- * 对应 Identity/Controllers/AccountsController.cs -> PostRegisterFinish
- * 用户注册
- */
-identity.post('/accounts/register', async (c) => {
-    const body = await c.req.json<RegisterRequest>();
-
-    if (!body.email || !body.masterPasswordHash) {
-        throw new BadRequestError('Email and master password hash are required.');
-    }
-
-    const db = drizzle(c.env.DB);
-    const email = body.email.toLowerCase().trim();
-
-    // 检查邮箱是否已注册
-    const existing = await db.select({ id: users.id }).from(users).where(eq(users.email, email)).get();
-    if (existing) {
-        throw new BadRequestError('Email is already taken.');
-    }
-
-    const now = new Date().toISOString();
-    const userId = generateUuid();
-
-    await db.insert(users).values({
-        id: userId,
-        name: body.name || null,
-        email,
-        emailVerified: false,
-        masterPassword: body.masterPasswordHash,
-        masterPasswordHint: body.masterPasswordHint || null,
-        culture: 'en-US',
-        securityStamp: generateSecureRandomString(50),
-        key: body.key,
-        publicKey: body.keys?.publicKey || null,
-        privateKey: body.keys?.encryptedPrivateKey || null,
-        kdf: body.kdf ?? 0,
-        kdfIterations: body.kdfIterations ?? 600000,
-        kdfMemory: body.kdfMemory ?? null,
-        kdfParallelism: body.kdfParallelism ?? null,
-        apiKey: generateSecureRandomString(30),
-        accountRevisionDate: now,
-        creationDate: now,
-        revisionDate: now,
-    });
-
-    return c.json(null, 200);
-});
-
-/**
  * POST /identity/connect/token
  * 对应原始项目 Identity 模块的 OAuth2 Token 端点
  * 支持 password grant (登录) 和 refresh_token grant (刷新)

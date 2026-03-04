@@ -15,7 +15,55 @@ import type { Bindings, Variables, ProfileResponse, AccountKeysResponse } from '
 
 const accounts = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
-// 所有端点都需要认证
+/**
+ * POST /api/accounts/register
+ * 用户注册 (免鉴权)
+ */
+accounts.post('/register', async (c) => {
+    const body = await c.req.json<any>(); // Reusing specific types or any for simplicity as it was imported in identity
+
+    if (!body.email || !body.masterPasswordHash) {
+        throw new BadRequestError('Email and master password hash are required.');
+    }
+
+    const db = drizzle(c.env.DB);
+    const email = body.email.toLowerCase().trim();
+
+    // 检查邮箱是否已注册
+    const existing = await db.select({ id: users.id }).from(users).where(eq(users.email, email)).get();
+    if (existing) {
+        throw new BadRequestError('Email is already taken.');
+    }
+
+    const now = new Date().toISOString();
+    const userId = crypto.randomUUID(); // generateUuid is in crypto.ts, we'll assume it's imported or we use crypto.randomUUID
+
+    await db.insert(users).values({
+        id: userId,
+        name: body.name || null,
+        email,
+        emailVerified: false,
+        masterPassword: body.masterPasswordHash,
+        masterPasswordHint: body.masterPasswordHint || null,
+        culture: 'en-US',
+        securityStamp: generateSecureRandomString(50),
+        key: body.key,
+        publicKey: body.keys?.publicKey || null,
+        privateKey: body.keys?.encryptedPrivateKey || null,
+        kdf: body.kdf ?? 0,
+        kdfIterations: body.kdfIterations ?? 600000,
+        kdfMemory: body.kdfMemory ?? null,
+        kdfParallelism: body.kdfParallelism ?? null,
+        apiKey: generateSecureRandomString(30),
+        accountRevisionDate: now,
+        creationDate: now,
+        revisionDate: now,
+    });
+
+    return c.json(null, 200);
+});
+
+// 其他端点都需要认证
 accounts.use('/*', authMiddleware);
 
 /**
