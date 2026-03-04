@@ -428,7 +428,7 @@ async function handlePasswordGrant(c: any, db: any, body: TokenRequest) {
         ipAddress: c.req.header('CF-Connecting-IP') || c.req.header('x-forwarded-for') || null,
     });
 
-    return c.json({
+    const response: any = {
         access_token: accessToken,
         expires_in: expiresIn,
         token_type: 'Bearer',
@@ -445,16 +445,27 @@ async function handlePasswordGrant(c: any, db: any, body: TokenRequest) {
         unofficialServer: false,
         UserDecryptionOptions: {
             hasMasterPassword: !!user.masterPassword,
-            masterPasswordUnlock: user.masterPassword ? {
-                kdf: user.kdf,
-                kdfIterations: user.kdfIterations,
-                kdfMemory: user.kdfMemory ?? null,
-                kdfParallelism: user.kdfParallelism ?? null,
-                salt: user.email.toLowerCase(),
-                masterKeyEncryptedUserKey: user.key || '',
-            } : null,
+            object: 'userDecryptionOptions',
         },
-    });
+    };
+
+    // 新版客户端需要 masterPasswordUnlock 字段（在 UserDecryptionOptions 内）
+    if (user.masterPassword && user.key) {
+        response.UserDecryptionOptions.masterPasswordUnlock = {
+            kdf: {
+                kdfType: user.kdf,
+                iterations: user.kdfIterations,
+                memory: user.kdfMemory ?? null,
+                parallelism: user.kdfParallelism ?? null,
+            },
+            masterKeyEncryptedUserKey: user.key,
+            salt: user.email.toLowerCase(),
+        };
+    }
+
+    console.log(`[TOKEN] Response for user ${user.email}: Kdf=${user.kdf}, KdfIterations=${user.kdfIterations}, HasKey=${!!user.key}, HasMasterPasswordUnlock=${!!response.UserDecryptionOptions.masterPasswordUnlock}`);
+
+    return c.json(response);
 }
 
 /**
@@ -514,7 +525,7 @@ async function handleRefreshTokenGrant(c: any, db: any, body: TokenRequest) {
         creationDate: new Date().toISOString(),
     });
 
-    return c.json({
+    const response: any = {
         access_token: accessToken,
         expires_in: expiresIn,
         token_type: 'Bearer',
@@ -531,16 +542,24 @@ async function handleRefreshTokenGrant(c: any, db: any, body: TokenRequest) {
         unofficialServer: false,
         UserDecryptionOptions: {
             hasMasterPassword: !!user.masterPassword,
-            masterPasswordUnlock: user.masterPassword ? {
-                kdf: user.kdf,
-                kdfIterations: user.kdfIterations,
-                kdfMemory: user.kdfMemory ?? null,
-                kdfParallelism: user.kdfParallelism ?? null,
-                salt: user.email.toLowerCase(),
-                masterKeyEncryptedUserKey: user.key || '',
-            } : null,
+            object: 'userDecryptionOptions',
         },
-    });
+    };
+
+    if (user.masterPassword && user.key) {
+        response.UserDecryptionOptions.masterPasswordUnlock = {
+            kdf: {
+                kdfType: user.kdf,
+                iterations: user.kdfIterations,
+                memory: user.kdfMemory ?? null,
+                parallelism: user.kdfParallelism ?? null,
+            },
+            masterKeyEncryptedUserKey: user.key,
+            salt: user.email.toLowerCase(),
+        };
+    }
+
+    return c.json(response);
 }
 
 export default identity;
