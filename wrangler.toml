@@ -7,6 +7,7 @@ compatibility_flags = ["nodejs_compat"]
 JWT_SECRET = "change-me-in-production"
 JWT_EXPIRATION = "3600"
 JWT_REFRESH_EXPIRATION = "2592000"
+GLOBAL_PREMIUM = "true"
 
 [[d1_databases]]
 binding = "DB"

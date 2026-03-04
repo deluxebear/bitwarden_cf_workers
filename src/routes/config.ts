@@ -26,7 +26,18 @@ config.get('/', async (c) => {
             notifications: '',
             sso: '',
         },
-        featureStates: {},
+        featureStates: {
+            // iOS app feature flags
+            'pm-19148-innovation-archive': true,    // Archive vault items (premium)
+            'cxp-export-mobile': true,              // Credential exchange export
+            'cxp-import-mobile': true,              // Credential exchange import
+            'cipher-key-encryption': true,          // Individual cipher encryption
+            'enableCipherKeyEncryption': true,      // SDK cipher key encryption
+            'pm-18021-force-update-kdf-settings': false, // Force KDF updates (keep off)
+            'pm-20558-migrate-myvault-to-myitems': true, // My Vault -> My Items
+            'pm-23995-no-logout-on-kdf-change': true,   // No logout on KDF change
+            'pm-19051-send-email-verification': false,   // Email verification (no email service)
+        },
         // 新增字段 - 对应 ConfigResponseModel
         push: {
             pushTechnology: 0, // SignalR

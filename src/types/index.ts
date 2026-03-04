@@ -11,6 +11,7 @@ export type Bindings = {
     JWT_EXPIRATION: string;
     JWT_REFRESH_EXPIRATION: string;
     ATTACHMENTS: R2Bucket;
+    GLOBAL_PREMIUM?: string;
 };
 
 // Hono 应用变量

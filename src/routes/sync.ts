@@ -77,13 +77,16 @@ sync.get('/', async (c) => {
     }
 
     // 构建 profile - 对应 ProfileResponseModel
+    const globalPremium = String(c.env.GLOBAL_PREMIUM).toLowerCase() === 'true';
+    const hasPremiumPersonally = user.premium || globalPremium;
+
     const profile: ProfileResponse = {
         id: user.id,
         name: user.name,
         email: user.email,
         emailVerified: user.emailVerified,
-        premium: user.premium,
-        premiumFromOrganization: false,
+        premium: hasPremiumPersonally,
+        premiumFromOrganization: false, // 会在组织查询后更新
         masterPasswordHint: user.masterPasswordHint,
         culture: user.culture,
         twoFactorEnabled: hasTwoFactor(user),
@@ -114,50 +117,6 @@ sync.get('/', async (c) => {
             personalCipherCollectionMap[cc.cipherId].push(cc.collectionId);
         }
     }
-
-    // 构建 ciphers 响应 - 对应 CipherDetailsResponseModel
-    const cipherResponses = userCiphers.map((cipher) => {
-        const data = JSON.parse(cipher.data || '{}');
-        const favorites = cipher.favorites ? JSON.parse(cipher.favorites) : {};
-        const foldersMap = cipher.folders ? JSON.parse(cipher.folders) : {};
-
-        return {
-            id: cipher.id,
-            organizationId: cipher.organizationId,
-            folderId: foldersMap[userId] || null,
-            type: cipher.type as CipherType,
-            data: data, // 原始 JSON - CipherMiniResponseModel 必返回
-            name: data.name || '',
-            notes: data.notes || null,
-            favorite: !!favorites[userId],
-            reprompt: (cipher.reprompt ?? 0) as CipherRepromptType,
-            login: cipher.type === 1 ? data.login : undefined,
-            card: cipher.type === 3 ? data.card : undefined,
-            identity: cipher.type === 4 ? data.identity : undefined,
-            secureNote: cipher.type === 2 ? data.secureNote : undefined,
-            sshKey: cipher.type === 5 ? data.sshKey : undefined,
-            fields: data.fields || null,
-            passwordHistory: data.passwordHistory || null,
-            attachments: null,
-            organizationUseTotp: false,
-            revisionDate: cipher.revisionDate,
-            creationDate: cipher.creationDate,
-            deletedDate: cipher.deletedDate,
-            archivedDate: null,
-            key: cipher.key,
-            object: 'cipherDetails',
-            collectionIds: personalCipherCollectionMap[cipher.id] || [],
-            edit: true,
-            viewPassword: true,
-            permissions: {
-                delete: true,
-                restore: true,
-                edit: true,
-                viewPassword: true,
-                manage: true,
-            },
-        };
-    });
 
     // 构建 folders 响应
     const folderResponses = userFolders.map((folder) => ({
@@ -203,11 +162,36 @@ sync.get('/', async (c) => {
         status: d.orgUser.status,
         type: d.orgUser.type,
         enabled: d.org.enabled,
-        useTotp: d.org.useTotp,
+        useTotp: d.org.useTotp ?? true,
+        use2fa: true,
+        useApi: true,
+        useSso: false,
+        useKeyConnector: false,
+        useScim: false,
+        useGroups: false,
+        useDirectory: false,
+        useEvents: true,
+        usePolicies: true,
+        useResetPassword: false,
+        useCustomPermissions: false,
+        useActivateAutofillPolicy: false,
+        useRiskInsights: false,
+        useOrganizationDomains: false,
+        useAdminSponsoredFamilies: false,
+        useSecretsManager: false,
+        usePhishingBlocker: false,
+        useDisableSMAdsForUsers: false,
+        usePasswordManager: true,
+        useMyItems: true,
+        useAutomaticUserConfirmation: false,
+        usersGetPremium: hasPremiumPersonally || (d.org.planType ?? 0) >= 1,
         keyConnectorEnabled: false,
-        useEvents: false,
-        usePolicies: false,
-        usersGetPremium: false,
+        maxStorageGb: d.org.maxStorageGb ?? 1,
+        seats: d.org.seats ?? 0,
+        maxCollections: null,
+        accessSecretsManager: false,
+        planProductType: d.org.planType ?? 0,
+        permissions: d.orgUser.permissions ? JSON.parse(d.orgUser.permissions) : null,
         object: 'profileOrganization',
     }));
 
@@ -258,6 +242,19 @@ sync.get('/', async (c) => {
 
     profile.organizations = profileOrganizations;
 
+    // 更新 premiumFromOrganization: 如果任何启用的组织授予 premium
+    const premiumFromOrg = profileOrganizations.some(o => o.enabled && o.usersGetPremium);
+    if (premiumFromOrg) {
+        profile.premiumFromOrganization = true;
+        profile.premium = true; // 组织授予的 premium 也算 premium
+    }
+
+    // 构建组织 useTotp 映射 (用于 cipher 的 organizationUseTotp)
+    const orgUseTotpMap: Record<string, boolean> = {};
+    for (const o of profileOrganizations) {
+        orgUseTotpMap[o.id] = o.useTotp;
+    }
+
     // 合并个人和组织 ciphers，并去重
     const allCiphers = [...userCiphers, ...orgCiphersData];
     const uniqueCipherIds = new Set();
@@ -290,7 +287,7 @@ sync.get('/', async (c) => {
             fields: data.fields || null,
             passwordHistory: data.passwordHistory || null,
             attachments: null,
-            organizationUseTotp: false,
+            organizationUseTotp: cipher.organizationId ? (orgUseTotpMap[cipher.organizationId] ?? false) : false,
             revisionDate: cipher.revisionDate,
             creationDate: cipher.creationDate,
             deletedDate: cipher.deletedDate,

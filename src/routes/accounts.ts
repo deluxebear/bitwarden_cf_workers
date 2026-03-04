@@ -79,13 +79,13 @@ function hasTwoFactorEnabled(user: any): boolean {
     }
 }
 
-function toProfileResponse(user: any): ProfileResponse {
+function toProfileResponse(user: any, env: Bindings): ProfileResponse {
     return {
         id: user.id,
         name: user.name,
         email: user.email,
         emailVerified: user.emailVerified,
-        premium: user.premium,
+        premium: user.premium || String(env.GLOBAL_PREMIUM).toLowerCase() === 'true',
         premiumFromOrganization: false, // 个人用户无组织 premium
         masterPasswordHint: user.masterPasswordHint,
         culture: user.culture,
@@ -144,22 +144,57 @@ accounts.get('/profile', async (c) => {
         .where(eq(organizationUsers.userId, userId))
         .all();
 
+    const globalPremium = String(c.env.GLOBAL_PREMIUM).toLowerCase() === 'true';
+
     const profileOrgs = orgsData.map(d => ({
         id: d.org.id,
         name: d.org.name,
-        useTotp: d.org.useTotp,
-        seats: d.org.seats,
-        maxStorageGb: d.org.maxStorageGb,
         key: d.orgUser.key,
         status: d.orgUser.status,
         type: d.orgUser.type,
         enabled: d.org.enabled,
+        useTotp: d.org.useTotp ?? true,
+        use2fa: true,
+        useApi: true,
+        useSso: false,
+        useKeyConnector: false,
+        useScim: false,
+        useGroups: false,
+        useDirectory: false,
+        useEvents: true,
+        usePolicies: true,
+        useResetPassword: false,
+        useCustomPermissions: false,
+        useActivateAutofillPolicy: false,
+        useRiskInsights: false,
+        useOrganizationDomains: false,
+        useAdminSponsoredFamilies: false,
+        useSecretsManager: false,
+        usePhishingBlocker: false,
+        useDisableSMAdsForUsers: false,
+        usePasswordManager: true,
+        useMyItems: true,
+        useAutomaticUserConfirmation: false,
+        usersGetPremium: globalPremium || (d.org.planType ?? 0) >= 1,
+        keyConnectorEnabled: false,
+        maxStorageGb: d.org.maxStorageGb ?? 1,
+        seats: d.org.seats ?? 0,
+        maxCollections: null,
+        accessSecretsManager: false,
+        planProductType: d.org.planType ?? 0,
         permissions: d.orgUser.permissions ? JSON.parse(d.orgUser.permissions) : null,
         object: 'profileOrganization',
     }));
 
-    const response = toProfileResponse(user);
+    const response = toProfileResponse(user, c.env);
     response.organizations = profileOrgs;
+
+    // 更新 premiumFromOrganization
+    const premiumFromOrg = profileOrgs.some(o => o.enabled && o.usersGetPremium);
+    if (premiumFromOrg) {
+        response.premiumFromOrganization = true;
+        response.premium = true;
+    }
 
     return c.json(response);
 });
@@ -187,7 +222,7 @@ accounts.put('/profile', async (c) => {
     }).where(eq(users.id, userId));
 
     const updated = await db.select().from(users).where(eq(users.id, userId)).get();
-    return c.json(toProfileResponse(updated!));
+    return c.json(toProfileResponse(updated!, c.env));
 });
 
 /**
@@ -210,7 +245,7 @@ accounts.post('/profile', async (c) => {
     }).where(eq(users.id, userId));
 
     const updated = await db.select().from(users).where(eq(users.id, userId)).get();
-    return c.json(toProfileResponse(updated!));
+    return c.json(toProfileResponse(updated!, c.env));
 });
 
 /**
@@ -359,7 +394,7 @@ accounts.put('/avatar', async (c) => {
 
     const updated = await db.select().from(users).where(eq(users.id, userId)).get();
     if (!updated) throw new NotFoundError('User not found.');
-    return c.json(toProfileResponse(updated));
+    return c.json(toProfileResponse(updated, c.env));
 });
 
 /**
