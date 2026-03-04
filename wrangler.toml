@@ -1,0 +1,18 @@
+name = "bitwarden-workers"
+main = "src/index.ts"
+compatibility_date = "2025-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+JWT_SECRET = "change-me-in-production"
+JWT_EXPIRATION = "3600"
+JWT_REFRESH_EXPIRATION = "2592000"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "bitwarden-db"
+database_id = "local"
+migrations_dir = "drizzle"
+
+[dev]
+port = 8787
