@@ -1,6 +1,7 @@
 /**
  * Bitwarden Workers - 类型定义
  * 对应原始项目的 Core/Entities + Core/Enums
+ * 已对齐官方 Bitwarden Server 响应模型
  */
 
 // Cloudflare Workers 环境绑定
@@ -95,7 +96,7 @@ export enum GrantType {
 
 // ------------- API 请求/响应模型 -------------
 
-// Prelogin
+// Prelogin - 对应 PasswordPreloginResponseModel.cs
 export interface PreloginRequest {
     email: string;
 }
@@ -105,6 +106,16 @@ export interface PreloginResponse {
     kdfIterations: number;
     kdfMemory?: number | null;
     kdfParallelism?: number | null;
+    // 新版字段
+    kdfSettings: KdfSettings;
+    salt: string | null;
+}
+
+export interface KdfSettings {
+    kdfType: KdfType;
+    iterations: number;
+    memory?: number | null;
+    parallelism?: number | null;
 }
 
 // Register
@@ -159,30 +170,40 @@ export interface UserDecryptionOptions {
     hasMasterPassword: boolean;
 }
 
-// Profile
+// Profile - 对应 ProfileResponseModel.cs
 export interface ProfileResponse {
     id: string;
     name: string | null;
     email: string;
     emailVerified: boolean;
     premium: boolean;
+    premiumFromOrganization: boolean;
     masterPasswordHint: string | null;
     culture: string;
     twoFactorEnabled: boolean;
     key: string | null;
     privateKey: string | null;
+    accountKeys: AccountKeysResponse | null;
     securityStamp: string;
     forcePasswordReset: boolean;
     usesKeyConnector: boolean;
     avatarColor: string | null;
     creationDate: string;
+    verifyDevices: boolean;
     object: string;
     organizations: any[];
     providers: any[];
     providerOrganizations: any[];
 }
 
-// Cipher 请求/响应
+export interface AccountKeysResponse {
+    accountPublicKey: string | null;
+    accountEncryptedPrivateKey: string | null;
+    signedPublicKey: string | null;
+    object: string;
+}
+
+// Cipher 请求/响应 - 对应 CipherResponseModel.cs
 export interface CipherRequest {
     type: CipherType;
     folderId?: string | null;
@@ -206,6 +227,7 @@ export interface CipherResponse {
     organizationId: string | null;
     folderId: string | null;
     type: CipherType;
+    data: any; // 原始加密 JSON 数据
     name: string;
     notes: string | null;
     favorite: boolean;
@@ -222,10 +244,21 @@ export interface CipherResponse {
     revisionDate: string;
     creationDate: string;
     deletedDate: string | null;
+    archivedDate: string | null;
     key: string | null;
     object: string;
+    collectionIds: string[];
     edit: boolean;
     viewPassword: boolean;
+    permissions: CipherPermissions | null;
+}
+
+export interface CipherPermissions {
+    delete: boolean;
+    restore: boolean;
+    edit: boolean;
+    viewPassword: boolean;
+    manage: boolean;
 }
 
 // Folder 请求/响应
@@ -240,7 +273,7 @@ export interface FolderResponse {
     object: string;
 }
 
-// Sync 响应
+// Sync 响应 - 对应 SyncResponseModel.cs
 export interface SyncResponse {
     profile: ProfileResponse;
     folders: FolderResponse[];
@@ -249,7 +282,20 @@ export interface SyncResponse {
     domains: DomainsResponse | null;
     policies: any[];
     sends: any[];
+    userDecryption: UserDecryptionResponse | null;
     object: string;
+}
+
+export interface UserDecryptionResponse {
+    masterPasswordUnlock: MasterPasswordUnlockResponse | null;
+    webAuthnPrfOptions: any[] | null;
+    v2UpgradeToken: any | null;
+}
+
+export interface MasterPasswordUnlockResponse {
+    kdf: KdfSettings;
+    masterKeyEncryptedUserKey: string;
+    salt: string;
 }
 
 export interface DomainsResponse {

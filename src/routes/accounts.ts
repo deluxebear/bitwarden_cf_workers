@@ -11,12 +11,52 @@ import { users } from '../db/schema';
 import { authMiddleware } from '../middleware/auth';
 import { BadRequestError, NotFoundError } from '../middleware/error';
 import { generateSecureRandomString, verifyPassword } from '../services/crypto';
-import type { Bindings, Variables, ProfileResponse } from '../types';
+import type { Bindings, Variables, ProfileResponse, AccountKeysResponse } from '../types';
 
 const accounts = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
 // 所有端点都需要认证
 accounts.use('/*', authMiddleware);
+
+/**
+ * 构建 ProfileResponse - 对应 ProfileResponseModel.cs
+ */
+function toProfileResponse(user: any): ProfileResponse {
+    return {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        emailVerified: user.emailVerified,
+        premium: user.premium,
+        premiumFromOrganization: false, // 个人用户无组织 premium
+        masterPasswordHint: user.masterPasswordHint,
+        culture: user.culture,
+        twoFactorEnabled: false,
+        key: user.key,
+        privateKey: user.privateKey,
+        accountKeys: buildAccountKeys(user),
+        securityStamp: user.securityStamp,
+        forcePasswordReset: user.forcePasswordReset,
+        usesKeyConnector: user.usesKeyConnector,
+        avatarColor: user.avatarColor,
+        creationDate: user.creationDate,
+        verifyDevices: true, // 默认开启设备验证
+        object: 'profile',
+        organizations: [],
+        providers: [],
+        providerOrganizations: [],
+    };
+}
+
+function buildAccountKeys(user: any): AccountKeysResponse | null {
+    if (!user.publicKey && !user.privateKey) return null;
+    return {
+        accountPublicKey: user.publicKey || null,
+        accountEncryptedPrivateKey: user.privateKey || null,
+        signedPublicKey: user.signedPublicKey || null,
+        object: 'accountKeys',
+    };
+}
 
 /**
  * GET /api/accounts/profile
@@ -31,29 +71,7 @@ accounts.get('/profile', async (c) => {
         throw new NotFoundError('User not found.');
     }
 
-    const response: ProfileResponse = {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        emailVerified: user.emailVerified,
-        premium: user.premium,
-        masterPasswordHint: user.masterPasswordHint,
-        culture: user.culture,
-        twoFactorEnabled: false,
-        key: user.key,
-        privateKey: user.privateKey,
-        securityStamp: user.securityStamp,
-        forcePasswordReset: user.forcePasswordReset,
-        usesKeyConnector: user.usesKeyConnector,
-        avatarColor: user.avatarColor,
-        creationDate: user.creationDate,
-        object: 'profile',
-        organizations: [],
-        providers: [],
-        providerOrganizations: [],
-    };
-
-    return c.json(response);
+    return c.json(toProfileResponse(user));
 });
 
 /**
@@ -79,37 +97,13 @@ accounts.put('/profile', async (c) => {
     }).where(eq(users.id, userId));
 
     const updated = await db.select().from(users).where(eq(users.id, userId)).get();
-
-    const response: ProfileResponse = {
-        id: updated!.id,
-        name: updated!.name,
-        email: updated!.email,
-        emailVerified: updated!.emailVerified,
-        premium: updated!.premium,
-        masterPasswordHint: updated!.masterPasswordHint,
-        culture: updated!.culture,
-        twoFactorEnabled: false,
-        key: updated!.key,
-        privateKey: updated!.privateKey,
-        securityStamp: updated!.securityStamp,
-        forcePasswordReset: updated!.forcePasswordReset,
-        usesKeyConnector: updated!.usesKeyConnector,
-        avatarColor: updated!.avatarColor,
-        creationDate: updated!.creationDate,
-        object: 'profile',
-        organizations: [],
-        providers: [],
-        providerOrganizations: [],
-    };
-
-    return c.json(response);
+    return c.json(toProfileResponse(updated!));
 });
 
 /**
  * POST /api/accounts/profile (alias for PUT)
  */
 accounts.post('/profile', async (c) => {
-    // Forward to PUT handler
     const db = drizzle(c.env.DB);
     const userId = c.get('userId');
     const body = await c.req.json<{ name?: string; masterPasswordHint?: string }>();
@@ -126,28 +120,7 @@ accounts.post('/profile', async (c) => {
     }).where(eq(users.id, userId));
 
     const updated = await db.select().from(users).where(eq(users.id, userId)).get();
-
-    return c.json({
-        id: updated!.id,
-        name: updated!.name,
-        email: updated!.email,
-        emailVerified: updated!.emailVerified,
-        premium: updated!.premium,
-        masterPasswordHint: updated!.masterPasswordHint,
-        culture: updated!.culture,
-        twoFactorEnabled: false,
-        key: updated!.key,
-        privateKey: updated!.privateKey,
-        securityStamp: updated!.securityStamp,
-        forcePasswordReset: updated!.forcePasswordReset,
-        usesKeyConnector: updated!.usesKeyConnector,
-        avatarColor: updated!.avatarColor,
-        creationDate: updated!.creationDate,
-        object: 'profile',
-        organizations: [],
-        providers: [],
-        providerOrganizations: [],
-    });
+    return c.json(toProfileResponse(updated!));
 });
 
 /**

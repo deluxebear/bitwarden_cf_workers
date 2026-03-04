@@ -31,6 +31,7 @@ function toCipherResponse(cipher: any, userId: string): CipherResponse {
         organizationId: cipher.organizationId,
         folderId: folders[userId] || null,
         type: cipher.type as CipherType,
+        data: data, // 原始加密 JSON - 官方 CipherMiniResponseModel 必返回
         name: data.name || '',
         notes: data.notes || null,
         favorite: !!favorites[userId],
@@ -47,10 +48,19 @@ function toCipherResponse(cipher: any, userId: string): CipherResponse {
         revisionDate: cipher.revisionDate,
         creationDate: cipher.creationDate,
         deletedDate: cipher.deletedDate,
+        archivedDate: null, // 归档日期 - CipherResponseModel
         key: cipher.key,
-        object: 'cipher',
+        object: 'cipherDetails', // 官方 Sync 使用 cipherDetails
+        collectionIds: [], // 个人 cipher 无 collection
         edit: true,
         viewPassword: true,
+        permissions: {
+            delete: true,
+            restore: true,
+            edit: true,
+            viewPassword: true,
+            manage: true,
+        },
     };
 }
 

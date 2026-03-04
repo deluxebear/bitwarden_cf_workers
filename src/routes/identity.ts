@@ -37,11 +37,24 @@ identity.post('/accounts/prelogin', async (c) => {
     }).from(users).where(eq(users.email, email)).get();
 
     // 即使用户不存在也返回默认 KDF 参数（防止用户枚举攻击）
+    const kdfType = (user?.kdf as KdfType) ?? 0;
+    const kdfIter = user?.kdfIterations ?? 600000;
+    const kdfMem = user?.kdfMemory ?? null;
+    const kdfPar = user?.kdfParallelism ?? null;
+
     const response: PreloginResponse = {
-        kdf: user?.kdf as KdfType ?? 0,
-        kdfIterations: user?.kdfIterations ?? 600000,
-        kdfMemory: user?.kdfMemory ?? null,
-        kdfParallelism: user?.kdfParallelism ?? null,
+        kdf: kdfType,
+        kdfIterations: kdfIter,
+        kdfMemory: kdfMem,
+        kdfParallelism: kdfPar,
+        // 新版字段 - 对应 PasswordPreloginResponseModel
+        kdfSettings: {
+            kdfType: kdfType,
+            iterations: kdfIter,
+            memory: kdfMem,
+            parallelism: kdfPar,
+        },
+        salt: email, // 与官方一致，返回 email 作为 salt
     };
 
     return c.json(response);

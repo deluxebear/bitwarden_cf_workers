@@ -6,11 +6,15 @@
 
 import { Hono } from 'hono';
 import { drizzle } from 'drizzle-orm/d1';
-import { eq, isNull } from 'drizzle-orm';
+import { eq } from 'drizzle-orm';
 import { users, ciphers, folders } from '../db/schema';
 import { authMiddleware } from '../middleware/auth';
 import { NotFoundError } from '../middleware/error';
-import type { Bindings, Variables, CipherType, CipherRepromptType, ProfileResponse, SyncResponse, GlobalEquivalentDomain } from '../types';
+import type {
+    Bindings, Variables, CipherType, CipherRepromptType,
+    ProfileResponse, SyncResponse, GlobalEquivalentDomain,
+    AccountKeysResponse, UserDecryptionResponse, KdfSettings,
+} from '../types';
 
 const sync = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
@@ -41,34 +45,45 @@ sync.get('/', async (c) => {
     // 获取所有文件夹
     const userFolders = await db.select().from(folders).where(eq(folders.userId, userId)).all();
 
-    // 获取所有未删除的 ciphers
+    // 获取所有 ciphers（包括已删除的，客户端需要知道）
     const userCiphers = await db.select().from(ciphers)
         .where(eq(ciphers.userId, userId)).all();
 
-    // 构建 profile
+    // 构建 accountKeys
+    const accountKeys: AccountKeysResponse | null = (user.publicKey || user.privateKey) ? {
+        accountPublicKey: user.publicKey || null,
+        accountEncryptedPrivateKey: user.privateKey || null,
+        signedPublicKey: user.signedPublicKey || null,
+        object: 'accountKeys',
+    } : null;
+
+    // 构建 profile - 对应 ProfileResponseModel
     const profile: ProfileResponse = {
         id: user.id,
         name: user.name,
         email: user.email,
         emailVerified: user.emailVerified,
         premium: user.premium,
+        premiumFromOrganization: false,
         masterPasswordHint: user.masterPasswordHint,
         culture: user.culture,
         twoFactorEnabled: false,
         key: user.key,
         privateKey: user.privateKey,
+        accountKeys,
         securityStamp: user.securityStamp,
         forcePasswordReset: user.forcePasswordReset,
         usesKeyConnector: user.usesKeyConnector,
         avatarColor: user.avatarColor,
         creationDate: user.creationDate,
+        verifyDevices: true,
         object: 'profile',
         organizations: [],
         providers: [],
         providerOrganizations: [],
     };
 
-    // 构建 ciphers 响应
+    // 构建 ciphers 响应 - 对应 CipherDetailsResponseModel
     const cipherResponses = userCiphers.map((cipher) => {
         const data = JSON.parse(cipher.data || '{}');
         const favorites = cipher.favorites ? JSON.parse(cipher.favorites) : {};
@@ -79,6 +94,7 @@ sync.get('/', async (c) => {
             organizationId: cipher.organizationId,
             folderId: foldersMap[userId] || null,
             type: cipher.type as CipherType,
+            data: data, // 原始 JSON - CipherMiniResponseModel 必返回
             name: data.name || '',
             notes: data.notes || null,
             favorite: !!favorites[userId],
@@ -95,10 +111,19 @@ sync.get('/', async (c) => {
             revisionDate: cipher.revisionDate,
             creationDate: cipher.creationDate,
             deletedDate: cipher.deletedDate,
+            archivedDate: null,
             key: cipher.key,
-            object: 'cipher',
+            object: 'cipherDetails',
+            collectionIds: [],
             edit: true,
             viewPassword: true,
+            permissions: {
+                delete: true,
+                restore: true,
+                edit: true,
+                viewPassword: true,
+                manage: true,
+            },
         };
     });
 
@@ -109,6 +134,24 @@ sync.get('/', async (c) => {
         revisionDate: folder.revisionDate,
         object: 'folder',
     }));
+
+    // 构建 UserDecryption - 对应 SyncResponseModel 的 UserDecryption 字段
+    const kdfSettings: KdfSettings = {
+        kdfType: user.kdf as any,
+        iterations: user.kdfIterations,
+        memory: user.kdfMemory,
+        parallelism: user.kdfParallelism,
+    };
+
+    const userDecryption: UserDecryptionResponse = {
+        masterPasswordUnlock: user.masterPassword ? {
+            kdf: kdfSettings,
+            masterKeyEncryptedUserKey: user.key || '',
+            salt: user.email.toLowerCase(),
+        } : null,
+        webAuthnPrfOptions: null,
+        v2UpgradeToken: null,
+    };
 
     const response: SyncResponse = {
         profile,
@@ -122,6 +165,7 @@ sync.get('/', async (c) => {
         },
         policies: [],
         sends: [],
+        userDecryption,
         object: 'sync',
     };
 

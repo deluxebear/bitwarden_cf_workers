@@ -1,7 +1,7 @@
 /**
  * Bitwarden Workers - Config 路由
  * 对应原始项目 Api/Controllers/ConfigController.cs
- * 返回服务端配置信息
+ * 返回服务端配置信息 - 对齐 ConfigResponseModel.cs
  */
 
 import { Hono } from 'hono';
@@ -30,6 +30,15 @@ config.get('/', async (c) => {
             sso: '',
         },
         featureStates: {},
+        // 新增字段 - 对应 ConfigResponseModel
+        push: {
+            pushTechnology: 0, // SignalR
+            vapidPublicKey: null,
+        },
+        communication: null,
+        settings: {
+            disableUserRegistration: false,
+        },
         object: 'config',
     });
 });
