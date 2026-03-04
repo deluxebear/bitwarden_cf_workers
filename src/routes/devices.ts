@@ -91,4 +91,68 @@ devicesRoute.get('/identifier/:identifier', async (c) => {
     });
 });
 
+/**
+ * PUT /api/devices/identifier/:identifier/token
+ * 更新设备 Push Token
+ */
+devicesRoute.put('/identifier/:identifier/token', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const identifier = c.req.param('identifier');
+
+    let pushToken: string;
+    try {
+        const body = await c.req.json();
+        pushToken = body.pushToken;
+    } catch {
+        return c.json({ message: 'Invalid JSON.', object: 'error' }, 400);
+    }
+
+    if (!pushToken) {
+        return c.json({ message: 'Push token is required.', object: 'error' }, 400);
+    }
+
+    const device = await db.select({ id: devices.id })
+        .from(devices)
+        .where(and(eq(devices.userId, userId), eq(devices.identifier, identifier)))
+        .get();
+
+    if (!device) {
+        return c.json({ message: 'Device not found.', object: 'error' }, 404);
+    }
+
+    await db.update(devices)
+        .set({ pushToken, revisionDate: new Date().toISOString() })
+        .where(eq(devices.id, device.id))
+        .execute();
+
+    return c.json({});
+});
+
+/**
+ * PUT /api/devices/identifier/:identifier/clear-token
+ * 清除设备 Push Token
+ */
+devicesRoute.put('/identifier/:identifier/clear-token', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const identifier = c.req.param('identifier');
+
+    const device = await db.select({ id: devices.id })
+        .from(devices)
+        .where(and(eq(devices.userId, userId), eq(devices.identifier, identifier)))
+        .get();
+
+    if (!device) {
+        return c.json({ message: 'Device not found.', object: 'error' }, 404);
+    }
+
+    await db.update(devices)
+        .set({ pushToken: null, revisionDate: new Date().toISOString() })
+        .where(eq(devices.id, device.id))
+        .execute();
+
+    return c.json({});
+});
+
 export default devicesRoute;

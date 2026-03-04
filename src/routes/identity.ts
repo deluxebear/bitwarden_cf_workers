@@ -6,7 +6,7 @@
 
 import { Hono } from 'hono';
 import { drizzle } from 'drizzle-orm/d1';
-import { eq } from 'drizzle-orm';
+import { eq, and } from 'drizzle-orm';
 import { users, devices, refreshTokens } from '../db/schema';
 import { signJwt } from '../middleware/auth';
 import { generateUuid, generateSecureRandomString, generateRefreshToken, sha256, verifyPassword } from '../services/crypto';
@@ -373,7 +373,7 @@ async function handlePasswordGrant(c: any, db: any, body: TokenRequest) {
     let deviceId = generateUuid();
     if (body.deviceIdentifier) {
         const existingDevice = await db.select().from(devices)
-            .where(eq(devices.identifier, body.deviceIdentifier)).get();
+            .where(and(eq(devices.userId, user.id), eq(devices.identifier, body.deviceIdentifier))).get();
         if (existingDevice) {
             deviceId = existingDevice.id;
             await db.update(devices).set({
