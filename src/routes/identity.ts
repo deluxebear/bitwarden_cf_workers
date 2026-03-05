@@ -436,6 +436,12 @@ async function handlePasswordGrant(c: any, db: any, body: TokenRequest) {
         refresh_token: refreshToken,
         Key: user.key,
         PrivateKey: user.privateKey,
+        AccountKeys: {
+            publicKeyEncryptionKeyPair: {
+                wrappedPrivateKey: user.privateKey || '',
+                publicKey: user.publicKey || '',
+            }
+        },
         Kdf: user.kdf,
         KdfIterations: user.kdfIterations,
         KdfMemory: user.kdfMemory,
