@@ -20,11 +20,50 @@ const ciphersRoute = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 // 所有端点都需要认证
 ciphersRoute.use('/*', authMiddleware);
 
+/** 从请求 URL 中提取 baseUrl（protocol + host），用于构建附件绝对下载 URL */
+function getBaseUrl(c: any): string {
+    const url = new URL(c.req.url);
+    return `${url.protocol}//${url.host}`;
+}
+
+/**
+ * 从 multipart form 中提取上传文件
+ * 官方 .NET 服务端用 Request.Form.Files.FirstOrDefault() 获取第一个文件，
+ * 不依赖特定字段名。这里兼容 'data'、'file' 以及任意字段名的 File。
+ */
+async function extractFileFromRequest(c: any): Promise<{ file: File; formData: Record<string, any> }> {
+    const formData = await c.req.parseBody({ all: true });
+    // 优先检查 'data' 字段（官方客户端标准字段名）
+    if (formData['data'] instanceof File) {
+        return { file: formData['data'], formData };
+    }
+    // 兼容 'file' 字段名
+    if (formData['file'] instanceof File) {
+        return { file: formData['file'], formData };
+    }
+    // 最后遍历所有字段，找到第一个 File 对象
+    for (const key of Object.keys(formData)) {
+        const val = formData[key];
+        if (val instanceof File) {
+            return { file: val, formData };
+        }
+        // parseBody({ all: true }) 可能返回数组
+        if (Array.isArray(val)) {
+            for (const item of val) {
+                if (item instanceof File) {
+                    return { file: item, formData };
+                }
+            }
+        }
+    }
+    throw new BadRequestError('File data is required.');
+}
+
 /**
  * 将数据库记录转换为 Bitwarden API 响应格式
  * objectType: "cipher" 用于单个 CRUD 端点, "cipherDetails" 用于列表/sync
  */
-function toCipherResponse(cipher: any, userId: string, objectType: 'cipher' | 'cipherDetails' = 'cipher'): CipherResponse {
+function toCipherResponse(cipher: any, userId: string, baseUrl: string, objectType: 'cipher' | 'cipherDetails' = 'cipher'): CipherResponse {
     const data = JSON.parse(cipher.data || '{}');
     const favorites = cipher.favorites ? JSON.parse(cipher.favorites) : {};
     const folders = cipher.folders ? JSON.parse(cipher.folders) : {};
@@ -41,7 +80,7 @@ function toCipherResponse(cipher: any, userId: string, objectType: 'cipher' | 'c
             key: a.key,
             size: a.size || '0',
             sizeName: sizeName,
-            url: `/api/ciphers/${cipher.id}/attachment/${id}` // 也可以使用真实 R2 代理路径
+            url: `${baseUrl}/attachments/${cipher.id}/${id}`
         };
     });
 
@@ -94,7 +133,8 @@ ciphersRoute.get('/', async (c) => {
     const results = await db.select().from(ciphers)
         .where(and(eq(ciphers.userId, userId), isNull(ciphers.deletedDate))).all();
 
-    const data = results.map((cipher) => toCipherResponse(cipher, userId, 'cipherDetails'));
+    const baseUrl = getBaseUrl(c);
+    const data = results.map((cipher) => toCipherResponse(cipher, userId, baseUrl, 'cipherDetails'));
 
     return c.json({
         data,
@@ -119,7 +159,7 @@ ciphersRoute.get('/:id', async (c) => {
         throw new NotFoundError('Cipher not found.');
     }
 
-    return c.json(toCipherResponse(cipher, userId));
+    return c.json(toCipherResponse(cipher, userId, getBaseUrl(c)));
 });
 
 /**
@@ -165,11 +205,7 @@ const uploadAttachmentHandler = async (c: any) => {
         throw new NotFoundError('Cipher not found');
     }
 
-    const body = await c.req.parseBody();
-    const file = body['data'] as File; // 原始 Bitwarden 客户端上传 FormData 时往往将附件放在 `data` 属性内
-    if (!file) {
-        throw new BadRequestError('File data is required.');
-    }
+    const { file, formData } = await extractFileFromRequest(c);
 
     const attachmentId = generateUuid();
     // 存储在 R2 的 key = {cipherId}/{attachmentId}
@@ -181,8 +217,8 @@ const uploadAttachmentHandler = async (c: any) => {
 
     const attachmentsMap = cipher.attachments ? JSON.parse(cipher.attachments) : {};
     attachmentsMap[attachmentId] = {
-        fileName: body.filename || file.name || 'file',
-        key: body.key || '',
+        fileName: formData.filename || file.name || 'file',
+        key: formData.key || '',
         size: file.size.toString()
     };
 
@@ -195,7 +231,7 @@ const uploadAttachmentHandler = async (c: any) => {
     await logEvent(c.env.DB, 1103, { userId, cipherId });
 
     const updated = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
-    return c.json(toCipherResponse(updated!, userId));
+    return c.json(toCipherResponse(updated!, userId, getBaseUrl(c)));
 };
 
 ciphersRoute.post('/:id/attachment', uploadAttachmentHandler);
@@ -248,9 +284,9 @@ ciphersRoute.post('/:id/attachment/v2', async (c) => {
 
     return c.json({
         attachmentId,
-        url: `/api/ciphers/${cipherId}/attachment/${attachmentId}`,
+        url: `${cipherId}/attachment/${attachmentId}`,
         fileUploadType: 0, // Direct
-        cipherResponse: toCipherResponse(updated!, userId),
+        cipherResponse: toCipherResponse(updated!, userId, getBaseUrl(c), 'cipherDetails'),
         cipherMiniResponse: null,
         object: 'attachment-fileUpload',
     });
@@ -277,11 +313,7 @@ ciphersRoute.post('/:id/attachment/:attachmentId', async (c) => {
         throw new NotFoundError('Attachment not found.');
     }
 
-    const body = await c.req.parseBody();
-    const file = body['data'] as File;
-    if (!file) {
-        throw new BadRequestError('File data is required.');
-    }
+    const { file } = await extractFileFromRequest(c);
 
     // 上传到 R2
     const r2Key = `${cipherId}/${attachmentId}`;
@@ -314,7 +346,7 @@ ciphersRoute.get('/:id/attachment/:attachmentId/renew', async (c) => {
     const attachmentId = c.req.param('attachmentId');
 
     return c.json({
-        url: `/api/ciphers/${cipherId}/attachment/${attachmentId}`,
+        url: `${cipherId}/attachment/${attachmentId}`,
         fileUploadType: 0, // Direct
         object: 'attachment-fileUpload',
     });
@@ -338,7 +370,8 @@ ciphersRoute.get('/:id/attachment/:attachmentId', async (c) => {
     }
 
     const attachmentsMap = cipher.attachments ? JSON.parse(cipher.attachments) : {};
-    if (!attachmentsMap[attachmentId]) {
+    const meta = attachmentsMap[attachmentId];
+    if (!meta) {
         throw new NotFoundError('Attachment metadata not found.');
     }
 
@@ -346,7 +379,20 @@ ciphersRoute.get('/:id/attachment/:attachmentId', async (c) => {
     const baseUrl = new URL(c.req.url);
     const downloadUrl = `${baseUrl.protocol}//${baseUrl.host}/attachments/${cipherId}/${attachmentId}`;
 
-    return c.json({ url: downloadUrl });
+    const sizeBytes = parseInt(meta.size || '0');
+    const sizeName = sizeBytes >= 1048576 ? `${(sizeBytes / 1048576).toFixed(2)} MB` :
+        sizeBytes >= 1024 ? `${(sizeBytes / 1024).toFixed(2)} KB` :
+            `${sizeBytes} Bytes`;
+
+    return c.json({
+        id: attachmentId,
+        url: downloadUrl,
+        fileName: meta.fileName,
+        key: meta.key,
+        size: meta.size || '0',
+        sizeName: sizeName,
+        object: 'attachment',
+    });
 });
 
 /**
@@ -376,14 +422,21 @@ const deleteAttachmentHandler = async (c: any) => {
     delete attachmentsMap[attachmentId];
 
     const now = new Date().toISOString();
+    const updatedAttachments = Object.keys(attachmentsMap).length > 0 ? JSON.stringify(attachmentsMap) : null;
     await db.update(ciphers).set({
-        attachments: Object.keys(attachmentsMap).length > 0 ? JSON.stringify(attachmentsMap) : null,
+        attachments: updatedAttachments,
         revisionDate: now
     }).where(eq(ciphers.id, cipherId));
 
     await logEvent(c.env.DB, 1104, { userId, cipherId });
 
-    return c.json(null, 200);
+    // 官方返回 DeleteAttachmentResponseModel，包含更新后的 cipher
+    const updatedCipher = { ...cipher, attachments: updatedAttachments, revisionDate: now };
+    const baseUrl = getBaseUrl(c);
+    return c.json({
+        cipher: toCipherResponse(updatedCipher, userId, baseUrl, 'cipher'),
+        object: 'deleteAttachment',
+    }, 200);
 };
 
 ciphersRoute.delete('/:id/attachment/:attachmentId', deleteAttachmentHandler);
@@ -457,7 +510,7 @@ ciphersRoute.post('/', async (c) => {
 
     await logEvent(c.env.DB, 1100, { userId, cipherId });
 
-    return c.json(toCipherResponse(created!, userId));
+    return c.json(toCipherResponse(created!, userId, getBaseUrl(c)));
 });
 
 /**
@@ -514,7 +567,7 @@ ciphersRoute.post('/create', async (c) => {
     await logEvent(c.env.DB, 1100, { userId, cipherId });
 
     const created = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
-    return c.json(toCipherResponse(created!, userId));
+    return c.json(toCipherResponse(created!, userId, getBaseUrl(c)));
 });
 
 /**
@@ -574,7 +627,7 @@ ciphersRoute.put('/:id', async (c) => {
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
 
     const updated = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
-    return c.json(toCipherResponse(updated!, userId));
+    return c.json(toCipherResponse(updated!, userId, getBaseUrl(c)));
 });
 
 /**
@@ -634,7 +687,7 @@ ciphersRoute.post('/:id', async (c) => {
     await logEvent(c.env.DB, 1101, { userId, cipherId: id });
 
     const updated = await db.select().from(ciphers).where(eq(ciphers.id, id)).get();
-    return c.json(toCipherResponse(updated!, userId));
+    return c.json(toCipherResponse(updated!, userId, getBaseUrl(c)));
 });
 
 /**
@@ -710,7 +763,7 @@ ciphersRoute.put('/:id/restore', async (c) => {
     await logEvent(c.env.DB, 1116, { userId, cipherId });
 
     const updated = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
-    return c.json(toCipherResponse(updated!, userId));
+    return c.json(toCipherResponse(updated!, userId, getBaseUrl(c)));
 });
 
 /**

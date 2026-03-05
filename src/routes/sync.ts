@@ -258,6 +258,8 @@ sync.get('/', async (c) => {
     // 合并个人和组织 ciphers，并去重
     const allCiphers = [...userCiphers, ...orgCiphersData];
     const uniqueCipherIds = new Set();
+    const reqUrl = new URL(c.req.url);
+    const attachmentBaseUrl = `${reqUrl.protocol}//${reqUrl.host}`;
     const formattedCiphers = allCiphers.filter(cipher => {
         if (uniqueCipherIds.has(cipher.id)) {
             return false;
@@ -268,6 +270,22 @@ sync.get('/', async (c) => {
         const data = JSON.parse(cipher.data || '{}');
         const favorites = cipher.favorites ? JSON.parse(cipher.favorites) : {};
         const foldersMap = cipher.folders ? JSON.parse(cipher.folders) : {};
+        const attachmentsMap = cipher.attachments ? JSON.parse(cipher.attachments) : {};
+        const attachmentsList = Object.keys(attachmentsMap).map(id => {
+            const a = attachmentsMap[id];
+            const sizeBytes = parseInt(a.size || '0');
+            const sizeName = sizeBytes >= 1048576 ? `${(sizeBytes / 1048576).toFixed(2)} MB` :
+                sizeBytes >= 1024 ? `${(sizeBytes / 1024).toFixed(2)} KB` :
+                    `${sizeBytes} Bytes`;
+            return {
+                id,
+                fileName: a.fileName,
+                key: a.key,
+                size: a.size || '0',
+                sizeName,
+                url: `${attachmentBaseUrl}/attachments/${cipher.id}/${id}`
+            };
+        });
 
         return {
             id: cipher.id,
@@ -286,7 +304,7 @@ sync.get('/', async (c) => {
             sshKey: cipher.type === 5 ? data.sshKey : undefined,
             fields: data.fields || null,
             passwordHistory: data.passwordHistory || null,
-            attachments: null,
+            attachments: attachmentsList.length > 0 ? attachmentsList : null,
             organizationUseTotp: cipher.organizationId ? (orgUseTotpMap[cipher.organizationId] ?? false) : false,
             revisionDate: cipher.revisionDate,
             creationDate: cipher.creationDate,
