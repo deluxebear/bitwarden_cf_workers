@@ -72,6 +72,7 @@ app.get('/attachments/:cipherId/:attachmentId', async (c) => {
     const cipherId = c.req.param('cipherId');
     const attachmentId = c.req.param('attachmentId');
     const r2Key = `${cipherId}/${attachmentId}`;
+
     const file = await c.env.ATTACHMENTS.get(r2Key);
 
     if (!file) {
@@ -79,9 +80,8 @@ app.get('/attachments/:cipherId/:attachmentId', async (c) => {
     }
 
     const headers = new Headers();
-    if (file.httpMetadata?.contentType) {
-        headers.set('Content-Type', file.httpMetadata.contentType);
-    }
+    headers.set('Content-Type', file.httpMetadata?.contentType || 'application/octet-stream');
+    headers.set('Content-Length', file.size.toString());
     headers.set('Cache-Control', 'public, max-age=31536000');
 
     return new Response(file.body, { headers });

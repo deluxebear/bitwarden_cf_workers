@@ -45,14 +45,18 @@ export const debugMiddleware: MiddlewareHandler<{
     if (['POST', 'PUT'].includes(method)) {
         const contentType = c.req.header('content-type') || '';
 
-        // 处理 form-urlencoded
-        if (contentType.includes('application/x-www-form-urlencoded')) {
+        if (contentType.includes('multipart/form-data')) {
+            // multipart/form-data（文件上传）：不解析 body，避免干扰文件流
+            console.log(`  Body: <multipart/form-data, skipped>`);
+        } else if (contentType.includes('application/x-www-form-urlencoded')) {
+            // 使用 clone() 避免消耗原始请求体
             try {
-                const formData = await c.req.parseBody();
-                const formObj: any = {};
-                for (const [key, value] of Object.entries(formData)) {
-                    formObj[key] = typeof value === 'string' ?
-                        (sensitiveFields.includes(key) ? value.slice(0, 10) + '***' : value) : value;
+                const clone = c.req.raw.clone();
+                const text = await clone.text();
+                const params = new URLSearchParams(text);
+                const formObj: Record<string, string> = {};
+                for (const [key, value] of params.entries()) {
+                    formObj[key] = sensitiveFields.includes(key) ? value.slice(0, 10) + '***' : value;
                 }
                 console.log(`  Body (form): ${JSON.stringify(formObj).slice(0, 300)}`);
             } catch (e) {

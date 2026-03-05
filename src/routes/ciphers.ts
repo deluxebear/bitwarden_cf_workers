@@ -23,7 +23,10 @@ ciphersRoute.use('/*', authMiddleware);
 /** 从请求 URL 中提取 baseUrl（protocol + host），用于构建附件绝对下载 URL */
 function getBaseUrl(c: any): string {
     const url = new URL(c.req.url);
-    return `${url.protocol}//${url.host}`;
+    // 通过反向代理/隧道（如 trycloudflare）时，内部请求可能是 http，
+    // 需要从 X-Forwarded-Proto 获取客户端实际使用的协议
+    const proto = c.req.header('x-forwarded-proto') || url.protocol.replace(':', '');
+    return `${proto}://${url.host}`;
 }
 
 /**
@@ -375,9 +378,8 @@ ciphersRoute.get('/:id/attachment/:attachmentId', async (c) => {
         throw new NotFoundError('Attachment metadata not found.');
     }
 
-    // 构建基于请求的绝对下载 URL
-    const baseUrl = new URL(c.req.url);
-    const downloadUrl = `${baseUrl.protocol}//${baseUrl.host}/attachments/${cipherId}/${attachmentId}`;
+    // 使用 getBaseUrl 构建绝对下载 URL（已处理反向代理协议）
+    const downloadUrl = `${getBaseUrl(c)}/attachments/${cipherId}/${attachmentId}`;
 
     const sizeBytes = parseInt(meta.size || '0');
     const sizeName = sizeBytes >= 1048576 ? `${(sizeBytes / 1048576).toFixed(2)} MB` :
