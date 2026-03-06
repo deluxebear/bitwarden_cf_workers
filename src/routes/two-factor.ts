@@ -162,6 +162,57 @@ twoFactor.put('/authenticator', enableAuthenticator);
 twoFactor.post('/authenticator', enableAuthenticator);
 
 /**
+ * DELETE /api/two-factor/authenticator
+ * 禁用 Authenticator 2FA
+ */
+twoFactor.delete('/authenticator', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const body = await c.req.json<{ type: number; key: string; userVerificationToken: string }>();
+
+    if (!body.userVerificationToken || !body.key) {
+        throw new BadRequestError('User verification failed.');
+    }
+
+    // 验证 userVerificationToken
+    try {
+        const decoded = JSON.parse(atob(body.userVerificationToken));
+        if (decoded.userId !== userId || decoded.key !== body.key) {
+            throw new BadRequestError('User verification failed.');
+        }
+    } catch (e) {
+        if (e instanceof BadRequestError) throw e;
+        throw new BadRequestError('User verification failed.');
+    }
+
+    const user = await db.select().from(users).where(eq(users.id, userId)).get();
+    if (!user) throw new BadRequestError('User not found.');
+
+    const providers = getProviders(user);
+
+    // 删除 Authenticator provider (type 0)
+    delete providers[0];
+
+    const now = new Date().toISOString();
+    const updateData: any = {
+        twoFactorProviders: JSON.stringify(providers),
+        accountRevisionDate: now,
+    };
+
+    if (Object.keys(providers).length === 0) {
+        updateData.twoFactorRecoveryCode = null;
+    }
+
+    await db.update(users).set(updateData).where(eq(users.id, userId));
+
+    return c.json({
+        enabled: false,
+        type: 0,
+        object: 'twoFactorProvider',
+    });
+});
+
+/**
  * 处理 PUT 和 POST /disable
  */
 async function disableProvider(c: Context<{ Bindings: Bindings; Variables: Variables }>) {

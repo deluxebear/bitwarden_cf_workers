@@ -309,8 +309,12 @@ identity.post('/connect/token', async (c) => {
     let webAuthnToken: string | undefined;
     let webAuthnDeviceResponse: string | undefined;
 
+    console.log(`[TOKEN] Content-Type: ${contentType}`);
+
     if (contentType.includes('application/x-www-form-urlencoded')) {
         const formData = await c.req.parseBody();
+        console.log(`[TOKEN] Form fields: ${Object.keys(formData).join(', ')}`);
+        console.log(`[TOKEN] grant_type=${formData['grant_type']}, username=${formData['username'] ? '***' : 'MISSING'}, password=${formData['password'] ? '***' : 'MISSING'}`);
         body = {
             grant_type: formData['grant_type'] as any,
             username: formData['username'] as string,
@@ -328,10 +332,13 @@ identity.post('/connect/token', async (c) => {
         webAuthnDeviceResponse = formData['deviceResponse'] as string;
     } else {
         const rawBody = await c.req.json<any>();
+        console.log(`[TOKEN] JSON body keys: ${Object.keys(rawBody).join(', ')}`);
         body = rawBody as TokenRequest;
         webAuthnToken = rawBody.token;
         webAuthnDeviceResponse = rawBody.deviceResponse;
     }
+
+    console.log(`[TOKEN] Parsed grant_type: ${body.grant_type}`);
 
     const db = drizzle(c.env.DB);
 
@@ -347,6 +354,61 @@ identity.post('/connect/token', async (c) => {
 });
 
 /**
+ * 构建 2FA provider 的元数据，用于 TwoFactorProviders2 响应
+ * 对应 TwoFactorAuthenticationValidator.BuildTwoFactorParams
+ */
+async function buildTwoFactorParams(
+    providerType: number,
+    provider: any,
+    origin: string,
+): Promise<Record<string, any> | null> {
+    switch (providerType) {
+        case 0: // Authenticator - 不需要额外参数
+            return null;
+        case 7: { // WebAuthn - 需要返回 assertion challenge
+            const metaData = provider?.metaData || {};
+            const allowCredentials: any[] = [];
+
+            // 从已注册的 key 中提取 credential descriptors
+            for (const keyName of Object.keys(metaData)) {
+                const keyData = metaData[keyName];
+                if (keyData?.Descriptor) {
+                    allowCredentials.push({
+                        id: keyData.Descriptor.Id,
+                        type: keyData.Descriptor.Type || 'public-key',
+                    });
+                }
+            }
+
+            // 生成 challenge
+            const challengeBytes = new Uint8Array(32);
+            crypto.getRandomValues(challengeBytes);
+            const challenge = bytesToBase64Url(challengeBytes);
+
+            let rpId: string;
+            try {
+                rpId = new URL(origin).hostname;
+            } catch {
+                rpId = 'localhost';
+            }
+
+            return {
+                challenge,
+                allowCredentials,
+                rpId,
+                timeout: 60000,
+                userVerification: 'discouraged',
+                extensions: {},
+                status: 'ok',
+                errorMessage: '',
+            };
+        }
+        default:
+            return null;
+    }
+}
+
+/**
  * Password grant - 用户名密码登录
  */
 async function handlePasswordGrant(c: any, db: any, body: TokenRequest) {
@@ -355,7 +417,9 @@ async function handlePasswordGrant(c: any, db: any, body: TokenRequest) {
     }
 
     const email = body.username.toLowerCase().trim();
+    console.log(`[TOKEN] Looking up user: ${email}`);
     const user = await db.select().from(users).where(eq(users.email, email)).get();
+    console.log(`[TOKEN] User found: ${!!user}, hasPassword: ${!!user?.masterPassword}`);
 
     if (!user) {
         return c.json({
@@ -367,6 +431,7 @@ async function handlePasswordGrant(c: any, db: any, body: TokenRequest) {
 
     // 验证密码
     const passwordValid = await verifyPassword(body.password, user.masterPassword || '');
+    console.log(`[TOKEN] Password valid: ${passwordValid}`);
     if (!passwordValid) {
         // 更新失败登录计数
         await db.update(users).set({
@@ -396,19 +461,29 @@ async function handlePasswordGrant(c: any, db: any, body: TokenRequest) {
     }
 
     const enabledProviders = Object.keys(providers).filter(k => providers[k].enabled).map(Number);
+    console.log(`[TOKEN] 2FA providers: ${JSON.stringify(providers)}, enabled: ${JSON.stringify(enabledProviders)}`);
     if (enabledProviders.length > 0) {
         // 支持大小写
         const twoFactorProvider = body.TwoFactorProvider ?? body.twoFactorProvider;
         const twoFactorToken = body.TwoFactorToken ?? body.twoFactorToken;
+        console.log(`[TOKEN] 2FA required but twoFactorProvider=${twoFactorProvider}, twoFactorToken=${twoFactorToken ? '***' : 'MISSING'}`);
 
         if (twoFactorProvider === undefined || !twoFactorToken) {
-            // 需要进行 2FA
-            return c.json({
+            // 构建每个 provider 的元数据
+            const origin = c.req.header('origin') || c.req.header('referer')?.replace(/\/$/, '') || `https://${c.req.header('host') || 'localhost'}`;
+            const providers2: Record<string, any> = {};
+            for (const p of enabledProviders) {
+                providers2[String(p)] = await buildTwoFactorParams(p, providers[p], origin);
+            }
+
+            const twoFactorResponse: Record<string, any> = {
                 error: 'invalid_grant',
-                error_description: 'TwoFactorProviders2',
-                TwoFactorProviders: enabledProviders,
-                TwoFactorProviders2: Object.fromEntries(enabledProviders.map(p => [p, null]))
-            }, 400);
+                error_description: 'Two factor required.',
+                TwoFactorProviders: enabledProviders.map(String),
+                TwoFactorProviders2: providers2,
+            };
+            console.log(`[TOKEN] Returning 2FA challenge: ${JSON.stringify(twoFactorResponse)}`);
+            return c.json(twoFactorResponse, 400);
         }
 
         const providerType = Number(twoFactorProvider);
@@ -434,6 +509,71 @@ async function handlePasswordGrant(c: any, db: any, body: TokenRequest) {
         } else if (providerType === 0) { // Authenticator
             const authProvider = providers[0];
             isValid = verifyAuthenticatorCode(authProvider.metaData.Key, token);
+        } else if (providerType === 7) { // WebAuthn
+            try {
+                const assertionResponse = typeof token === 'string' ? JSON.parse(token) : token;
+                const resp = assertionResponse.response || {};
+                const origin = c.req.header('origin') || c.req.header('referer')?.replace(/\/$/, '') || `https://${c.req.header('host') || 'localhost'}`;
+                let rpId: string;
+                try { rpId = new URL(origin).hostname; } catch { rpId = 'localhost'; }
+
+                // 查找匹配的 credential
+                const webAuthnProvider = providers[7];
+                const metaData = webAuthnProvider?.metaData || {};
+                let matchedKey: any = null;
+                const credentialId = assertionResponse.id;
+
+                for (const keyName of Object.keys(metaData)) {
+                    if (metaData[keyName]?.Descriptor?.Id === credentialId) {
+                        matchedKey = metaData[keyName];
+                        break;
+                    }
+                }
+
+                if (!matchedKey) {
+                    console.log(`[TOKEN] WebAuthn 2FA: no matching credential for id=${credentialId}`);
+                    isValid = false;
+                } else {
+                    // 验证 clientDataJSON
+                    const clientDataBytes = base64UrlToBytes(resp.clientDataJSON || resp.clientDataJson);
+                    const clientData = JSON.parse(new TextDecoder().decode(clientDataBytes));
+
+                    if (clientData.type !== 'webauthn.get') {
+                        console.log(`[TOKEN] WebAuthn 2FA: invalid type ${clientData.type}`);
+                        isValid = false;
+                    } else {
+                        // 验证 authenticatorData rpId hash
+                        const authDataBytes = base64UrlToBytes(resp.authenticatorData);
+                        const expectedRpIdHash = new Uint8Array(
+                            await crypto.subtle.digest('SHA-256', new TextEncoder().encode(rpId))
+                        );
+                        const rpIdHash = authDataBytes.slice(0, 32);
+                        const rpIdMatch = rpIdHash.length === 32 && rpIdHash.every((b: number, i: number) => b === expectedRpIdHash[i]);
+
+                        if (!rpIdMatch) {
+                            console.log(`[TOKEN] WebAuthn 2FA: RP ID mismatch`);
+                            isValid = false;
+                        } else {
+                            // 验证签名
+                            const signatureBytes = base64UrlToBytes(resp.signature);
+                            const clientDataHash = new Uint8Array(
+                                await crypto.subtle.digest('SHA-256', clientDataBytes)
+                            );
+                            const signedData = new Uint8Array(authDataBytes.length + clientDataHash.length);
+                            signedData.set(authDataBytes);
+                            signedData.set(clientDataHash, authDataBytes.length);
+
+                            const publicKeyBytes = base64UrlToBytes(matchedKey.PublicKey);
+                            const { verifySignatureWithCoseKey } = await import('../services/webauthn');
+                            isValid = await verifySignatureWithCoseKey(publicKeyBytes, signedData, signatureBytes);
+                            console.log(`[TOKEN] WebAuthn 2FA: signature valid=${isValid}`);
+                        }
+                    }
+                }
+            } catch (e) {
+                console.log(`[TOKEN] WebAuthn 2FA verification error: ${e}`);
+                isValid = false;
+            }
         } else {
             return c.json({ error: 'invalid_grant', error_description: 'unsupported_provider', ErrorModel: { Message: 'Unsupported 2FA provider.', Object: 'error' } }, 400);
         }
@@ -447,6 +587,7 @@ async function handlePasswordGrant(c: any, db: any, body: TokenRequest) {
         }
     }
     // ================= 2FA 检查完毕 =================
+    console.log(`[TOKEN] 2FA check passed, proceeding to device/token generation`);
 
     // 处理设备
     let deviceId = generateUuid();
