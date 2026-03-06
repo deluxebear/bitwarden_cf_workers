@@ -31,6 +31,8 @@ function buildAuthRequestResponse(authRequest: {
     masterPasswordHash?: string | null;
     creationDate: string;
     responseDate: string | null;
+    authenticationDate?: string | null;
+    responseDeviceId?: string | null;
     approved: boolean | null;
 }) {
     return {

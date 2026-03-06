@@ -175,7 +175,7 @@ async function verifyWebAuthnToken(env: Bindings, rawToken: string, expectedIden
 webauthn.post('/attestation-options', async (c) => {
     const db = drizzle(c.env.DB);
     const userId = c.get('userId');
-    const body = await c.req.json<{ masterPasswordHash?: string }>().catch(() => ({}));
+    const body = await c.req.json().catch(() => ({})) as { masterPasswordHash?: string };
 
     const user = await verifyUserSecret(db, userId, body.masterPasswordHash);
 
@@ -407,7 +407,7 @@ webauthn.post('/', async (c) => {
 webauthn.post('/assertion-options', async (c) => {
     const db = drizzle(c.env.DB);
     const userId = c.get('userId');
-    const body = await c.req.json<{ masterPasswordHash?: string }>().catch(() => ({}));
+    const body = await c.req.json().catch(() => ({})) as { masterPasswordHash?: string };
 
     await verifyUserSecret(db, userId, body.masterPasswordHash);
 
@@ -479,9 +479,9 @@ webauthn.put('/', async (c) => {
     );
 
     const deviceResponse = typeof body.deviceResponse === 'string'
-        ? JSON.parse(body.deviceResponse) as { id: string; response: Record<string, unknown> }
-        : (body.deviceResponse as { id: string; response: Record<string, unknown> });
-    const resp = deviceResponse.response ?? {};
+        ? JSON.parse(body.deviceResponse) as { id: string; response: Record<string, string> }
+        : (body.deviceResponse as { id: string; response: Record<string, string> });
+    const resp = deviceResponse.response ?? {} as Record<string, string>;
 
     const origin = c.req.header('origin') || c.req.header('referer')?.replace(/\/$/, '') || `https://${c.req.header('host') || 'localhost'}`;
     let rpId: string;
@@ -576,7 +576,7 @@ webauthn.post('/:id/delete', async (c) => {
     const db = drizzle(c.env.DB);
     const userId = c.get('userId');
     const id = c.req.param('id');
-    const body = await c.req.json<{ masterPasswordHash?: string }>().catch(() => ({}));
+    const body = await c.req.json().catch(() => ({})) as { masterPasswordHash?: string };
 
     await verifyUserSecret(db, userId, body.masterPasswordHash);
 

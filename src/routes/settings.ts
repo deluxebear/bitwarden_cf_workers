@@ -88,12 +88,12 @@ settings.get('/domains', async (c) => {
 settings.put('/domains', async (c) => {
     const db = drizzle(c.env.DB);
     const userId = c.get('userId');
-    const body = await c.req.json<{
+    const body = await c.req.json().catch(() => ({})) as {
         EquivalentDomains?: string[][];
         ExcludedGlobalEquivalentDomains?: number[];
         equivalentDomains?: string[][];
         excludedGlobalEquivalentDomains?: number[];
-    }>().catch(() => ({}));
+    };
 
     const user = await db.select().from(users).where(eq(users.id, userId)).get();
     if (!user) throw new NotFoundError('User not found.');
@@ -143,12 +143,12 @@ settings.put('/domains', async (c) => {
 settings.post('/domains', async (c) => {
     const db = drizzle(c.env.DB);
     const userId = c.get('userId');
-    const body = await c.req.json<{
+    const body = await c.req.json().catch(() => ({})) as {
         EquivalentDomains?: string[][];
         ExcludedGlobalEquivalentDomains?: number[];
         equivalentDomains?: string[][];
         excludedGlobalEquivalentDomains?: number[];
-    }>().catch(() => ({}));
+    };
 
     const user = await db.select().from(users).where(eq(users.id, userId)).get();
     if (!user) throw new NotFoundError('User not found.');

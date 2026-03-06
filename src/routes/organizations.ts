@@ -681,7 +681,7 @@ async function upsertOrganizationDuo(c: any) {
     const db = drizzle(c.env.DB);
     const orgId = c.req.param('id');
     const userId = c.get('userId');
-    const body = await c.req.json<{ secret: string; clientSecret: string; clientId: string; host: string }>();
+    const body = await c.req.json() as { secret: string; clientSecret: string; clientId: string; host: string };
 
     await verifyOrgSecret(db as D1Db, userId, body.secret);
 
