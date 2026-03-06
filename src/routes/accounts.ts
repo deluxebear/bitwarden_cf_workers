@@ -12,6 +12,8 @@ import { authMiddleware } from '../middleware/auth';
 import { BadRequestError, NotFoundError } from '../middleware/error';
 import { generateSecureRandomString, verifyPassword } from '../services/crypto';
 import type { Bindings, Variables, ProfileResponse, AccountKeysResponse } from '../types';
+import { pushLogOut, pushSyncUser } from '../services/push-notification';
+import { PushType } from '../types/push-notification';
 
 const accounts = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
@@ -222,6 +224,10 @@ accounts.put('/profile', async (c) => {
     }).where(eq(users.id, userId));
 
     const updated = await db.select().from(users).where(eq(users.id, userId)).get();
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncSettings, userId, contextId));
+
     return c.json(toProfileResponse(updated!, c.env));
 });
 
@@ -245,6 +251,10 @@ accounts.post('/profile', async (c) => {
     }).where(eq(users.id, userId));
 
     const updated = await db.select().from(users).where(eq(users.id, userId)).get();
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncSettings, userId, contextId));
+
     return c.json(toProfileResponse(updated!, c.env));
 });
 
@@ -325,6 +335,9 @@ accounts.post('/keys', async (c) => {
         accountRevisionDate: now,
     }).where(eq(users.id, userId));
 
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncSettings, userId, contextId));
+
     return c.json({
         key: user.key,
         publicKey: body.publicKey,
@@ -366,6 +379,10 @@ accounts.post('/password', async (c) => {
         accountRevisionDate: now,
         lastPasswordChangeDate: now,
     }).where(eq(users.id, userId));
+
+    // 密码变更后通知其他设备登出
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushLogOut(c.env, userId, contextId));
 
     return c.body(null, 204);
 });
@@ -442,6 +459,9 @@ accounts.post('/security-stamp', async (c) => {
         accountRevisionDate: now,
     }).where(eq(users.id, userId));
 
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushLogOut(c.env, userId, contextId));
+
     return c.body(null, 204);
 });
 
@@ -498,6 +518,9 @@ accounts.put('/email', async (c) => {
         accountRevisionDate: now,
         lastEmailChangeDate: now,
     }).where(eq(users.id, userId));
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushLogOut(c.env, userId, contextId));
 
     return c.body(null, 204);
 });

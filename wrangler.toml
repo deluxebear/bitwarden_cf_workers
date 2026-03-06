@@ -26,6 +26,17 @@ port = 8787
 binding = "ATTACHMENTS"
 bucket_name = "bitwarden-attachments"
 
+# Durable Objects - 实时通知 (SignalR 兼容 WebSocket Hub)
+# 对应官方 Notifications/NotificationsHub.cs
+[durable_objects]
+bindings = [
+  { name = "NOTIFICATION_HUB", class_name = "NotificationHub" },
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["NotificationHub"]
+
 # 定时任务 - Cron Triggers
 # 对应官方 Admin/JobsHostedService.cs + Api/JobsHostedService.cs
 [triggers]

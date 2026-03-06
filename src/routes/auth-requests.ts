@@ -11,6 +11,7 @@ import { users, devices, authRequests } from '../db/schema';
 import { authMiddleware } from '../middleware/auth';
 import type { Bindings, Variables, AuthRequestCreateRequest, AuthRequestUpdateRequest } from '../types';
 import { AuthRequestType } from '../types';
+import { pushAuthRequest, pushAuthRequestResponse } from '../services/push-notification';
 
 const authRequestsRoute = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
@@ -133,6 +134,9 @@ authRequestsRoute.post('/', async (c) => {
     };
 
     await db.insert(authRequests).values(newAuthRequest).execute();
+
+    // 推送 AuthRequest 通知到用户的设备
+    c.executionCtx.waitUntil(pushAuthRequest(c.env, id, user.id, null));
 
     return c.json(buildAuthRequestResponse({
         ...newAuthRequest,
@@ -369,6 +373,11 @@ authRequestsRoute.put('/:id', async (c) => {
 
     if (!updated) {
         return c.json({ message: 'Auth request not found.', object: 'error' }, 404);
+    }
+
+    // 推送 AuthRequestResponse 通知（发到匿名 hub + 用户 hub）
+    if (body.requestApproved) {
+        c.executionCtx.waitUntil(pushAuthRequestResponse(c.env, id, authRequest.userId));
     }
 
     return c.json(buildAuthRequestResponse(updated));

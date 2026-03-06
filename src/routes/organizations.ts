@@ -27,9 +27,27 @@ import { generateUuid, createInviteToken, verifyInviteToken } from '../services/
 import { toOrganizationResponse, toOrganizationSubscriptionResponse, toOrganizationUserResponse } from '../models/organization-responses';
 import type { Bindings, Variables } from '../types';
 import { batchedInArrayQuery, D1_BATCH_SIZE } from '../services/db';
+import { pushSyncUser, pushSyncOrganizationStatus } from '../services/push-notification';
+import { PushType } from '../types/push-notification';
 
 const orgs = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 orgs.use('/*', authMiddleware);
+
+type HubEnv = { NOTIFICATION_HUB: DurableObjectNamespace };
+type D1DbType = ReturnType<typeof drizzle>;
+
+/** 向组织所有已确认成员推送 SyncVault 通知 */
+async function pushSyncVaultToOrgMembers(env: HubEnv, db: D1DbType, orgId: string): Promise<void> {
+    const members = await db.select({ userId: organizationUsers.userId })
+        .from(organizationUsers)
+        .where(and(eq(organizationUsers.organizationId, orgId), eq(organizationUsers.status, 2)))
+        .all();
+    await Promise.all(
+        members
+            .filter(m => m.userId)
+            .map(m => pushSyncUser(env as any, PushType.SyncVault, m.userId!, null))
+    );
+}
 
 // ==================== 类型定义 ====================
 
@@ -444,11 +462,24 @@ orgs.delete('/:id', async (c) => {
     // 删除组织前，按组织维度刷新所有已确认成员的 AccountRevisionDate
     await bumpAccountRevisionDateByOrganizationId(db, orgId);
 
+    // 获取所有确认成员，用于推送通知
+    const confirmedMembers = await db.select({ userId: organizationUsers.userId })
+        .from(organizationUsers)
+        .where(and(eq(organizationUsers.organizationId, orgId), eq(organizationUsers.status, 2)))
+        .all();
+
     // 官方需要密码验证，这里简化（自建环境信任 Owner）
     // body 中可能有 masterPasswordHash，但我们暂不验证
     await db.delete(organizations).where(eq(organizations.id, orgId));
 
     await logEvent(c.env.DB, 1601, { userId, organizationId: orgId, deviceType: getDeviceTypeFromRequest(c) });
+
+    // 推送组织删除通知到所有已确认成员
+    for (const member of confirmedMembers) {
+        if (member.userId) {
+            c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncOrganizations, member.userId, null));
+        }
+    }
 
     return c.json({});
 });
@@ -467,11 +498,23 @@ orgs.post('/:id/delete', async (c) => {
     const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
     if (!org) throw new NotFoundError('Organization not found.');
 
+    // 获取所有确认成员
+    const confirmedMembers = await db.select({ userId: organizationUsers.userId })
+        .from(organizationUsers)
+        .where(and(eq(organizationUsers.organizationId, orgId), eq(organizationUsers.status, 2)))
+        .all();
+
     // 删除组织前，按组织维度刷新所有已确认成员的 AccountRevisionDate
     await bumpAccountRevisionDateByOrganizationId(db, orgId);
 
     await db.delete(organizations).where(eq(organizations.id, orgId));
     await logEvent(c.env.DB, 1601, { userId, organizationId: orgId, deviceType: getDeviceTypeFromRequest(c) });
+
+    for (const member of confirmedMembers) {
+        if (member.userId) {
+            c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncOrganizations, member.userId, null));
+        }
+    }
 
     return c.json({});
 });
@@ -510,6 +553,9 @@ orgs.post('/:id/leave', async (c) => {
 
     // 当前用户离开组织后，需要刷新自己的 AccountRevisionDate 以触发客户端重新同步
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncOrganizations, userId, contextId));
 
     return c.body(null, 200);
 });
@@ -992,6 +1038,11 @@ orgs.post('/:id/users/:orgUserId/confirm', async (c) => {
     // 用户从 Accepted -> Confirmed，正式获得组织保险库访问权限，需刷新其 AccountRevisionDate
     await bumpAccountRevisionDateByOrganizationUserId(db, orgUserId, now);
 
+    // 推送 SyncOrgKeys 通知到被确认的用户
+    if (targetOrgUser.userId) {
+        c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncOrgKeys, targetOrgUser.userId, null));
+    }
+
     return c.body(null, 200);
 });
 
@@ -1038,6 +1089,11 @@ orgs.post('/:id/users/confirm', async (c) => {
 
         // 批量确认成员时，同样需要为每个成员刷新 AccountRevisionDate
         await bumpAccountRevisionDateByOrganizationUserId(db, ouId, now);
+
+        // 推送 SyncOrgKeys 通知到被确认的用户
+        if (targetOrgUser.userId) {
+            c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncOrgKeys, targetOrgUser.userId, null));
+        }
 
         results.push({ id: ouId, error: '' });
     }
@@ -1166,6 +1222,11 @@ orgs.put('/:id/users/:orgUserId', async (c) => {
     // 成员角色 / 权限 / 集合访问权限变化，会改变其能看到的组织条目，需刷新 AccountRevisionDate
     await bumpAccountRevisionDateByOrganizationUserId(db, orgUserId, now);
 
+    // 推送 SyncOrganizations 通知到被修改的用户
+    if (targetOrgUser.userId) {
+        c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncOrganizations, targetOrgUser.userId, null));
+    }
+
     return c.body(null, 200);
 });
 
@@ -1252,6 +1313,7 @@ orgs.delete('/:id/users/:orgUserId', async (c) => {
     // 被移除成员失去组织访问权限，刷新该成员的 AccountRevisionDate
     if (targetUser.userId) {
         await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, targetUser.userId));
+        c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncOrganizations, targetUser.userId, null));
     }
 
     return c.json({});
@@ -1287,6 +1349,7 @@ orgs.post('/:id/users/:orgUserId/remove', async (c) => {
 
     if (targetUser.userId) {
         await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, targetUser.userId));
+        c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncOrganizations, targetUser.userId, null));
     }
 
     return c.json({});
@@ -1350,6 +1413,8 @@ orgs.put('/:id/collection-management', async (c) => {
     // 集合管理策略变化会影响组织成员的可见/可操作范围，按组织维度刷新 AccountRevisionDate
     await bumpAccountRevisionDateByOrganizationId(db, orgId, now);
 
+    c.executionCtx.waitUntil(pushSyncVaultToOrgMembers(c.env, db, orgId));
+
     return c.json(toOrganizationResponse(updated));
 });
 
@@ -1386,6 +1451,8 @@ orgs.post('/:id/collections', async (c) => {
 
     // 新建集合会影响组织成员的集合列表，按组织维度刷新 AccountRevisionDate
     await bumpAccountRevisionDateByOrganizationId(db, orgId, now);
+
+    c.executionCtx.waitUntil(pushSyncVaultToOrgMembers(c.env, db, orgId));
 
     return c.json({
         id: collectionId,
@@ -1489,6 +1556,8 @@ orgs.put('/:id/collections/:collectionId', async (c) => {
     // 集合的名称 / externalId / 访问权限发生变化，影响成员可访问内容，按组织维度刷新 AccountRevisionDate
     await bumpAccountRevisionDateByOrganizationId(db, orgId, now);
 
+    c.executionCtx.waitUntil(pushSyncVaultToOrgMembers(c.env, db, orgId));
+
     return c.json({
         id: collectionId,
         organizationId: orgId,
@@ -1539,6 +1608,8 @@ orgs.delete('/:id/collections/:collectionId', async (c) => {
     // 删除单个集合，按组织维度刷新 AccountRevisionDate
     await bumpAccountRevisionDateByOrganizationId(db, orgId);
 
+    c.executionCtx.waitUntil(pushSyncVaultToOrgMembers(c.env, db, orgId));
+
     return c.json({});
 });
 
@@ -1577,6 +1648,8 @@ orgs.delete('/:id/collections', async (c) => {
     // 批量删除集合，同样刷新组织内所有成员的 AccountRevisionDate
     await bumpAccountRevisionDateByOrganizationId(db, orgId);
 
+    c.executionCtx.waitUntil(pushSyncVaultToOrgMembers(c.env, db, orgId));
+
     return c.json({});
 });
 
@@ -1613,6 +1686,8 @@ orgs.post('/:id/collections/delete', async (c) => {
     }
 
     await bumpAccountRevisionDateByOrganizationId(db, orgId);
+
+    c.executionCtx.waitUntil(pushSyncVaultToOrgMembers(c.env, db, orgId));
 
     return c.json({});
 });
@@ -1800,6 +1875,8 @@ orgs.post('/:id/groups', async (c) => {
     // 新建群组（及其集合/成员关联）会影响成员可访问集合，按组织维度刷新 AccountRevisionDate
     await bumpAccountRevisionDateByOrganizationId(db, orgId, now);
 
+    c.executionCtx.waitUntil(pushSyncVaultToOrgMembers(c.env, db, orgId));
+
     return c.json({
         id: groupId,
         organizationId: orgId,
@@ -1893,6 +1970,8 @@ orgs.put('/:id/groups/:groupId', async (c) => {
 
     // 群组的集合/成员变更会影响访问控制，按组织维度刷新 AccountRevisionDate
     await bumpAccountRevisionDateByOrganizationId(db, orgId, now);
+
+    c.executionCtx.waitUntil(pushSyncVaultToOrgMembers(c.env, db, orgId));
 
     return c.json({
         id: group.id,
@@ -2002,6 +2081,8 @@ orgs.delete('/:id/groups/:groupId', async (c) => {
 
     // 删除群组影响集合访问关系，按组织维度刷新 AccountRevisionDate
     await bumpAccountRevisionDateByOrganizationId(db, orgId);
+
+    c.executionCtx.waitUntil(pushSyncVaultToOrgMembers(c.env, db, orgId));
 
     return c.json({}, 200);
 });

@@ -12,6 +12,8 @@ import { authMiddleware } from '../middleware/auth';
 import { BadRequestError, NotFoundError } from '../middleware/error';
 import { generateUuid, hashSendPassword, verifySendPassword } from '../services/crypto';
 import type { Bindings, Variables, SendRequest, SendResponse, SendAccessResponse, SendType } from '../types';
+import { pushSyncSend } from '../services/push-notification';
+import { PushType } from '../types/push-notification';
 
 const sendsRoute = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
@@ -197,6 +199,10 @@ authed.post('/', async (c) => {
 
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
     const created = await db.select().from(sends).where(eq(sends.id, sendId)).get();
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncSend(c.env, PushType.SyncSendCreate, sendId, userId, now, contextId));
+
     return c.json(toSendResponse(created!));
 });
 
@@ -237,6 +243,10 @@ authed.put('/:id', async (c) => {
 
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
     const updated = await db.select().from(sends).where(eq(sends.id, sendId)).get();
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncSend(c.env, PushType.SyncSendUpdate, sendId, userId, now, contextId));
+
     return c.json(toSendResponse(updated!));
 });
 
@@ -257,6 +267,10 @@ authed.put('/:id/remove-password', async (c) => {
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
 
     const updated = await db.select().from(sends).where(eq(sends.id, sendId)).get();
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncSend(c.env, PushType.SyncSendUpdate, sendId, userId, now, contextId));
+
     return c.json(toSendResponse(updated!));
 });
 
@@ -275,6 +289,10 @@ authed.delete('/:id', async (c) => {
     await db.delete(sends).where(eq(sends.id, sendId));
     const now = new Date().toISOString();
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncSend(c.env, PushType.SyncSendDelete, sendId, userId, now, contextId));
+
     return c.body(null, 204);
 });
 

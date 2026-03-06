@@ -34,6 +34,7 @@ import configRoutes from './routes/config';
 import devicesRoutes from './routes/devices';
 import authRequestsRoutes from './routes/auth-requests';
 import webauthnRoutes from './routes/webauthn';
+import hubRoutes from './routes/hub';
 import type { Bindings, Variables } from './types';
 
 const app = new Hono<{ Bindings: Bindings; Variables: Variables }>();
@@ -102,14 +103,8 @@ app.get('/attachments/:cipherId/:attachmentId', async (c) => {
     return new Response(file.body, { headers });
 });
 
-// Hub (SignalR notifications) - stub endpoint
-// Bitwarden 客户端尝试连接 /hub 进行实时通知推送，Workers 环境不支持 SignalR
-app.get('/hub', (c) => {
-    return c.json({ message: 'SignalR hub is not supported in this implementation.' }, 404);
-});
-app.post('/hub/negotiate', (c) => {
-    return c.json({ message: 'SignalR hub is not supported in this implementation.' }, 404);
-});
+// Hub (SignalR notifications) - WebSocket via Durable Object
+app.route('/', hubRoutes);
 
 // 404 处理
 app.notFound((c) => {
@@ -120,6 +115,9 @@ app.notFound((c) => {
 // fetch: Hono 处理 HTTP 请求
 // scheduled: Cloudflare Cron Triggers 处理定时任务
 import { handleScheduled } from './services/scheduled';
+
+// 导出 Durable Object
+export { NotificationHub } from './durable-objects/notification-hub';
 
 export default {
     fetch: app.fetch,

@@ -16,6 +16,8 @@ import { BadRequestError, NotFoundError } from '../middleware/error';
 import { batchedInArrayQuery } from '../services/db';
 import { generateUuid } from '../services/crypto';
 import type { Bindings, Variables, CipherRequest, CipherResponse, CipherType, CipherRepromptType } from '../types';
+import { pushSyncCipher, pushSyncUser } from '../services/push-notification';
+import { PushType } from '../types/push-notification';
 
 const ciphersRoute = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
@@ -409,6 +411,14 @@ const uploadAttachmentHandler = async (c: any) => {
     await logEvent(c.env.DB, 1103, { userId, cipherId });
 
     const updated = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncCipher(
+        c.env, PushType.SyncCipherUpdate, cipherId,
+        cipher.organizationId ? null : userId, cipher.organizationId || null,
+        null, now, contextId,
+    ));
+
     return c.json(toCipherResponse(updated!, userId, getBaseUrl(c)));
 };
 
@@ -690,6 +700,14 @@ ciphersRoute.post('/', async (c) => {
     }
 
     await logEvent(c.env.DB, 1100, { userId, cipherId });
+
+    // 推送通知（不阻塞响应）
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncCipher(
+        c.env, PushType.SyncCipherCreate, cipherId,
+        body.organizationId ? null : userId, body.organizationId || null,
+        body.collectionIds || null, now, contextId,
+    ));
 
     return c.json(toCipherResponse(created!, userId, getBaseUrl(c)));
 });
@@ -1067,6 +1085,13 @@ ciphersRoute.put('/:id/delete', async (c) => {
 
     await logEvent(c.env.DB, 1115, { userId, cipherId });
 
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncCipher(
+        c.env, PushType.SyncCipherDelete, cipherId,
+        existing.organizationId ? null : userId, existing.organizationId || null,
+        null, now, contextId,
+    ));
+
     return c.body(null, 204);
 });
 
@@ -1090,6 +1115,14 @@ ciphersRoute.put('/:id/restore', async (c) => {
     await logEvent(c.env.DB, 1116, { userId, cipherId });
 
     const updated = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncCipher(
+        c.env, PushType.SyncCipherUpdate, cipherId,
+        existing.organizationId ? null : userId, existing.organizationId || null,
+        null, now, contextId,
+    ));
+
     return c.json(toCipherResponse(updated!, userId, getBaseUrl(c)));
 });
 
@@ -1114,6 +1147,10 @@ ciphersRoute.put('/delete', async (c) => {
     }
 
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncVault, userId, contextId));
+
     return c.json(null, 200);
 });
 
@@ -1149,6 +1186,11 @@ ciphersRoute.post('/delete', async (c) => {
 
     const now = new Date().toISOString();
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+
+    // 批量操作推送全量同步
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncVault, userId, contextId));
+
     return c.json(null, 200);
 });
 
@@ -1176,6 +1218,10 @@ ciphersRoute.put('/delete-admin', async (c) => {
     }
 
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncVault, userId, contextId));
+
     return c.json(null, 200);
 });
 
@@ -1213,6 +1259,10 @@ ciphersRoute.post('/delete-admin', async (c) => {
 
     const now = new Date().toISOString();
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncVault, userId, contextId));
+
     return c.json(null, 200);
 });
 
@@ -1240,6 +1290,10 @@ ciphersRoute.put('/restore', async (c) => {
     }
 
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncVault, userId, contextId));
+
     return c.json({ data: results, object: 'list', continuationToken: null });
 });
 
@@ -1270,6 +1324,10 @@ ciphersRoute.put('/restore-admin', async (c) => {
     }
 
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncVault, userId, contextId));
+
     return c.json({ data: results, object: 'list', continuationToken: null });
 });
 
@@ -1317,6 +1375,10 @@ ciphersRoute.put('/share', async (c) => {
     }
 
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncCiphers, userId, contextId));
+
     return c.json({});
 });
 
@@ -1364,6 +1426,10 @@ ciphersRoute.post('/share', async (c) => {
     }
 
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncCiphers, userId, contextId));
+
     return c.json({});
 });
 
@@ -1390,6 +1456,10 @@ ciphersRoute.put('/move', async (c) => {
     }
 
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncCiphers, userId, contextId));
+
     return c.json(null, 200);
 });
 
@@ -1420,6 +1490,9 @@ ciphersRoute.post('/purge', async (c) => {
 
     const now = new Date().toISOString();
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncVault, userId, contextId));
 
     return c.body(null, 204);
 });
@@ -1481,6 +1554,14 @@ ciphersRoute.post('/:id', async (c) => {
     await logEvent(c.env.DB, 1101, { userId, cipherId: id });
 
     const updated = await db.select().from(ciphers).where(eq(ciphers.id, id)).get();
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncCipher(
+        c.env, PushType.SyncCipherUpdate, id,
+        existing.organizationId ? null : userId, existing.organizationId || null,
+        null, now, contextId,
+    ));
+
     return c.json(toCipherResponse(updated!, userId, getBaseUrl(c)));
 });
 
@@ -1519,6 +1600,10 @@ ciphersRoute.delete('/', async (c) => {
 
     const now = new Date().toISOString();
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncVault, userId, contextId));
+
     return c.json(null, 200);
 });
 
@@ -1556,6 +1641,10 @@ ciphersRoute.delete('/admin', async (c) => {
 
     const now = new Date().toISOString();
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncVault, userId, contextId));
+
     return c.json(null, 200);
 });
 
@@ -1581,6 +1670,13 @@ ciphersRoute.delete('/:id', async (c) => {
     const now = new Date().toISOString();
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
     await logEvent(c.env.DB, 1102, { userId, cipherId });
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncCipher(
+        c.env, PushType.SyncCipherDelete, cipherId,
+        existing.organizationId ? null : userId, existing.organizationId || null,
+        null, now, contextId,
+    ));
 
     return c.body(null, 204);
 });
@@ -1650,6 +1746,15 @@ ciphersRoute.put('/:id', async (c) => {
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
 
     const updated = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
+
+    // 推送通知
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncCipher(
+        c.env, PushType.SyncCipherUpdate, cipherId,
+        existing.organizationId ? null : userId, existing.organizationId || null,
+        null, now, contextId,
+    ));
+
     return c.json(toCipherResponse(updated!, userId, getBaseUrl(c)));
 });
 

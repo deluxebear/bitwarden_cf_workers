@@ -11,6 +11,7 @@ export type Bindings = {
     JWT_EXPIRATION: string;
     JWT_REFRESH_EXPIRATION: string;
     ATTACHMENTS: R2Bucket;
+    NOTIFICATION_HUB: DurableObjectNamespace;
     GLOBAL_PREMIUM?: string;
     /**
      * 可选：用于自建许可证校验的 InstallationId。

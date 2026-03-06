@@ -12,6 +12,8 @@ import { authMiddleware } from '../middleware/auth';
 import { BadRequestError, NotFoundError } from '../middleware/error';
 import { generateUuid } from '../services/crypto';
 import type { Bindings, Variables, FolderRequest, FolderResponse } from '../types';
+import { pushSyncFolder } from '../services/push-notification';
+import { PushType } from '../types/push-notification';
 
 const foldersRoute = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
@@ -81,6 +83,10 @@ foldersRoute.post('/', async (c) => {
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
 
     const created = await db.select().from(folders).where(eq(folders.id, folderId)).get();
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncFolder(c.env, PushType.SyncFolderCreate, folderId, userId, now, contextId));
+
     return c.json(toFolderResponse(created!));
 });
 
@@ -106,6 +112,10 @@ foldersRoute.put('/:id', async (c) => {
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
 
     const updated = await db.select().from(folders).where(eq(folders.id, folderId)).get();
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncFolder(c.env, PushType.SyncFolderUpdate, folderId, userId, now, contextId));
+
     return c.json(toFolderResponse(updated!));
 });
 
@@ -127,6 +137,10 @@ foldersRoute.post('/:id', async (c) => {
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
 
     const updated = await db.select().from(folders).where(eq(folders.id, folderId)).get();
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncFolder(c.env, PushType.SyncFolderUpdate, folderId, userId, now, contextId));
+
     return c.json(toFolderResponse(updated!));
 });
 
@@ -146,6 +160,9 @@ foldersRoute.delete('/:id', async (c) => {
 
     const now = new Date().toISOString();
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncFolder(c.env, PushType.SyncFolderDelete, folderId, userId, now, contextId));
 
     return c.json(null, 200);
 });

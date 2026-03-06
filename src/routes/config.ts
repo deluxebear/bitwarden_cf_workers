@@ -14,6 +14,8 @@ const config = new Hono<{ Bindings: Bindings; Variables: Variables }>();
  * 对应 ConfigController.Get
  */
 config.get('/', async (c) => {
+    // 从请求中推断 notifications URL（与 api 同源）
+    const origin = new URL(c.req.url).origin;
     return c.json({
         version: '2025.1.0',
         gitHash: 'workers',
@@ -23,7 +25,7 @@ config.get('/', async (c) => {
             vault: '',
             api: '',
             identity: '',
-            notifications: '',
+            notifications: origin,
             sso: '',
         },
         featureStates: {
