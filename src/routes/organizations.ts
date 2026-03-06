@@ -30,6 +30,12 @@ import type { Bindings, Variables } from '../types';
 import { batchedInArrayQuery, D1_BATCH_SIZE } from '../services/db';
 import { pushSyncUser, pushSyncOrganizationStatus } from '../services/push-notification';
 import { PushType } from '../types/push-notification';
+import {
+    PolicyType,
+    validatePolicyData, validateDependenciesOnEnable, validateDependentsOnDisable,
+    canTogglePolicyState, isValidPolicyType,
+    type PolicyRecord,
+} from '../services/policy-validators';
 
 const orgs = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 orgs.use('/*', authMiddleware);
@@ -2618,6 +2624,7 @@ orgs.get('/:id/billing/vnext/self-host/metadata', async (c) => {
 
 // ==================== Policies（组织策略） ====================
 // 对应官方 Api/AdminConsole/Controllers/PoliciesController.cs
+//        Core/AdminConsole/OrganizationFeatures/Policies/Implementations/SavePolicyCommand.cs
 
 function isNoSuchTablePolicies(e: unknown): boolean {
     const msg: string = e instanceof Error
@@ -2628,6 +2635,17 @@ function isNoSuchTablePolicies(e: unknown): boolean {
     return /no such table:\s*policies/i.test(msg);
 }
 
+/** 获取组织所有策略（容忍表不存在） */
+async function getOrgPolicies(db: D1Db, orgId: string): Promise<PolicyRow[]> {
+    try {
+        return await db.select().from(policies).where(eq(policies.organizationId, orgId)).all();
+    } catch (e) {
+        if (isNoSuchTablePolicies(e)) return [];
+        throw e;
+    }
+}
+
+/** 对应 PolicyResponseModel（含 id、revisionDate） */
 function toPolicyResponse(p: PolicyRow) {
     let data: Record<string, unknown> | null = null;
     if (p.data) {
@@ -2639,8 +2657,160 @@ function toPolicyResponse(p: PolicyRow) {
         type: p.type,
         data,
         enabled: p.enabled,
+        revisionDate: p.revisionDate,
         object: 'policy',
     };
+}
+
+/**
+ * 对应 PolicyStatusResponseModel（含 canToggleState，不含 id/revisionDate）
+ * 用于 GET /:id/policies/:type 端点
+ */
+function toPolicyStatusResponse(
+    orgId: string,
+    policyType: number,
+    policy: PolicyRow | undefined,
+    allPolicies: PolicyRecord[],
+) {
+    let data: Record<string, unknown> = {};
+    if (policy?.data) {
+        try { data = JSON.parse(policy.data); } catch { /* ignore */ }
+    }
+    const enabled = policy?.enabled ?? false;
+    return {
+        organizationId: orgId,
+        type: policyType,
+        data,
+        enabled,
+        canToggleState: canTogglePolicyState(policyType, enabled, allPolicies),
+        object: 'policy',
+    };
+}
+
+/**
+ * SingleOrg(3) 策略副作用：启用时撤销属于多个组织的非 Owner/Admin 成员
+ * 对应 SingleOrgPolicyValidator.RevokeNonCompliantUsersAsync
+ */
+async function singleOrgOnEnableSideEffect(db: D1Db, orgId: string, actingUserId: string): Promise<void> {
+    const members = await db.select().from(organizationUsers)
+        .where(and(
+            eq(organizationUsers.organizationId, orgId),
+            eq(organizationUsers.status, 2),
+        )).all();
+
+    const revocable = members.filter(m =>
+        m.userId && m.type !== 0 && m.type !== 1 && m.userId !== actingUserId,
+    );
+    if (revocable.length === 0) return;
+
+    const userIds = revocable.map(m => m.userId).filter((id): id is string => id != null);
+    const otherOrgMemberships = await db.select().from(organizationUsers)
+        .where(and(
+            inArray(organizationUsers.userId, userIds),
+            eq(organizationUsers.status, 2),
+        )).all();
+
+    const usersInMultipleOrgs = new Set<string>();
+    for (const m of otherOrgMemberships) {
+        if (m.userId && m.organizationId !== orgId) {
+            usersInMultipleOrgs.add(m.userId);
+        }
+    }
+    if (usersInMultipleOrgs.size === 0) return;
+
+    const toRevoke = revocable.filter(m => m.userId && usersInMultipleOrgs.has(m.userId));
+    const now = new Date().toISOString();
+    for (const m of toRevoke) {
+        await db.update(organizationUsers).set({
+            status: 3, // Revoked
+            revisionDate: now,
+        }).where(eq(organizationUsers.id, m.id));
+    }
+}
+
+/**
+ * TwoFactorAuthentication(0) 策略副作用：启用时撤销未启用2FA的非 Owner/Admin 成员
+ * 对应 TwoFactorAuthenticationPolicyValidator.RevokeNonCompliantUsersAsync
+ */
+async function twoFactorOnEnableSideEffect(db: D1Db, orgId: string, actingUserId: string): Promise<void> {
+    const members = await db.select({
+        ouId: organizationUsers.id,
+        ouUserId: organizationUsers.userId,
+        ouType: organizationUsers.type,
+        twoFactorProviders: users.twoFactorProviders,
+    }).from(organizationUsers)
+        .leftJoin(users, eq(organizationUsers.userId, users.id))
+        .where(and(
+            eq(organizationUsers.organizationId, orgId),
+            eq(organizationUsers.status, 2),
+        )).all();
+
+    const now = new Date().toISOString();
+    for (const m of members) {
+        if (m.ouType === 0 || m.ouType === 1) continue;
+        if (m.ouUserId === actingUserId) continue;
+        const has2FA = m.twoFactorProviders && m.twoFactorProviders !== '{}' && m.twoFactorProviders !== 'null';
+        if (has2FA) continue;
+
+        await db.update(organizationUsers).set({
+            status: 3, // Revoked
+            revisionDate: now,
+        }).where(eq(organizationUsers.id, m.ouId));
+    }
+}
+
+/**
+ * 策略保存前执行所有验证
+ * 对应 SavePolicyCommand.RunValidatorAsync
+ */
+function runPolicyValidation(
+    policyType: number,
+    enabled: boolean,
+    data: Record<string, unknown> | null,
+    currentEnabled: boolean,
+    allPolicies: PolicyRecord[],
+): string | null {
+    if (!isValidPolicyType(policyType)) {
+        throw new BadRequestError('Invalid policy type.');
+    }
+
+    validatePolicyData(policyType, data);
+
+    // 从禁用变为启用：检查前置依赖
+    if (!currentEnabled && enabled) {
+        validateDependenciesOnEnable(policyType, allPolicies);
+    }
+
+    // 从启用变为禁用：检查是否有其他策略依赖
+    if (currentEnabled && !enabled) {
+        validateDependentsOnDisable(policyType, allPolicies);
+    }
+
+    return data ? JSON.stringify(data) : null;
+}
+
+/**
+ * 策略保存后执行副作用
+ * 对应各 PolicyValidator.OnSaveSideEffectsAsync
+ */
+async function runPolicySideEffects(
+    db: D1Db,
+    policyType: number,
+    enabled: boolean,
+    wasEnabled: boolean,
+    orgId: string,
+    actingUserId: string,
+): Promise<void> {
+    if (wasEnabled || !enabled) return;
+
+    switch (policyType) {
+        case PolicyType.SingleOrg:
+            await singleOrgOnEnableSideEffect(db, orgId, actingUserId);
+            break;
+        case PolicyType.TwoFactorAuthentication:
+            await twoFactorOnEnableSideEffect(db, orgId, actingUserId);
+            break;
+    }
 }
 
 /**
@@ -2656,14 +2826,7 @@ orgs.get('/:id/policies', async (c) => {
     const orgUser = await getOrgUser(db, orgId, userId);
     requireOwnerOrAdmin(orgUser);
 
-    let policyList: PolicyRow[];
-    try {
-        policyList = await db.select().from(policies)
-            .where(eq(policies.organizationId, orgId)).all();
-    } catch (e) {
-        if (isNoSuchTablePolicies(e)) policyList = [];
-        else throw e;
-    }
+    const policyList = await getOrgPolicies(db, orgId);
 
     return c.json({
         data: policyList.map(toPolicyResponse),
@@ -2674,7 +2837,7 @@ orgs.get('/:id/policies', async (c) => {
 
 /**
  * GET /api/organizations/:id/policies/token
- * 对应 PoliciesController.GetByToken —— 通过邀请 token 获取已启用的策略（匿名端点，但 Workers 里统一需 auth）
+ * 对应 PoliciesController.GetByToken —— 通过邀请 token 获取已启用的策略
  */
 orgs.get('/:id/policies/token', async (c) => {
     const db = drizzle(c.env.DB);
@@ -2683,17 +2846,37 @@ orgs.get('/:id/policies/token', async (c) => {
     const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
     if (!org) return c.json({ message: 'Not found', object: 'error' }, 404);
 
-    let policyList: PolicyRow[];
-    try {
-        policyList = await db.select().from(policies)
-            .where(and(eq(policies.organizationId, orgId), eq(policies.enabled, true))).all();
-    } catch (e) {
-        if (isNoSuchTablePolicies(e)) policyList = [];
-        else throw e;
-    }
+    const policyList = await getOrgPolicies(db, orgId);
+    const enabledPolicies = policyList.filter(p => p.enabled);
 
     return c.json({
-        data: policyList.map(toPolicyResponse),
+        data: enabledPolicies.map(toPolicyResponse),
+        object: 'list',
+        continuationToken: null,
+    });
+});
+
+/**
+ * GET /api/organizations/:id/policies/invited-user
+ * 对应 PoliciesController.GetByInvitedUser（已废弃但仍需兼容旧客户端）
+ */
+orgs.get('/:id/policies/invited-user', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userIdParam = c.req.query('userId');
+    if (!userIdParam) throw new BadRequestError('userId is required.');
+
+    const orgUser = await db.select().from(organizationUsers)
+        .where(and(eq(organizationUsers.organizationId, orgId), eq(organizationUsers.userId, userIdParam)))
+        .get();
+    if (!orgUser) throw new NotFoundError('Not found.');
+    if (orgUser.status !== 0) throw new BadRequestError('User is not in invited status.');
+
+    const policyList = await getOrgPolicies(db, orgId);
+    const enabledPolicies = policyList.filter(p => p.enabled);
+
+    return c.json({
+        data: enabledPolicies.map(toPolicyResponse),
         object: 'list',
         continuationToken: null,
     });
@@ -2709,27 +2892,27 @@ orgs.get('/:id/policies/master-password', async (c) => {
     const userId = c.get('userId');
 
     const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
-    if (!org) return c.json({ message: 'Not found', object: 'error' }, 404);
+    if (!org) throw new NotFoundError('Not found.');
 
     await getOrgUser(db, orgId, userId);
 
     let policy: PolicyRow | undefined;
     try {
         policy = await db.select().from(policies)
-            .where(and(eq(policies.organizationId, orgId), eq(policies.type, 1)))
+            .where(and(eq(policies.organizationId, orgId), eq(policies.type, PolicyType.MasterPassword)))
             .get();
     } catch (e) {
         if (isNoSuchTablePolicies(e)) throw new NotFoundError('Policy not found.');
         throw e;
     }
 
-    if (!policy || !policy.enabled) return c.json({ message: 'Policy not found.', object: 'error' }, 404);
+    if (!policy || !policy.enabled) throw new NotFoundError('Policy not found.');
     return c.json(toPolicyResponse(policy));
 });
 
 /**
  * GET /api/organizations/:id/policies/:type
- * 对应 PoliciesController.Get —— 获取单个策略
+ * 对应 PoliciesController.Get —— 返回 PolicyStatusResponseModel（含 canToggleState）
  */
 orgs.get('/:id/policies/:type', async (c) => {
     const db = drizzle(c.env.DB);
@@ -2737,38 +2920,30 @@ orgs.get('/:id/policies/:type', async (c) => {
     const policyType = parseInt(c.req.param('type'), 10);
     const userId = c.get('userId');
 
-    if (Number.isNaN(policyType)) throw new BadRequestError('Invalid policy type.');
+    if (Number.isNaN(policyType) || !isValidPolicyType(policyType)) {
+        throw new BadRequestError('Invalid policy type.');
+    }
 
     const orgUser = await getOrgUser(db, orgId, userId);
     requireOwnerOrAdmin(orgUser);
 
-    let policy: PolicyRow | undefined;
-    try {
-        policy = await db.select().from(policies)
-            .where(and(eq(policies.organizationId, orgId), eq(policies.type, policyType)))
-            .get();
-    } catch (e) {
-        if (isNoSuchTablePolicies(e)) throw new NotFoundError('Policy not found.');
-        throw e;
-    }
+    const allPolicies = await getOrgPolicies(db, orgId);
+    const policy = allPolicies.find(p => p.type === policyType);
 
-    if (!policy) {
-        return c.json({
-            id: null,
-            organizationId: orgId,
-            type: policyType,
-            data: null,
-            enabled: false,
-            object: 'policy',
-        });
-    }
-
-    return c.json(toPolicyResponse(policy));
+    return c.json(toPolicyStatusResponse(orgId, policyType, policy, allPolicies));
 });
 
 /**
  * PUT /api/organizations/:id/policies/:type
- * 对应 PoliciesController.Put —— 创建或更新策略
+ * 对应 PoliciesController.Put + SavePolicyCommand.SaveAsync
+ *
+ * 完整流程：
+ *  1. 权限检查（Owner/Admin）
+ *  2. 数据验证（MasterPassword 等策略的字段校验）
+ *  3. 依赖检查（启用时检查前置策略，禁用时检查依赖策略）
+ *  4. 保存到数据库（upsert by OrganizationId + Type）
+ *  5. 执行副作用（SingleOrg 撤销多组织成员、TwoFactor 撤销无2FA成员）
+ *  6. 记录事件 + 推送同步
  */
 orgs.put('/:id/policies/:type', async (c) => {
     const db = drizzle(c.env.DB);
@@ -2776,7 +2951,9 @@ orgs.put('/:id/policies/:type', async (c) => {
     const policyType = parseInt(c.req.param('type'), 10);
     const userId = c.get('userId');
 
-    if (Number.isNaN(policyType)) throw new BadRequestError('Invalid policy type.');
+    if (Number.isNaN(policyType) || !isValidPolicyType(policyType)) {
+        throw new BadRequestError('Invalid policy type.');
+    }
 
     const orgUser = await getOrgUser(db, orgId, userId);
     requireOwnerOrAdmin(orgUser);
@@ -2789,22 +2966,22 @@ orgs.put('/:id/policies/:type', async (c) => {
         data?: Record<string, unknown> | null;
     }>();
 
+    const newEnabled = body.enabled ?? false;
+
+    const allPolicies = await getOrgPolicies(db, orgId);
+    const existing = allPolicies.find(p => p.type === policyType);
+    const currentEnabled = existing?.enabled ?? false;
+
+    const dataStr = runPolicyValidation(
+        policyType, newEnabled, body.data ?? null, currentEnabled, allPolicies,
+    );
+
     const now = new Date().toISOString();
-    const dataStr = body.data ? JSON.stringify(body.data) : null;
-
-    let existing: PolicyRow | undefined;
-    try {
-        existing = await db.select().from(policies)
-            .where(and(eq(policies.organizationId, orgId), eq(policies.type, policyType)))
-            .get();
-    } catch (e) {
-        if (!isNoSuchTablePolicies(e)) throw e;
-    }
-
     let policy: PolicyRow;
+
     if (existing) {
         await db.update(policies).set({
-            enabled: body.enabled ?? existing.enabled,
+            enabled: newEnabled,
             data: dataStr ?? existing.data,
             revisionDate: now,
         }).where(eq(policies.id, existing.id));
@@ -2817,7 +2994,88 @@ orgs.put('/:id/policies/:type', async (c) => {
             id: policyId,
             organizationId: orgId,
             type: policyType,
-            enabled: body.enabled ?? false,
+            enabled: newEnabled,
+            data: dataStr,
+            creationDate: now,
+            revisionDate: now,
+        });
+        const created = await db.select().from(policies).where(eq(policies.id, policyId)).get();
+        if (!created) throw new NotFoundError('Policy not found after creation.');
+        policy = created;
+    }
+
+    // EventType 1300 = Policy_Updated
+    await logEvent(c.env.DB, 1300, {
+        organizationId: orgId,
+        actingUserId: userId,
+        deviceType: getDeviceTypeFromRequest(c),
+    });
+
+    await runPolicySideEffects(db, policyType, newEnabled, currentEnabled, orgId, userId);
+
+    await bumpAccountRevisionDateByOrganizationId(db, orgId, now);
+    c.executionCtx.waitUntil(pushSyncVaultToOrgMembers(c.env, db, orgId));
+
+    return c.json(toPolicyResponse(policy));
+});
+
+/**
+ * PUT /api/organizations/:id/policies/:type/vnext
+ * 对应 PoliciesController.PutVNext —— vnext 版本的请求体格式为
+ *   { policy: { enabled, data }, metadata }
+ * 逻辑与 PUT /:type 相同，仅解包方式不同
+ */
+orgs.put('/:id/policies/:type/vnext', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const policyType = parseInt(c.req.param('type'), 10);
+    const userId = c.get('userId');
+
+    if (Number.isNaN(policyType) || !isValidPolicyType(policyType)) {
+        throw new BadRequestError('Invalid policy type.');
+    }
+
+    const orgUser = await getOrgUser(db, orgId, userId);
+    requireOwnerOrAdmin(orgUser);
+
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+
+    const body = await c.req.json<{
+        policy: { enabled?: boolean; data?: Record<string, unknown> | null };
+        metadata?: Record<string, unknown> | null;
+    }>();
+
+    const policyBody = body.policy ?? {};
+    const newEnabled = policyBody.enabled ?? false;
+
+    const allPolicies = await getOrgPolicies(db, orgId);
+    const existing = allPolicies.find(p => p.type === policyType);
+    const currentEnabled = existing?.enabled ?? false;
+
+    const dataStr = runPolicyValidation(
+        policyType, newEnabled, policyBody.data ?? null, currentEnabled, allPolicies,
+    );
+
+    const now = new Date().toISOString();
+    let policy: PolicyRow;
+
+    if (existing) {
+        await db.update(policies).set({
+            enabled: newEnabled,
+            data: dataStr ?? existing.data,
+            revisionDate: now,
+        }).where(eq(policies.id, existing.id));
+        const updated = await db.select().from(policies).where(eq(policies.id, existing.id)).get();
+        if (!updated) throw new NotFoundError('Policy not found after update.');
+        policy = updated;
+    } else {
+        const policyId = generateUuid();
+        await db.insert(policies).values({
+            id: policyId,
+            organizationId: orgId,
+            type: policyType,
+            enabled: newEnabled,
             data: dataStr,
             creationDate: now,
             revisionDate: now,
@@ -2832,6 +3090,8 @@ orgs.put('/:id/policies/:type', async (c) => {
         actingUserId: userId,
         deviceType: getDeviceTypeFromRequest(c),
     });
+
+    await runPolicySideEffects(db, policyType, newEnabled, currentEnabled, orgId, userId);
 
     await bumpAccountRevisionDateByOrganizationId(db, orgId, now);
     c.executionCtx.waitUntil(pushSyncVaultToOrgMembers(c.env, db, orgId));
@@ -2856,14 +3116,29 @@ orgs.get('/:id/plan-type', async (c) => {
 
 /**
  * GET /api/organizations/:id/auto-enroll-status
- * 自动注册状态（简化）
+ * 对应官方 OrganizationsController.GetAutoEnrollStatus
+ * 检查 ResetPassword(8) 策略是否启用且 autoEnrollEnabled=true
  */
 orgs.get('/:id/auto-enroll-status', async (c) => {
+    const db = drizzle(c.env.DB);
     const orgId = c.req.param('id');
+
+    let resetPasswordEnabled = false;
+    try {
+        const resetPolicy = await db.select().from(policies)
+            .where(and(eq(policies.organizationId, orgId), eq(policies.type, PolicyType.ResetPassword)))
+            .get();
+        if (resetPolicy?.enabled && resetPolicy.data) {
+            try {
+                const policyData = JSON.parse(resetPolicy.data) as { autoEnrollEnabled?: boolean };
+                resetPasswordEnabled = policyData.autoEnrollEnabled === true;
+            } catch { /* ignore parse errors */ }
+        }
+    } catch { /* policies table may not exist yet */ }
 
     return c.json({
         id: orgId,
-        resetPasswordEnabled: false,
+        resetPasswordEnabled,
         object: 'organizationAutoEnrollStatus',
     });
 });

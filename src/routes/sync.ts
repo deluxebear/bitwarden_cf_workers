@@ -371,6 +371,7 @@ sync.get('/', async (c) => {
                     type: p.type,
                     data,
                     enabled: p.enabled,
+                    revisionDate: p.revisionDate,
                     object: 'policy',
                 };
             });
