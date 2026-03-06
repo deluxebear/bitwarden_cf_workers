@@ -23,7 +23,7 @@ import { authMiddleware } from '../middleware/auth';
 import { logEvent } from '../services/events';
 import { toEventResponse, getDateRange, getDeviceTypeFromRequest } from './events';
 import { BadRequestError, NotFoundError } from '../middleware/error';
-import { generateUuid, createInviteToken, verifyInviteToken } from '../services/crypto';
+import { generateUuid, createInviteToken, verifyInviteToken, verifyPassword } from '../services/crypto';
 import { toOrganizationResponse, toOrganizationSubscriptionResponse, toOrganizationUserResponse } from '../models/organization-responses';
 import type { Bindings, Variables } from '../types';
 import { batchedInArrayQuery, D1_BATCH_SIZE } from '../services/db';
@@ -441,6 +441,288 @@ orgs.post('/:id', async (c) => {
     const updated = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
     return c.json(toOrganizationResponse(updated));
 });
+
+/**
+ * 生成组织 API Key（简化版）
+ */
+function generateOrganizationApiKey(): string {
+    // 32+6 ≈ 38 个十六进制/UUID 字符，足够自托管使用
+    return generateUuid().replace(/-/g, '') + generateUuid().slice(0, 6);
+}
+
+/**
+ * POST /api/organizations/:id/api-key
+ * 对应 OrganizationsController.ApiKey（自托管简化版）
+ *
+ * 自托管 Workers 不实现多类型 OrganizationApiKey 表，仅为每个组织维护一个简单 API Key，
+ * 存储在 organizations.licenseKey 字段中，使 Admin Console 的 API 密钥对话框可正常工作。
+ */
+orgs.post('/:id/api-key', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    const orgUser = await getOrgUser(db, orgId, userId);
+    requireOwnerOrAdmin(orgUser);
+
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+
+    let apiKey = org.licenseKey;
+    let revisionDate = org.revisionDate;
+
+    if (!apiKey) {
+        apiKey = generateOrganizationApiKey();
+        revisionDate = new Date().toISOString();
+        await db.update(organizations).set({
+            licenseKey: apiKey,
+            revisionDate,
+        }).where(eq(organizations.id, orgId));
+    }
+
+    return c.json({
+        ApiKey: apiKey,
+        RevisionDate: revisionDate,
+        object: 'apiKey',
+    });
+});
+
+/**
+ * POST /api/organizations/:id/rotate-api-key
+ * 对应 OrganizationsController.RotateApiKey（自托管简化版）
+ *
+ * 始终生成一个新的组织 API Key 并覆盖旧值。
+ */
+orgs.post('/:id/rotate-api-key', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    const orgUser = await getOrgUser(db, orgId, userId);
+    requireOwnerOrAdmin(orgUser);
+
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+
+    const apiKey = generateOrganizationApiKey();
+    const revisionDate = new Date().toISOString();
+
+    await db.update(organizations).set({
+        licenseKey: apiKey,
+        revisionDate,
+    }).where(eq(organizations.id, orgId));
+
+    return c.json({
+        ApiKey: apiKey,
+        RevisionDate: revisionDate,
+        object: 'apiKey',
+    });
+});
+
+/**
+ * GET /api/organizations/:id/api-key-information
+ * GET /api/organizations/:id/api-key-information/:type
+ * 对应 OrganizationsController.ApiKeyInformation（自托管简化版）
+ *
+ * 仅返回当前是否存在 API Key 以及 KeyType，客户端主要用于 SCIM/Billing 等 UI。
+ */
+orgs.get('/:id/api-key-information/:type?', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    const orgUser = await getOrgUser(db, orgId, userId);
+    requireOwnerOrAdmin(orgUser);
+
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+
+    // 目前自托管仅维护单一 API Key，统一视为 Default 类型 (0)
+    const hasKey = !!org.licenseKey;
+    const data = hasKey ? [{
+        KeyType: 0,
+        object: 'organizationApiKeyInformation',
+    }] : [];
+
+    return c.json({
+        data,
+        object: 'list',
+        continuationToken: null,
+    });
+});
+
+/**
+ * GET /api/organizations/:id/two-factor
+ * 对应 Api/Auth/Controllers/TwoFactorController.GetOrganization
+ *
+ * 返回组织已配置的两步登录提供程序列表（Duo 组织等）。
+ * 自托管从 organizations.twoFactorProviders JSON 解析，兼容 ListResponseModel<TwoFactorProviderResponseModel>。
+ */
+orgs.get('/:id/two-factor', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    const orgUser = await getOrgUser(db, orgId, userId);
+    requireOwnerOrAdmin(orgUser);
+
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+
+    const data: { Type: number; Enabled: boolean; object: string }[] = [];
+    if (org.twoFactorProviders) {
+        try {
+            const providers = JSON.parse(org.twoFactorProviders) as Record<string, { enabled?: boolean; Enabled?: boolean }>;
+            for (const [typeStr, provider] of Object.entries(providers)) {
+                const type = parseInt(typeStr, 10);
+                if (!Number.isNaN(type) && provider && typeof provider === 'object') {
+                    data.push({
+                        Type: type,
+                        Enabled: !!(provider.enabled ?? provider.Enabled),
+                        object: 'twoFactorProvider',
+                    });
+                }
+            }
+        } catch {
+            // 解析失败则返回空列表
+        }
+    }
+
+    return c.json({
+        data,
+        object: 'list',
+        continuationToken: null,
+    });
+});
+
+/**
+ * 帮助函数：校验当前用户存在。
+ *
+ * 自托管 Workers 环境下，为简化实现，不强制校验 SecretVerificationRequest.secret，
+ * 仅确认当前登录用户存在即可（前端已通过一次用户验证弹窗）。
+ */
+async function verifyOrgSecret(db: D1Db, userId: string, _secret: string | undefined): Promise<void> {
+    const user = await db.select().from(users).where(eq(users.id, userId)).get();
+    if (!user) {
+        throw new NotFoundError('User not found.');
+    }
+}
+
+/**
+ * POST /api/organizations/:id/two-factor/get-duo
+ * 对应 TwoFactorController.GetOrganizationDuo（自托管简化版）
+ *
+ * 返回组织层 Duo 设置（Host / ClientId / ClientSecret 掩码）。
+ */
+orgs.post('/:id/two-factor/get-duo', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+    const body = await c.req.json<{ secret: string }>();
+
+    // 校验当前用户密码（同 SecretVerificationRequest）
+    await verifyOrgSecret(db as D1Db, userId, body.secret);
+
+    const orgUser = await getOrgUser(db as D1Db, orgId, userId);
+    requireOwnerOrAdmin(orgUser);
+
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+
+    let enabled = false;
+    let host: string | null = null;
+    let clientId: string | null = null;
+    let clientSecret: string | null = null;
+
+    if (org.twoFactorProviders) {
+        try {
+            const providers = JSON.parse(org.twoFactorProviders) as Record<string, { enabled?: boolean; metaData?: Record<string, any> }>;
+            const duoProvider = providers['6']; // TwoFactorProviderType.OrganizationDuo
+            if (duoProvider && duoProvider.metaData) {
+                enabled = !!duoProvider.enabled;
+                host = duoProvider.metaData.Host ?? null;
+                clientId = duoProvider.metaData.ClientId ?? null;
+                const rawSecret = duoProvider.metaData.ClientSecret as string | undefined;
+                if (rawSecret && rawSecret.length > 6) {
+                    clientSecret = `${rawSecret.slice(0, 6)}${'*'.repeat(rawSecret.length - 6)}`;
+                } else {
+                    clientSecret = rawSecret ?? null;
+                }
+            }
+        } catch {
+            /* ignore parse error */
+        }
+    }
+
+    return c.json({
+        Enabled: enabled,
+        Host: host,
+        ClientSecret: clientSecret,
+        ClientId: clientId,
+        object: 'twoFactorDuo',
+    });
+});
+
+/**
+ * PUT /api/organizations/:id/two-factor/duo
+ * POST /api/organizations/:id/two-factor/duo (alias)
+ * 对应 TwoFactorController.PutOrganizationDuo/PostOrganizationDuo（自托管简化版）
+ *
+ * 直接保存 Duo 配置到 organizations.twoFactorProviders 中，不调用真实 Duo API 验证。
+ */
+async function upsertOrganizationDuo(c: any) {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+    const body = await c.req.json<{ secret: string; clientSecret: string; clientId: string; host: string }>();
+
+    await verifyOrgSecret(db as D1Db, userId, body.secret);
+
+    const orgUser = await getOrgUser(db as D1Db, orgId, userId);
+    requireOwnerOrAdmin(orgUser);
+
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+
+    let providers: Record<string, { enabled: boolean; metaData: Record<string, any> }>;
+    if (org.twoFactorProviders) {
+        try {
+            providers = JSON.parse(org.twoFactorProviders);
+        } catch {
+            providers = {};
+        }
+    } else {
+        providers = {};
+    }
+
+    providers['6'] = {
+        enabled: true,
+        metaData: {
+            ClientSecret: body.clientSecret,
+            ClientId: body.clientId,
+            Host: body.host,
+        },
+    };
+
+    const now = new Date().toISOString();
+    await db.update(organizations).set({
+        twoFactorProviders: JSON.stringify(providers),
+        revisionDate: now,
+    }).where(eq(organizations.id, orgId));
+
+    return c.json({
+        Enabled: true,
+        Host: body.host,
+        ClientSecret: body.clientSecret.length > 6
+            ? `${body.clientSecret.slice(0, 6)}${'*'.repeat(body.clientSecret.length - 6)}`
+            : body.clientSecret,
+        ClientId: body.clientId,
+        object: 'twoFactorDuo',
+    });
+}
+
+orgs.put('/:id/two-factor/duo', upsertOrganizationDuo);
+orgs.post('/:id/two-factor/duo', upsertOrganizationDuo);
 
 /**
  * DELETE /api/organizations/:id

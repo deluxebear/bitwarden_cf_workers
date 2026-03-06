@@ -281,6 +281,43 @@ accounts.get('/revision-date', async (c) => {
 });
 
 /**
+ * GET /api/accounts/subscription
+ * 对应 Billing/Controllers/AccountsController.GetSubscriptionAsync（自托管简化版）
+ *
+ * 自托管环境下官方实现只是基于 User 与 License 构建 SubscriptionResponseModel，
+ * 未关联 Stripe 等外部网关。Workers 目前未持久化用户存储/License 信息，
+ * 因此这里返回一个最小且结构兼容的响应，确保 Web/iOS/桌面客户端能够正常渲染
+ * 「订阅」页面，而不会 404。
+ */
+accounts.get('/subscription', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+
+    const user = await db.select().from(users).where(eq(users.id, userId)).get();
+    if (!user) {
+        throw new NotFoundError('User not found.');
+    }
+
+    // 目前未单独记录个人订阅/存储信息，自托管场景下保持简单：
+    // - storageName: null（不展示）
+    // - storageGb: 0
+    // - maxStorageGb: 1（与组织默认一致，仅用于 UI 展示）
+    // - subscription / upcomingInvoice / customerDiscount / license: null
+    // - expiration: null（不展示到期时间）
+    return c.json({
+        storageName: null,
+        storageGb: 0,
+        maxStorageGb: 1,
+        subscription: null,
+        upcomingInvoice: null,
+        customerDiscount: null,
+        license: null,
+        expiration: null,
+        object: 'subscription',
+    });
+});
+
+/**
  * GET /api/accounts/keys
  * 对应 AccountsController.GetKeys
  */
