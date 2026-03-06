@@ -378,3 +378,8 @@ export const webAuthnCredentials = sqliteTable('webauthn_credentials', {
     index('idx_webauthn_credentials_user_id').on(table.userId),
     index('idx_webauthn_credentials_credential_id').on(table.credentialId),
 ]);
+
+// ==================== 推断类型（供路由等使用，避免 any） ====================
+export type OrganizationUserRow = typeof organizationUsers.$inferSelect;
+export type OrganizationRow = typeof organizations.$inferSelect;
+export type UserRow = typeof users.$inferSelect;

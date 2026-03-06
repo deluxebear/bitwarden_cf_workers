@@ -87,6 +87,31 @@ export function toOrganizationResponse(org: any) {
 }
 
 /**
+ * OrganizationSubscriptionResponseModel - GET /organizations/{id}/subscription
+ * 对应官方 Api/AdminConsole/Models/Response/Organizations/OrganizationResponseModel.cs
+ * 自托管场景：与 OrganizationResponse 相同，object 为 organizationSubscription，并增加 expiration/storage 等字段
+ */
+export function toOrganizationSubscriptionResponse(org: any) {
+    const base = toOrganizationResponse(org);
+    const storageBytes = org.storage != null ? Number(org.storage) : null;
+    const storageGb = storageBytes != null ? Math.round((storageBytes / 1073741824) * 100) / 100 : null;
+    let storageName: string | null = null;
+    if (storageBytes != null && storageBytes > 0) {
+        const gb = storageBytes / 1073741824;
+        if (gb >= 1) storageName = `${gb.toFixed(2)} GB`;
+        else storageName = `${Math.round(storageBytes / 1048576)} MB`;
+    }
+    return {
+        ...base,
+        object: 'organizationSubscription' as const,
+        expiration: org.expirationDate ?? null,
+        expirationWithoutGracePeriod: null,
+        storageName,
+        storageGb: storageGb ?? 0,
+    };
+}
+
+/**
  * ProfileOrganizationResponseModel - 用于 Sync
  * 对应官方 Api/AdminConsole/Models/Response/ProfileOrganizationResponseModel.cs
  */

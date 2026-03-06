@@ -6,6 +6,7 @@ import { authMiddleware } from '../middleware/auth';
 import { BadRequestError } from '../middleware/error';
 import { logEvent } from '../services/events';
 import type { Bindings, Variables } from '../types';
+import { batchedInArrayQuery } from '../services/db';
 
 /** 客户端 POST /collect 请求体中的单条事件（对应官方 EventModel） */
 interface CollectEventModel {
@@ -218,8 +219,8 @@ evRoutes.post('/collect', async (c) => {
     }
 
     if (cipherEvents.length > 0 && cipherIdsToLoad.size > 0) {
-        const cipherList = await db.select().from(ciphers)
-            .where(inArray(ciphers.id, [...cipherIdsToLoad])).all();
+        const cipherList = await batchedInArrayQuery<typeof ciphers.$inferSelect>(
+            db, ciphers, ciphers.id, [...cipherIdsToLoad]);
         const cipherMap = new Map(cipherList.map((row) => [row.id, row]));
 
         for (const ev of cipherEvents) {

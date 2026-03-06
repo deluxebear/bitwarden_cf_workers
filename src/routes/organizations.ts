@@ -6,24 +6,54 @@
 import { Hono } from 'hono';
 import { drizzle } from 'drizzle-orm/d1';
 import { eq, and, desc, inArray, sql } from 'drizzle-orm';
-import { organizations, organizationUsers, users, events, collections, collectionUsers, groups, groupUsers, collectionGroups } from '../db/schema';
+import {
+    organizations,
+    organizationUsers,
+    users,
+    events,
+    collections,
+    collectionUsers,
+    groups,
+    groupUsers,
+    collectionGroups,
+    collectionCiphers,
+} from '../db/schema';
+import type { OrganizationUserRow, OrganizationRow, UserRow } from '../db/schema';
 import { authMiddleware } from '../middleware/auth';
 import { logEvent } from '../services/events';
 import { toEventResponse, getDateRange, getDeviceTypeFromRequest } from './events';
 import { BadRequestError, NotFoundError } from '../middleware/error';
 import { generateUuid, createInviteToken, verifyInviteToken } from '../services/crypto';
-import { toOrganizationResponse, toOrganizationUserResponse } from '../models/organization-responses';
+import { toOrganizationResponse, toOrganizationSubscriptionResponse, toOrganizationUserResponse } from '../models/organization-responses';
 import type { Bindings, Variables } from '../types';
+import { batchedInArrayQuery } from '../services/db';
 
 const orgs = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 orgs.use('/*', authMiddleware);
+
+// ==================== 类型定义 ====================
+
+/** 组织成员权限 JSON（camelCase，与官方 Permissions 一致） */
+interface OrganizationUserPermissions {
+    manageGroups?: boolean;
+    manageUsers?: boolean;
+    createNewCollections?: boolean;
+    editAnyCollection?: boolean;
+    deleteAnyCollection?: boolean;
+    accessEventLogs?: boolean;
+    /** 对应官方 AccessImportExport，用于组织导入/导出及向已有集合导入条目 */
+    accessImportExport?: boolean;
+}
+
+/** Drizzle D1 实例（用于 getOrgUser 等，避免 any） */
+type D1Db = ReturnType<typeof drizzle>;
 
 // ==================== 辅助函数 ====================
 
 /**
  * 验证组织用户权限，返回 orgUser 记录
  */
-async function getOrgUser(db: any, orgId: string, userId: string) {
+async function getOrgUser(db: D1Db, orgId: string, userId: string): Promise<OrganizationUserRow> {
     const orgUser = await db.select().from(organizationUsers)
         .where(and(eq(organizationUsers.organizationId, orgId), eq(organizationUsers.userId, userId))).get();
 
@@ -36,7 +66,7 @@ async function getOrgUser(db: any, orgId: string, userId: string) {
 /**
  * 验证是否为 Owner 或 Admin
  */
-function requireOwnerOrAdmin(orgUser: any) {
+function requireOwnerOrAdmin(orgUser: OrganizationUserRow): void {
     if (orgUser.type !== 0 && orgUser.type !== 1) {
         throw new BadRequestError('Requires Owner or Admin privileges.');
     }
@@ -45,22 +75,64 @@ function requireOwnerOrAdmin(orgUser: any) {
 /**
  * 验证是否为 Owner
  */
-function requireOwner(orgUser: any) {
+function requireOwner(orgUser: OrganizationUserRow): void {
     if (orgUser.type !== 0) {
         throw new BadRequestError('Requires Owner privileges.');
     }
 }
 
+function parseOrgUserPermissions(permissions: string | null): OrganizationUserPermissions | null {
+    if (!permissions) return null;
+    try {
+        return JSON.parse(permissions) as OrganizationUserPermissions;
+    } catch {
+        return null;
+    }
+}
+
+/** 是否有权查看群组详情（列表）：Owner/Admin 或 permissions.manageGroups 或 permissions.manageUsers */
+function canViewGroupDetails(orgUser: OrganizationUserRow): boolean {
+    if (orgUser.type === 0 || orgUser.type === 1) return true; // Owner, Admin
+    const perms = parseOrgUserPermissions(orgUser.permissions);
+    return !!(perms && (perms.manageGroups === true || perms.manageUsers === true));
+}
+
+/** 是否有权创建集合：Owner/Admin 或 permissions.createNewCollections（与官方 BulkCollectionOperations.Create 一致） */
+function canCreateCollection(orgUser: OrganizationUserRow): boolean {
+    if (orgUser.type === 0 || orgUser.type === 1) return true; // Owner, Admin
+    const perms = parseOrgUserPermissions(orgUser.permissions);
+    return !!(perms && perms.createNewCollections === true);
+}
+
+/** 是否有权导入/导出：Owner/Admin 或 permissions.accessImportExport（与官方 CheckOrgImportPermission 一致） */
+function canAccessImportExport(orgUser: OrganizationUserRow): boolean {
+    if (orgUser.type === 0 || orgUser.type === 1) return true; // Owner, Admin
+    const perms = parseOrgUserPermissions(orgUser.permissions);
+    return !!(perms && perms.accessImportExport === true);
+}
+
+/** 是否有权编辑集合：Owner/Admin（且组织允许管理员访问全部）或 permissions.editAnyCollection */
+function canEditCollection(orgUser: OrganizationUserRow, org: OrganizationRow | null | undefined): boolean {
+    const perms = parseOrgUserPermissions(orgUser.permissions);
+    if (perms?.editAnyCollection === true) return true;
+    const allowAdminAll = org?.allowAdminAccessToAllCollectionItems === true;
+    return (orgUser.type === 0 || orgUser.type === 1) && !!allowAdminAll;
+}
+
+/** 是否有权删除集合：Owner/Admin（且组织允许管理员访问全部）或 permissions.deleteAnyCollection */
+function canDeleteCollection(orgUser: OrganizationUserRow, org: OrganizationRow | null | undefined): boolean {
+    const perms = parseOrgUserPermissions(orgUser.permissions);
+    if (perms?.deleteAnyCollection === true) return true;
+    const allowAdminAll = org?.allowAdminAccessToAllCollectionItems === true;
+    return (orgUser.type === 0 || orgUser.type === 1) && !!allowAdminAll;
+}
+
 /** 是否有权查看事件日志：组织开启 useEvents 且 (Owner/Admin 或 permissions.accessEventLogs) */
-function canAccessEventLogs(org: any, orgUser: any): boolean {
+function canAccessEventLogs(org: OrganizationRow | null | undefined, orgUser: OrganizationUserRow): boolean {
     if (!org?.useEvents) return false;
     if (orgUser.type === 0 || orgUser.type === 1) return true; // Owner, Admin
-    try {
-        const perms = orgUser.permissions ? JSON.parse(orgUser.permissions) : null;
-        return !!(perms && perms.accessEventLogs);
-    } catch {
-        return false;
-    }
+    const perms = parseOrgUserPermissions(orgUser.permissions);
+    return !!(perms?.accessEventLogs);
 }
 
 /**
@@ -102,6 +174,18 @@ function buildOrgDefaults(planType: number) {
         allowAdminAccessToAllCollectionItems: true,
     };
 }
+
+// ==================== Organization Connections（与云端通信） ====================
+// 对应官方 Api/AdminConsole/Controllers/OrganizationConnectionsController.cs
+
+/**
+ * GET /api/organizations/connections/enabled
+ * 是否启用组织连接（SelfHosted && EnableCloudCommunication）；Workers 自建默认 false，可通过 env 开启
+ */
+orgs.get('/connections/enabled', async (c) => {
+    const enabled = (c.env as { ENABLE_CLOUD_COMMUNICATION?: string }).ENABLE_CLOUD_COMMUNICATION === 'true';
+    return c.json(enabled);
+});
 
 // ==================== 组织 CRUD ====================
 
@@ -224,7 +308,7 @@ orgs.put('/:id', async (c) => {
     }>();
 
     const now = new Date().toISOString();
-    const updateData: Record<string, any> = { revisionDate: now };
+    const updateData: Partial<OrganizationRow> = { revisionDate: now };
 
     if (body.name !== undefined) updateData.name = body.name;
     if (body.billingEmail !== undefined) {
@@ -271,7 +355,7 @@ orgs.post('/:id', async (c) => {
     }>();
 
     const now = new Date().toISOString();
-    const updateData: Record<string, any> = { revisionDate: now };
+    const updateData: Partial<OrganizationRow> = { revisionDate: now };
     if (body.name !== undefined) updateData.name = body.name;
     if (body.billingEmail !== undefined) {
         updateData.billingEmail = body.billingEmail;
@@ -515,10 +599,10 @@ orgs.get('/:id/users', async (c) => {
     const usersList = await db.select().from(organizationUsers)
         .where(eq(organizationUsers.organizationId, orgId)).all();
 
-    const userIds = usersList.filter(u => u.userId).map(u => u.userId!);
-    let usersMap: Record<string, any> = {};
+    const userIds = usersList.filter((u): u is OrganizationUserRow & { userId: string } => u.userId != null).map(u => u.userId);
+    const usersMap: Record<string, UserRow> = {};
     if (userIds.length > 0) {
-        const userRecords = await db.select().from(users).where(inArray(users.id, userIds)).all();
+        const userRecords = await batchedInArrayQuery<UserRow>(db, users, users.id, userIds);
         for (const u of userRecords) {
             usersMap[u.id] = u;
         }
@@ -529,9 +613,8 @@ orgs.get('/:id/users', async (c) => {
     if (includeGroups && usersList.length > 0) {
         try {
             const orgUserIds = usersList.map(u => u.id);
-            const guRows = await db.select({ organizationUserId: groupUsers.organizationUserId, groupId: groupUsers.groupId })
-                .from(groupUsers)
-                .where(inArray(groupUsers.organizationUserId, orgUserIds)).all();
+            const guRows = await batchedInArrayQuery<{ organizationUserId: string; groupId: string }>(
+                db, groupUsers, groupUsers.organizationUserId, orgUserIds);
             for (const row of guRows) {
                 if (!orgUserGroupsMap[row.organizationUserId]) orgUserGroupsMap[row.organizationUserId] = [];
                 orgUserGroupsMap[row.organizationUserId].push(row.groupId);
@@ -568,10 +651,10 @@ orgs.get('/:id/users/mini-details', async (c) => {
     const usersList = await db.select().from(organizationUsers)
         .where(eq(organizationUsers.organizationId, orgId)).all();
 
-    const userIds = usersList.filter(u => u.userId).map(u => u.userId!);
-    let usersMap: Record<string, any> = {};
+    const userIds = usersList.filter((u): u is OrganizationUserRow & { userId: string } => u.userId != null).map(u => u.userId);
+    const usersMap: Record<string, UserRow> = {};
     if (userIds.length > 0) {
-        const userRecords = await db.select().from(users).where(inArray(users.id, userIds)).all();
+        const userRecords = await batchedInArrayQuery<UserRow>(db, users, users.id, userIds);
         for (const u of userRecords) {
             usersMap[u.id] = u;
         }
@@ -611,7 +694,7 @@ orgs.get('/:id/users/:orgUserId', async (c) => {
         .where(and(eq(organizationUsers.id, orgUserId), eq(organizationUsers.organizationId, orgId))).get();
     if (!targetOrgUser) throw new NotFoundError('Organization user not found.');
 
-    let user;
+    let user: UserRow | undefined;
     if (targetOrgUser.userId) {
         user = await db.select().from(users).where(eq(users.id, targetOrgUser.userId)).get();
     }
@@ -758,7 +841,7 @@ orgs.post('/:id/users/:orgUserId/accept', async (c) => {
 
     let tokenValid = false;
     try {
-        const body = await c.req.json<{ token?: string; resetPasswordKey?: string }>().catch(() => ({}));
+        const body = await c.req.json<{ token?: string; resetPasswordKey?: string }>().catch((): { token?: string; resetPasswordKey?: string } => ({}));
         if (body?.token) {
             const payload = await verifyInviteToken(body.token, c.env.JWT_SECRET);
             tokenValid = !!payload &&
@@ -922,10 +1005,10 @@ orgs.post('/:id/users/public-keys', async (c) => {
             inArray(organizationUsers.id, body.ids),
         )).all();
 
-    const userIds = orgUsersList.filter(ou => ou.userId).map(ou => ou.userId!);
-    let usersMap: Record<string, any> = {};
+    const userIds = orgUsersList.filter((ou): ou is OrganizationUserRow & { userId: string } => ou.userId != null).map(ou => ou.userId);
+    const usersMap: Record<string, UserRow> = {};
     if (userIds.length > 0) {
-        const userRecords = await db.select().from(users).where(inArray(users.id, userIds)).all();
+        const userRecords = await batchedInArrayQuery<UserRow>(db, users, users.id, userIds);
         for (const u of userRecords) {
             usersMap[u.id] = u;
         }
@@ -963,7 +1046,7 @@ orgs.put('/:id/users/:orgUserId', async (c) => {
     const body = await c.req.json<{
         type?: number;
         accessAll?: boolean;
-        permissions?: any;
+        permissions?: OrganizationUserPermissions;
         collections?: Array<{ id: string; readOnly?: boolean; hidePasswords?: boolean; manage?: boolean }>;
         groups?: string[];
         accessSecretsManager?: boolean;
@@ -980,7 +1063,7 @@ orgs.put('/:id/users/:orgUserId', async (c) => {
     }
 
     const now = new Date().toISOString();
-    const updateData: Record<string, any> = { revisionDate: now };
+    const updateData: Partial<OrganizationUserRow> = { revisionDate: now };
     if (body.type !== undefined) updateData.type = body.type;
     if (body.permissions !== undefined) updateData.permissions = JSON.stringify(body.permissions);
     if (body.accessSecretsManager !== undefined) updateData.accessSecretsManager = body.accessSecretsManager;
@@ -1131,7 +1214,6 @@ orgs.put('/:id/users/:orgUserId/reset-password-enrollment', async (c) => {
     const db = drizzle(c.env.DB);
     const orgId = c.req.param('id');
     const orgUserId = c.req.param('orgUserId');
-    const userId = c.get('userId');
 
     const body = await c.req.json<{ resetPasswordKey?: string; masterPasswordHash?: string }>();
 
@@ -1170,7 +1252,7 @@ orgs.put('/:id/collection-management', async (c) => {
     }>();
 
     const now = new Date().toISOString();
-    const updateData: Record<string, any> = { revisionDate: now };
+    const updateData: Partial<OrganizationRow> = { revisionDate: now };
     if (body.limitCollectionCreation !== undefined) updateData.limitCollectionCreation = body.limitCollectionCreation;
     if (body.limitCollectionDeletion !== undefined) updateData.limitCollectionDeletion = body.limitCollectionDeletion;
     if (body.limitItemDeletion !== undefined) updateData.limitItemDeletion = body.limitItemDeletion;
@@ -1183,6 +1265,7 @@ orgs.put('/:id/collection-management', async (c) => {
 
 /**
  * POST /api/organizations/:id/collections
+ * 创建集合：需 Owner/Admin 或 createNewCollections 权限（与官方 BulkCollectionOperations.Create 一致）
  */
 orgs.post('/:id/collections', async (c) => {
     const db = drizzle(c.env.DB);
@@ -1194,7 +1277,10 @@ orgs.post('/:id/collections', async (c) => {
         throw new BadRequestError('Name is required.');
     }
 
-    await getOrgUser(db, orgId, userId);
+    const orgUser = await getOrgUser(db, orgId, userId);
+    if (!canCreateCollection(orgUser)) {
+        throw new BadRequestError('Requires Owner, Admin, or Create New Collections permission.');
+    }
 
     const collectionId = generateUuid();
     const now = new Date().toISOString();
@@ -1228,6 +1314,7 @@ interface CollectionUpdateBody {
 /**
  * PUT /api/organizations/:id/collections/:collectionId
  * 更新集合名称、externalId，并整体替换群组/成员访问权限（与官方 UpdateCollectionCommand 一致）
+ * 需 editAnyCollection 或 (Owner/Admin 且 allowAdminAccessToAllCollectionItems)
  */
 orgs.put('/:id/collections/:collectionId', async (c) => {
     const db = drizzle(c.env.DB);
@@ -1240,9 +1327,12 @@ orgs.put('/:id/collections/:collectionId', async (c) => {
         throw new BadRequestError('Name is required.');
     }
 
-    await getOrgUser(db, orgId, userId);
+    const orgUser = await getOrgUser(db, orgId, userId);
     const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
     if (!org) throw new NotFoundError('Organization not found.');
+    if (!canEditCollection(orgUser, org)) {
+        throw new BadRequestError('Requires Edit Any Collection permission or Owner/Admin with access to all collections.');
+    }
 
     const col = await db.select().from(collections)
         .where(and(eq(collections.id, collectionId), eq(collections.organizationId, orgId))).get();
@@ -1262,7 +1352,7 @@ orgs.put('/:id/collections/:collectionId', async (c) => {
 
     const groupHasManage = groupsList.some((g) => g.manage);
     const userHasManage = usersList.some((u) => u.manage);
-    const allowAdminAll = org.allowAdminAccessToAllCollectionItems === true || org.allowAdminAccessToAllCollectionItems === 1;
+    const allowAdminAll = org.allowAdminAccessToAllCollectionItems === true;
     if (!groupHasManage && !userHasManage && !allowAdminAll) {
         throw new BadRequestError('At least one member or group must have can manage permission.');
     }
@@ -1326,6 +1416,7 @@ orgs.put('/:id/collections/:collectionId', async (c) => {
 
 /**
  * DELETE /api/organizations/:id/collections/:collectionId
+ * 需 deleteAnyCollection 或 (Owner/Admin 且 allowAdminAccessToAllCollectionItems)
  */
 orgs.delete('/:id/collections/:collectionId', async (c) => {
     const db = drizzle(c.env.DB);
@@ -1333,13 +1424,91 @@ orgs.delete('/:id/collections/:collectionId', async (c) => {
     const collectionId = c.req.param('collectionId');
     const userId = c.get('userId');
 
-    await getOrgUser(db, orgId, userId);
+    const orgUser = await getOrgUser(db, orgId, userId);
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+    if (!canDeleteCollection(orgUser, org)) {
+        throw new BadRequestError('Requires Delete Any Collection permission or Owner/Admin with access to all collections.');
+    }
 
     const col = await db.select().from(collections)
         .where(and(eq(collections.id, collectionId), eq(collections.organizationId, orgId))).get();
     if (!col) throw new NotFoundError('Collection not found.');
 
+    await db.delete(collectionUsers).where(eq(collectionUsers.collectionId, collectionId));
+    await db.delete(collectionGroups).where(eq(collectionGroups.collectionId, collectionId));
+    await db.delete(collectionCiphers).where(eq(collectionCiphers.collectionId, collectionId));
     await db.delete(collections).where(eq(collections.id, collectionId));
+
+    return c.json({});
+});
+
+/**
+ * DELETE /api/organizations/:id/collections
+ * 对应 CollectionsController.DeleteMany（批量删除集合）
+ */
+orgs.delete('/:id/collections', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    const body = await c.req.json<{ ids: string[] }>();
+    if (!body.ids?.length) {
+        throw new BadRequestError('No collection ids provided.');
+    }
+
+    const orgUser = await getOrgUser(db, orgId, userId);
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+    if (!canDeleteCollection(orgUser, org)) {
+        throw new BadRequestError('Requires Delete Any Collection permission or Owner/Admin with access to all collections.');
+    }
+
+    for (const colId of body.ids) {
+        const col = await db.select().from(collections)
+            .where(and(eq(collections.id, colId), eq(collections.organizationId, orgId))).get();
+        if (!col) continue;
+
+        await db.delete(collectionUsers).where(eq(collectionUsers.collectionId, colId));
+        await db.delete(collectionGroups).where(eq(collectionGroups.collectionId, colId));
+        await db.delete(collectionCiphers).where(eq(collectionCiphers.collectionId, colId));
+        await db.delete(collections).where(eq(collections.id, colId));
+    }
+
+    return c.json({});
+});
+
+/**
+ * POST /api/organizations/:id/collections/delete
+ * 对应 CollectionsController.PostDeleteMany（POST alias）
+ */
+orgs.post('/:id/collections/delete', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    const body = await c.req.json<{ ids: string[] }>();
+    if (!body.ids?.length) {
+        throw new BadRequestError('No collection ids provided.');
+    }
+
+    const orgUser = await getOrgUser(db, orgId, userId);
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+    if (!canDeleteCollection(orgUser, org)) {
+        throw new BadRequestError('Requires Delete Any Collection permission or Owner/Admin with access to all collections.');
+    }
+
+    for (const colId of body.ids) {
+        const col = await db.select().from(collections)
+            .where(and(eq(collections.id, colId), eq(collections.organizationId, orgId))).get();
+        if (!col) continue;
+
+        await db.delete(collectionUsers).where(eq(collectionUsers.collectionId, colId));
+        await db.delete(collectionGroups).where(eq(collectionGroups.collectionId, colId));
+        await db.delete(collectionCiphers).where(eq(collectionCiphers.collectionId, colId));
+        await db.delete(collections).where(eq(collections.id, colId));
+    }
 
     return c.json({});
 });
@@ -1349,9 +1518,11 @@ orgs.delete('/:id/collections/:collectionId', async (c) => {
 // 若未执行 0008_groups 迁移（groups 表不存在），GET 返回空列表避免 500
 
 function isNoSuchTable(e: unknown): boolean {
-    const msg = e && typeof (e as Error).cause === 'object' && (e as Error).cause instanceof Error
-        ? (e as Error).cause.message
-        : e instanceof Error ? e.message : String(e);
+    const msg: string = e instanceof Error
+        ? e.message
+        : e && typeof (e as { cause?: unknown }).cause === 'object' && (e as { cause: Error }).cause instanceof Error
+            ? (e as { cause: Error }).cause.message
+            : String(e);
     return /no such table:\s*groups/i.test(msg);
 }
 
@@ -1364,8 +1535,7 @@ orgs.get('/:id/groups', async (c) => {
     const orgId = c.req.param('id');
     const userId = c.get('userId');
 
-    const orgUser = await getOrgUser(db, orgId, userId);
-    requireOwnerOrAdmin(orgUser);
+    await getOrgUser(db, orgId, userId); // 官方 ReadAll：任意组织成员可列群组
 
     const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
     if (!org) throw new NotFoundError('Organization not found.');
@@ -1403,7 +1573,9 @@ orgs.get('/:id/groups/details', async (c) => {
     const userId = c.get('userId');
 
     const orgUser = await getOrgUser(db, orgId, userId);
-    requireOwnerOrAdmin(orgUser);
+    if (!canViewGroupDetails(orgUser)) {
+        throw new BadRequestError('Requires Owner, Admin, or Manage Groups/Users permission.');
+    }
 
     const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
     if (!org) throw new NotFoundError('Organization not found.');
@@ -1748,58 +1920,104 @@ orgs.get('/:id/collections', async (c) => {
 
 /**
  * GET /api/organizations/:id/collections/details
- * 列表：每个集合带 groups、users（与官方 GetManyWithDetails 一致，供编辑权限时展示）
+ * 列表：每个集合带 groups、users，以及当前用户在该集合上的权限（assigned/manage/readOnly/hidePasswords/unmanaged），与官方 GetManyWithDetails 一致
+ * 客户端根据 assigned/manage 显示「权限」列，缺省会显示「无访问权限」
  */
 orgs.get('/:id/collections/details', async (c) => {
     const db = drizzle(c.env.DB);
     const orgId = c.req.param('id');
     const userId = c.get('userId');
 
-    await getOrgUser(db, orgId, userId);
+    const orgUser = await getOrgUser(db, orgId, userId);
+    const orgUserId = orgUser.id;
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    const allowAdminAll = org?.allowAdminAccessToAllCollectionItems === true;
+    const isOwnerOrAdmin = orgUser.type === 0 || orgUser.type === 1;
 
     const cols = await db.select().from(collections).where(eq(collections.organizationId, orgId)).all();
     const collectionIds = cols.map((col) => col.id);
 
-    const cuAll =
-        collectionIds.length > 0
-            ? await db.select().from(collectionUsers).where(inArray(collectionUsers.collectionId, collectionIds)).all()
-            : [];
-    const cgAll =
-        collectionIds.length > 0
-            ? await db.select().from(collectionGroups).where(inArray(collectionGroups.collectionId, collectionIds)).all()
-            : [];
+    const cuAll = collectionIds.length > 0
+        ? await batchedInArrayQuery<typeof collectionUsers.$inferSelect>(db, collectionUsers, collectionUsers.collectionId, collectionIds)
+        : [];
+    const cgAll = collectionIds.length > 0
+        ? await batchedInArrayQuery<typeof collectionGroups.$inferSelect>(db, collectionGroups, collectionGroups.collectionId, collectionIds)
+        : [];
 
     const cuByCol = new Map<string, typeof cuAll>();
     for (const cu of cuAll) {
-        if (!cuByCol.has(cu.collectionId)) cuByCol.set(cu.collectionId, []);
-        cuByCol.get(cu.collectionId)!.push(cu);
+        const arr = cuByCol.get(cu.collectionId) ?? [];
+        arr.push(cu);
+        cuByCol.set(cu.collectionId, arr);
     }
     const cgByCol = new Map<string, typeof cgAll>();
     for (const cg of cgAll) {
-        if (!cgByCol.has(cg.collectionId)) cgByCol.set(cg.collectionId, []);
-        cgByCol.get(cg.collectionId)!.push(cg);
+        const arr = cgByCol.get(cg.collectionId) ?? [];
+        arr.push(cg);
+        cgByCol.set(cg.collectionId, arr);
     }
 
-    return c.json({
-        data: cols.map((col) => ({
+    // 当前用户所属的 groupId 列表（用于判断通过群组获得的集合权限）
+    let myGroupIds: string[] = [];
+    try {
+        const guRows = await db.select({ groupId: groupUsers.groupId }).from(groupUsers)
+            .where(eq(groupUsers.organizationUserId, orgUserId)).all();
+        myGroupIds = guRows.map((r) => r.groupId);
+    } catch (e) {
+        if (!isNoSuchTable(e)) throw e;
+    }
+
+    const data = cols.map((col) => {
+        const colUsers = cuByCol.get(col.id) ?? [];
+        const colGroups = cgByCol.get(col.id) ?? [];
+        const directUser = colUsers.find((cu) => cu.organizationUserId === orgUserId);
+        const myGroupAccess = colGroups.filter((cg) => myGroupIds.includes(cg.groupId));
+        const assigned = !!(directUser || myGroupAccess.length > 0) || (allowAdminAll && isOwnerOrAdmin);
+        let readOnly = false;
+        let hidePasswords = false;
+        let manage = false;
+        if (allowAdminAll && isOwnerOrAdmin) {
+            manage = true;
+        } else if (directUser) {
+            readOnly = directUser.readOnly ?? false;
+            hidePasswords = directUser.hidePasswords ?? false;
+            manage = directUser.manage ?? false;
+        } else if (myGroupAccess.length > 0) {
+            readOnly = myGroupAccess.every((cg) => cg.readOnly);
+            hidePasswords = myGroupAccess.every((cg) => cg.hidePasswords);
+            manage = myGroupAccess.some((cg) => cg.manage);
+        }
+        const hasAnyManage = colUsers.some((cu) => cu.manage) || colGroups.some((cg) => cg.manage);
+        const unmanaged = !hasAnyManage;
+
+        return {
             id: col.id,
             organizationId: col.organizationId,
             name: col.name,
             externalId: col.externalId,
             object: 'collectionAccessDetails',
-            groups: (cgByCol.get(col.id) ?? []).map((cg) => ({
+            assigned,
+            readOnly,
+            hidePasswords,
+            manage,
+            unmanaged,
+            groups: colGroups.map((cg) => ({
                 id: cg.groupId,
                 readOnly: cg.readOnly ?? false,
                 hidePasswords: cg.hidePasswords ?? false,
                 manage: cg.manage ?? false,
             })),
-            users: (cuByCol.get(col.id) ?? []).map((cu) => ({
+            users: colUsers.map((cu) => ({
                 id: cu.organizationUserId,
                 readOnly: cu.readOnly ?? false,
                 hidePasswords: cu.hidePasswords ?? false,
                 manage: cu.manage ?? false,
             })),
-        })),
+        };
+    });
+
+    return c.json({
+        data,
         object: 'list',
         continuationToken: null,
     });
@@ -1807,7 +2025,7 @@ orgs.get('/:id/collections/details', async (c) => {
 
 /**
  * GET /api/organizations/:id/collections/:collectionId/details
- * 单条集合详情（含群组/成员权限），编辑集合时客户端调用此接口拉取
+ * 单条集合详情（含群组/成员权限及当前用户在该集合上的权限），编辑集合时客户端调用
  */
 orgs.get('/:id/collections/:collectionId/details', async (c) => {
     const db = drizzle(c.env.DB);
@@ -1815,7 +2033,10 @@ orgs.get('/:id/collections/:collectionId/details', async (c) => {
     const collectionId = c.req.param('collectionId');
     const userId = c.get('userId');
 
-    await getOrgUser(db, orgId, userId);
+    const orgUser = await getOrgUser(db, orgId, userId);
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    const allowAdminAll = org?.allowAdminAccessToAllCollectionItems === true;
+    const isOwnerOrAdmin = orgUser.type === 0 || orgUser.type === 1;
 
     const col = await db.select().from(collections)
         .where(and(eq(collections.id, collectionId), eq(collections.organizationId, orgId))).get();
@@ -1824,12 +2045,44 @@ orgs.get('/:id/collections/:collectionId/details', async (c) => {
     const cuList = await db.select().from(collectionUsers).where(eq(collectionUsers.collectionId, collectionId)).all();
     const cgList = await db.select().from(collectionGroups).where(eq(collectionGroups.collectionId, collectionId)).all();
 
+    let myGroupIds: string[] = [];
+    try {
+        const guRows = await db.select({ groupId: groupUsers.groupId }).from(groupUsers)
+            .where(eq(groupUsers.organizationUserId, orgUser.id)).all();
+        myGroupIds = guRows.map((r) => r.groupId);
+    } catch (e) {
+        if (!isNoSuchTable(e)) throw e;
+    }
+    const directUser = cuList.find((cu) => cu.organizationUserId === orgUser.id);
+    const myGroupAccess = cgList.filter((cg) => myGroupIds.includes(cg.groupId));
+    const assigned = !!(directUser || myGroupAccess.length > 0) || (allowAdminAll && isOwnerOrAdmin);
+    let readOnly = false;
+    let hidePasswords = false;
+    let manage = false;
+    if (allowAdminAll && isOwnerOrAdmin) {
+        manage = true;
+    } else if (directUser) {
+        readOnly = directUser.readOnly ?? false;
+        hidePasswords = directUser.hidePasswords ?? false;
+        manage = directUser.manage ?? false;
+    } else if (myGroupAccess.length > 0) {
+        readOnly = myGroupAccess.every((cg) => cg.readOnly);
+        hidePasswords = myGroupAccess.every((cg) => cg.hidePasswords);
+        manage = myGroupAccess.some((cg) => cg.manage);
+    }
+    const unmanaged = !cuList.some((cu) => cu.manage) && !cgList.some((cg) => cg.manage);
+
     return c.json({
         id: col.id,
         organizationId: col.organizationId,
         name: col.name,
         externalId: col.externalId,
         object: 'collectionAccessDetails',
+        assigned,
+        readOnly,
+        hidePasswords,
+        manage,
+        unmanaged,
         groups: cgList.map((cg) => ({
             id: cg.groupId,
             readOnly: cg.readOnly ?? false,
@@ -1845,8 +2098,25 @@ orgs.get('/:id/collections/:collectionId/details', async (c) => {
     });
 });
 
-// ==================== Billing（计费元数据） ====================
-// 对应官方 SelfHostedOrganizationBillingVNextController
+// ==================== Billing（计费/订阅） ====================
+// 对应官方 Billing/Controllers/OrganizationsController + SelfHostedOrganizationBillingVNextController
+
+/**
+ * GET /api/organizations/:id/subscription
+ * 组织订阅信息（管理控制台「订阅」页）；自托管下基于组织数据返回，与官方 OrganizationSubscriptionResponseModel 兼容
+ */
+orgs.get('/:id/subscription', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    await getOrgUser(db, orgId, userId);
+
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+
+    return c.json(toOrganizationSubscriptionResponse(org));
+});
 
 /**
  * GET /api/organizations/:id/billing/vnext/self-host/metadata
@@ -1889,7 +2159,6 @@ orgs.get('/:id/plan-type', async (c) => {
  * 自动注册状态（简化）
  */
 orgs.get('/:id/auto-enroll-status', async (c) => {
-    const db = drizzle(c.env.DB);
     const orgId = c.req.param('id');
 
     return c.json({
@@ -1899,4 +2168,5 @@ orgs.get('/:id/auto-enroll-status', async (c) => {
     });
 });
 
+export { getOrgUser, canCreateCollection, canAccessImportExport };
 export default orgs;

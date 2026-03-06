@@ -10,6 +10,7 @@ import { eq, and, inArray } from 'drizzle-orm';
 import { users, ciphers, folders, sends, organizations, organizationUsers, collections, collectionCiphers } from '../db/schema';
 import { authMiddleware } from '../middleware/auth';
 import { NotFoundError } from '../middleware/error';
+import { batchedInArrayQuery, D1_BATCH_SIZE } from '../services/db';
 import { toProfileOrganizationResponse } from '../models/organization-responses';
 import type {
     Bindings, Variables, CipherType, CipherRepromptType, SendType,
@@ -117,10 +118,9 @@ sync.get('/', async (c) => {
     const personalCipherIds = userCiphers.map(c => c.id);
     const personalCipherCollectionMap: Record<string, string[]> = {};
     if (personalCipherIds.length > 0) {
-        const personalCipherCollections = await db.select().from(collectionCiphers)
-            .where(inArray(collectionCiphers.cipherId, personalCipherIds))
-            .all();
-        for (const cc of personalCipherCollections) {
+        const rows = await batchedInArrayQuery<{ cipherId: string; collectionId: string }>(
+            db, collectionCiphers, collectionCiphers.cipherId, personalCipherIds);
+        for (const cc of rows) {
             if (!personalCipherCollectionMap[cc.cipherId]) personalCipherCollectionMap[cc.cipherId] = [];
             personalCipherCollectionMap[cc.cipherId].push(cc.collectionId);
         }
@@ -203,9 +203,8 @@ sync.get('/', async (c) => {
             }
 
             if (cipherIdsInCollection.length > 0) {
-                const ciphersInCollection = await db.select().from(ciphers)
-                    .where(inArray(ciphers.id, cipherIdsInCollection))
-                    .all();
+                const ciphersInCollection = await batchedInArrayQuery<typeof ciphers.$inferSelect>(
+                    db, ciphers, ciphers.id, cipherIdsInCollection);
                 orgCiphersData.push(...ciphersInCollection);
             }
         }

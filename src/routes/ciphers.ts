@@ -7,11 +7,13 @@
 import { Hono } from 'hono';
 import { drizzle } from 'drizzle-orm/d1';
 import { eq, and, desc, isNull, isNotNull, inArray } from 'drizzle-orm';
-import { users, ciphers, folders, collectionCiphers, collections, events, organizationUsers } from '../db/schema';
+import { users, ciphers, folders, collectionCiphers, collections, collectionUsers, events, organizationUsers, organizations } from '../db/schema';
+import { getOrgUser, canCreateCollection, canAccessImportExport } from './organizations';
 import { authMiddleware } from '../middleware/auth';
 import { logEvent } from '../services/events';
 import { toEventResponse } from './events';
 import { BadRequestError, NotFoundError } from '../middleware/error';
+import { batchedInArrayQuery } from '../services/db';
 import { generateUuid } from '../services/crypto';
 import type { Bindings, Variables, CipherRequest, CipherResponse, CipherType, CipherRepromptType } from '../types';
 
@@ -193,9 +195,9 @@ ciphersRoute.get('/organization-details', async (c) => {
 
     const cipherCollectionMap: Record<string, string[]> = {};
     if (orgCiphers.length > 0) {
-        const orgCollCiphers = await db.select().from(collectionCiphers)
-            .where(inArray(collectionCiphers.cipherId, orgCiphers.map(ci => ci.id)))
-            .all();
+        const cipherIds = orgCiphers.map(ci => ci.id);
+        const orgCollCiphers = await batchedInArrayQuery<{ cipherId: string; collectionId: string }>(
+            db, collectionCiphers, collectionCiphers.cipherId, cipherIds);
         for (const cc of orgCollCiphers) {
             if (!cipherCollectionMap[cc.cipherId]) cipherCollectionMap[cc.cipherId] = [];
             cipherCollectionMap[cc.cipherId].push(cc.collectionId);
@@ -249,9 +251,9 @@ ciphersRoute.get('/organization-details/assigned', async (c) => {
 
     const cipherCollectionMap: Record<string, string[]> = {};
     if (orgCiphers.length > 0) {
-        const orgCollCiphers = await db.select().from(collectionCiphers)
-            .where(inArray(collectionCiphers.cipherId, orgCiphers.map(ci => ci.id)))
-            .all();
+        const cipherIds = orgCiphers.map(ci => ci.id);
+        const orgCollCiphers = await batchedInArrayQuery<{ cipherId: string; collectionId: string }>(
+            db, collectionCiphers, collectionCiphers.cipherId, cipherIds);
         for (const cc of orgCollCiphers) {
             if (!cipherCollectionMap[cc.cipherId]) cipherCollectionMap[cc.cipherId] = [];
             cipherCollectionMap[cc.cipherId].push(cc.collectionId);
@@ -812,170 +814,234 @@ ciphersRoute.put('/:id/collections-admin', async (c) => {
 });
 
 /**
- * PUT /api/ciphers/:id
- * 对应 CiphersController.Put
+ * POST /api/ciphers/bulk-collections
+ * 对应 CiphersController.PostBulkCollections
+ * 批量为 cipher 添加/移除 collection 关联
  */
-ciphersRoute.put('/:id', async (c) => {
+ciphersRoute.post('/bulk-collections', async (c) => {
     const db = drizzle(c.env.DB);
     const userId = c.get('userId');
-    const cipherId = c.req.param('id');
-    const body = await c.req.json<CipherRequest>();
+    const body = await c.req.json<{
+        organizationId: string;
+        cipherIds: string[];
+        collectionIds: string[];
+        removeCollections?: boolean;
+    }>();
 
-    const existing = await db.select().from(ciphers)
-        .where(and(eq(ciphers.id, cipherId), eq(ciphers.userId, userId))).get();
-
-    if (!existing) {
-        throw new NotFoundError('Cipher not found.');
+    const { organizationId, cipherIds, collectionIds, removeCollections } = body;
+    if (!organizationId || !cipherIds?.length || !collectionIds?.length) {
+        throw new BadRequestError('organizationId, cipherIds, and collectionIds are required.');
     }
 
-    const now = new Date().toISOString();
+    const orgUser = await getOrgUser(db, organizationId, userId);
+    if (!orgUser) throw new NotFoundError('Organization not found.');
 
-    const data: any = {
-        name: body.name,
-        notes: body.notes || null,
-        fields: body.fields || null,
-        passwordHistory: body.passwordHistory || null,
-    };
-    if (body.type === 1) data.login = body.login;
-    if (body.type === 2) data.secureNote = body.secureNote;
-    if (body.type === 3) data.card = body.card;
-    if (body.type === 4) data.identity = body.identity;
-    if (body.type === 5 && body.sshKey) {
-        data.privateKey = body.sshKey.privateKey;
-        data.publicKey = body.sshKey.publicKey;
-        data.keyFingerprint = body.sshKey.keyFingerprint;
+    // 验证 ciphers 属于该组织
+    const orgCiphers = await batchedInArrayQuery<{ id: string; organizationId: string | null }>(
+        db, ciphers, ciphers.id, cipherIds);
+    for (const ci of orgCiphers) {
+        if (ci.organizationId !== organizationId) {
+            throw new BadRequestError('Cipher does not belong to the organization.');
+        }
+    }
+    if (orgCiphers.length !== cipherIds.length) {
+        throw new NotFoundError('One or more ciphers not found.');
     }
 
-    const existingFavorites = existing.favorites ? JSON.parse(existing.favorites) : {};
-    const existingFolders = existing.folders ? JSON.parse(existing.folders) : {};
-
-    if (body.favorite !== undefined) {
-        if (body.favorite) existingFavorites[userId] = true;
-        else delete existingFavorites[userId];
-    }
-
-    if (body.folderId !== undefined) {
-        if (body.folderId) existingFolders[userId] = body.folderId;
-        else delete existingFolders[userId];
-    }
-
-    await db.update(ciphers).set({
-        type: body.type ?? existing.type,
-        data: JSON.stringify(data),
-        favorites: JSON.stringify(existingFavorites),
-        folders: JSON.stringify(existingFolders),
-        reprompt: body.reprompt ?? existing.reprompt,
-        key: body.key !== undefined ? body.key : existing.key,
-        revisionDate: now,
-    }).where(eq(ciphers.id, cipherId));
-
-    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
-
-    const updated = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
-    return c.json(toCipherResponse(updated!, userId, getBaseUrl(c)));
-});
-
-/**
- * POST /api/ciphers/:id (alias for PUT, Bitwarden 客户端兼容)
- */
-ciphersRoute.post('/:id', async (c) => {
-    const id = c.req.param('id');
-    // 跳过特殊路由
-    if (['create', 'delete', 'restore', 'move', 'share', 'purge'].includes(id)) {
-        return;
-    }
-    // 复用 PUT 逻辑
-    const db = drizzle(c.env.DB);
-    const userId = c.get('userId');
-    const body = await c.req.json<CipherRequest>();
-
-    const existing = await db.select().from(ciphers)
-        .where(and(eq(ciphers.id, id), eq(ciphers.userId, userId))).get();
-    if (!existing) throw new NotFoundError('Cipher not found.');
-
-    const now = new Date().toISOString();
-    const data: any = {
-        name: body.name,
-        notes: body.notes || null,
-        fields: body.fields || null,
-        passwordHistory: body.passwordHistory || null,
-    };
-    if (body.type === 1) data.login = body.login;
-    if (body.type === 2) data.secureNote = body.secureNote;
-    if (body.type === 3) data.card = body.card;
-    if (body.type === 4) data.identity = body.identity;
-    if (body.type === 5 && body.sshKey) {
-        data.privateKey = body.sshKey.privateKey;
-        data.publicKey = body.sshKey.publicKey;
-        data.keyFingerprint = body.sshKey.keyFingerprint;
-    }
-
-    const existingFavorites = existing.favorites ? JSON.parse(existing.favorites) : {};
-    const existingFolders = existing.folders ? JSON.parse(existing.folders) : {};
-    if (body.favorite !== undefined) {
-        if (body.favorite) existingFavorites[userId] = true;
-        else delete existingFavorites[userId];
-    }
-    if (body.folderId !== undefined) {
-        if (body.folderId) existingFolders[userId] = body.folderId;
-        else delete existingFolders[userId];
-    }
-
-    await db.update(ciphers).set({
-        type: body.type ?? existing.type,
-        data: JSON.stringify(data),
-        favorites: JSON.stringify(existingFavorites),
-        folders: JSON.stringify(existingFolders),
-        reprompt: body.reprompt ?? existing.reprompt,
-        key: body.key !== undefined ? body.key : existing.key,
-        revisionDate: now,
-    }).where(eq(ciphers.id, id));
-
-    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
-
-    await logEvent(c.env.DB, 1101, { userId, cipherId: id });
-
-    const updated = await db.select().from(ciphers).where(eq(ciphers.id, id)).get();
-    return c.json(toCipherResponse(updated!, userId, getBaseUrl(c)));
-});
-
-/**
- * DELETE /api/ciphers/:id
- * 对应 CiphersController.Delete（永久删除）
- * iOS 客户端在回收站中删除时调用此端点
- */
-ciphersRoute.delete('/:id', async (c) => {
-    const db = drizzle(c.env.DB);
-    const userId = c.get('userId');
-    const cipherId = c.req.param('id');
-
-    const existing = await db.select().from(ciphers)
-        .where(and(eq(ciphers.id, cipherId), eq(ciphers.userId, userId))).get();
-
-    if (!existing) {
-        throw new NotFoundError('Cipher not found.');
-    }
-
-    // 删除关联附件（R2 存储）
-    if (existing.attachments) {
-        const attachmentsMap = JSON.parse(existing.attachments);
-        for (const attachmentId of Object.keys(attachmentsMap)) {
-            await c.env.ATTACHMENTS.delete(`${cipherId}/${attachmentId}`);
+    // 验证 collections 属于该组织
+    const orgCols = await batchedInArrayQuery<{ id: string; organizationId: string }>(
+        db, collections, collections.id, collectionIds);
+    for (const col of orgCols) {
+        if (col.organizationId !== organizationId) {
+            throw new BadRequestError('Collection does not belong to the organization.');
         }
     }
 
-    // 删除 collectionCiphers 关联
-    await db.delete(collectionCiphers).where(eq(collectionCiphers.cipherId, cipherId));
+    if (removeCollections) {
+        // 移除关联：逐批删除
+        for (const collectionId of collectionIds) {
+            for (let i = 0; i < cipherIds.length; i += 50) {
+                const batch = cipherIds.slice(i, i + 50);
+                await db.delete(collectionCiphers).where(
+                    and(
+                        eq(collectionCiphers.collectionId, collectionId),
+                        inArray(collectionCiphers.cipherId, batch),
+                    )
+                );
+            }
+        }
+    } else {
+        // 添加关联
+        const toInsert: { collectionId: string; cipherId: string }[] = [];
+        for (const collectionId of collectionIds) {
+            for (const cipherId of cipherIds) {
+                toInsert.push({ collectionId, cipherId });
+            }
+        }
+        const BATCH = 50;
+        for (let i = 0; i < toInsert.length; i += BATCH) {
+            const chunk = toInsert.slice(i, i + BATCH);
+            await db.insert(collectionCiphers).values(chunk).onConflictDoNothing();
+        }
+    }
 
-    // 永久删除 cipher 记录
-    await db.delete(ciphers).where(eq(ciphers.id, cipherId));
+    return c.json({});
+});
+
+/**
+ * POST /api/ciphers/import-organization
+ * 对应 ImportCiphersController.PostImportOrganization：组织保险库导入（集合 + 密码条目 + 关系）
+ */
+ciphersRoute.post('/import-organization', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const organizationId = c.req.query('organizationId');
+    if (!organizationId) {
+        throw new BadRequestError('organizationId is required.');
+    }
+
+    const body = await c.req.json<{
+        collections?: Array<{ id?: string; name: string; externalId?: string }>;
+        ciphers: CipherRequest[];
+        collectionRelationships?: Array<{ key: number; value: number }>;
+    }>();
+    const collectionsList = body.collections ?? [];
+    const ciphersList = body.ciphers ?? [];
+    const collectionRelationships = body.collectionRelationships ?? [];
+
+    const org = await db.select().from(organizations).where(eq(organizations.id, organizationId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+    const orgUser = await getOrgUser(db, organizationId, userId);
+
+    const orgCollectionIds = new Set(
+        (await db.select({ id: collections.id }).from(collections).where(eq(collections.organizationId, organizationId))).map((r) => r.id)
+    );
+    const existingCollections = collectionsList.filter((col) => col.id && orgCollectionIds.has(col.id));
+    const hasNewCollections = collectionsList.some((col) => !col.id || !orgCollectionIds.has(col.id));
+
+    let authorized = canAccessImportExport(orgUser);
+    if (!authorized && collectionsList.length === 0) authorized = true;
+    else if (!authorized) {
+        if (hasNewCollections && existingCollections.length > 0) {
+            authorized = canCreateCollection(orgUser) && canAccessImportExport(orgUser);
+        } else if (hasNewCollections) {
+            authorized = canCreateCollection(orgUser);
+        } else {
+            authorized = canAccessImportExport(orgUser);
+        }
+    }
+    if (!authorized) {
+        throw new BadRequestError('Not enough privileges to import into this organization.');
+    }
+
+    if (org.maxCollections != null && collectionsList.length > 0) {
+        const currentCount = orgCollectionIds.size;
+        const newCount = collectionsList.filter((col) => !col.id || !orgCollectionIds.has(col.id)).length;
+        if (org.maxCollections < currentCount + newCount) {
+            throw new BadRequestError(
+                'This organization can only have a maximum of ' + org.maxCollections + ' collections.'
+            );
+        }
+    }
 
     const now = new Date().toISOString();
+    const cipherIdMap = new Map<number, string>();
+    for (let i = 0; i < ciphersList.length; i++) {
+        cipherIdMap.set(i, generateUuid());
+    }
+    const collectionIdMap = new Map<number, string>();
+    const newCollectionRows: { id: string; organizationId: string; name: string; externalId: string | null; creationDate: string; revisionDate: string }[] = [];
+    for (let i = 0; i < collectionsList.length; i++) {
+        const col = collectionsList[i];
+        const existingId = col.id && orgCollectionIds.has(col.id) ? col.id : null;
+        if (existingId) {
+            collectionIdMap.set(i, existingId);
+        } else {
+            const newId = generateUuid();
+            collectionIdMap.set(i, newId);
+            newCollectionRows.push({
+                id: newId,
+                organizationId,
+                name: col.name,
+                externalId: col.externalId ?? null,
+                creationDate: now,
+                revisionDate: now,
+            });
+        }
+    }
+
+    // D1 单条 SQL 绑定变量上限约 100，每行 6 列，每批最多 floor(100/6)=16 条，取 10 留余量
+    const COLLECTION_BATCH = 10;
+    if (newCollectionRows.length > 0) {
+        for (let i = 0; i < newCollectionRows.length; i += COLLECTION_BATCH) {
+            const chunk = newCollectionRows.slice(i, i + COLLECTION_BATCH);
+            await db.insert(collections).values(chunk);
+        }
+        for (const row of newCollectionRows) {
+            await db.insert(collectionUsers).values({
+                collectionId: row.id,
+                organizationUserId: orgUser.id,
+                readOnly: false,
+                hidePasswords: false,
+                manage: true,
+            }).onConflictDoNothing();
+        }
+    }
+
+    for (let i = 0; i < ciphersList.length; i++) {
+        const bodyCipher = ciphersList[i];
+        const cipherId = cipherIdMap.get(i);
+        if (!cipherId) continue;
+        const data: Record<string, unknown> = {
+            name: bodyCipher.name,
+            notes: bodyCipher.notes ?? null,
+            fields: bodyCipher.fields ?? null,
+            passwordHistory: bodyCipher.passwordHistory ?? null,
+        };
+        if (bodyCipher.type === 1) data.login = bodyCipher.login;
+        if (bodyCipher.type === 2) data.secureNote = bodyCipher.secureNote;
+        if (bodyCipher.type === 3) data.card = bodyCipher.card;
+        if (bodyCipher.type === 4) data.identity = bodyCipher.identity;
+        if (bodyCipher.type === 5 && bodyCipher.sshKey) {
+            data.privateKey = bodyCipher.sshKey.privateKey;
+            data.publicKey = bodyCipher.sshKey.publicKey;
+            data.keyFingerprint = bodyCipher.sshKey.keyFingerprint;
+        }
+        const fav = bodyCipher.favorite ? { [userId]: true } : {};
+        await db.insert(ciphers).values({
+            id: cipherId,
+            userId: null,
+            organizationId,
+            type: bodyCipher.type,
+            data: JSON.stringify(data),
+            favorites: JSON.stringify(fav),
+            folders: JSON.stringify({}),
+            reprompt: bodyCipher.reprompt ?? 0,
+            key: bodyCipher.key ?? null,
+            creationDate: now,
+            revisionDate: now,
+        });
+    }
+
+    const toInsert: { collectionId: string; cipherId: string }[] = [];
+    for (const rel of collectionRelationships) {
+        const cipherId = cipherIdMap.get(rel.key);
+        const collectionId = collectionIdMap.get(rel.value);
+        if (cipherId && collectionId) {
+            toInsert.push({ collectionId, cipherId });
+        }
+    }
+    // D1 绑定变量上限约 100，每行 2 列，每批最多 50 条
+    const COLLECTION_CIPHER_BATCH = 50;
+    for (let i = 0; i < toInsert.length; i += COLLECTION_CIPHER_BATCH) {
+        const chunk = toInsert.slice(i, i + COLLECTION_CIPHER_BATCH);
+        if (chunk.length > 0) {
+            await db.insert(collectionCiphers).values(chunk).onConflictDoNothing();
+        }
+    }
+
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
-
-    await logEvent(c.env.DB, 1102, { userId, cipherId });
-
-    return c.body(null, 204);
+    return c.json({});
 });
 
 /**
@@ -1083,6 +1149,221 @@ ciphersRoute.post('/delete', async (c) => {
 });
 
 /**
+ * PUT /api/ciphers/delete-admin
+ * 对应 CiphersController.PutDeleteManyAdmin（管理员批量软删除）
+ */
+ciphersRoute.put('/delete-admin', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const body = await c.req.json<{ ids: string[]; organizationId: string }>();
+
+    if (!body.ids?.length) {
+        throw new BadRequestError('No cipher ids provided.');
+    }
+
+    const orgUser = await getOrgUser(db, body.organizationId, userId);
+    if (!orgUser) throw new NotFoundError('Organization not found.');
+
+    const now = new Date().toISOString();
+    for (const id of body.ids) {
+        await db.update(ciphers).set({ deletedDate: now, revisionDate: now })
+            .where(and(eq(ciphers.id, id), eq(ciphers.organizationId, body.organizationId)));
+        await logEvent(c.env.DB, 1115, { userId, cipherId: id, organizationId: body.organizationId });
+    }
+
+    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+    return c.json(null, 200);
+});
+
+/**
+ * POST /api/ciphers/delete-admin
+ * 对应 CiphersController.PostDeleteManyAdmin（管理员批量永久删除）
+ */
+ciphersRoute.post('/delete-admin', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const body = await c.req.json<{ ids: string[]; organizationId: string }>();
+
+    if (!body.ids?.length) {
+        throw new BadRequestError('No cipher ids provided.');
+    }
+
+    const orgUser = await getOrgUser(db, body.organizationId, userId);
+    if (!orgUser) throw new NotFoundError('Organization not found.');
+
+    for (const id of body.ids) {
+        const cipher = await db.select().from(ciphers)
+            .where(and(eq(ciphers.id, id), eq(ciphers.organizationId, body.organizationId))).get();
+        if (cipher) {
+            if (cipher.attachments) {
+                const attachmentsMap = JSON.parse(cipher.attachments);
+                for (const attachmentId of Object.keys(attachmentsMap)) {
+                    await c.env.ATTACHMENTS.delete(`${id}/${attachmentId}`);
+                }
+            }
+            await db.delete(collectionCiphers).where(eq(collectionCiphers.cipherId, id));
+            await db.delete(ciphers).where(eq(ciphers.id, id));
+            await logEvent(c.env.DB, 1102, { userId, cipherId: id, organizationId: body.organizationId });
+        }
+    }
+
+    const now = new Date().toISOString();
+    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+    return c.json(null, 200);
+});
+
+/**
+ * PUT /api/ciphers/restore
+ * 对应 CiphersController.PutRestoreMany（批量恢复）
+ */
+ciphersRoute.put('/restore', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const body = await c.req.json<{ ids: string[] }>();
+
+    if (!body.ids?.length) {
+        throw new BadRequestError('No cipher ids provided.');
+    }
+
+    const now = new Date().toISOString();
+    const results: any[] = [];
+    for (const id of body.ids) {
+        await db.update(ciphers).set({ deletedDate: null, revisionDate: now })
+            .where(and(eq(ciphers.id, id), eq(ciphers.userId, userId)));
+        await logEvent(c.env.DB, 1116, { userId, cipherId: id });
+        const updated = await db.select().from(ciphers).where(eq(ciphers.id, id)).get();
+        if (updated) results.push(toCipherResponse(updated, userId, getBaseUrl(c)));
+    }
+
+    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+    return c.json({ data: results, object: 'list', continuationToken: null });
+});
+
+/**
+ * PUT /api/ciphers/restore-admin
+ * 对应 CiphersController.PutRestoreManyAdmin（管理员批量恢复）
+ */
+ciphersRoute.put('/restore-admin', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const body = await c.req.json<{ ids: string[]; organizationId: string }>();
+
+    if (!body.ids?.length) {
+        throw new BadRequestError('No cipher ids provided.');
+    }
+
+    const orgUser = await getOrgUser(db, body.organizationId, userId);
+    if (!orgUser) throw new NotFoundError('Organization not found.');
+
+    const now = new Date().toISOString();
+    const results: any[] = [];
+    for (const id of body.ids) {
+        await db.update(ciphers).set({ deletedDate: null, revisionDate: now })
+            .where(and(eq(ciphers.id, id), eq(ciphers.organizationId, body.organizationId)));
+        await logEvent(c.env.DB, 1116, { userId, cipherId: id, organizationId: body.organizationId });
+        const updated = await db.select().from(ciphers).where(eq(ciphers.id, id)).get();
+        if (updated) results.push(toCipherResponse(updated, userId, getBaseUrl(c)));
+    }
+
+    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+    return c.json({ data: results, object: 'list', continuationToken: null });
+});
+
+/**
+ * PUT /api/ciphers/share
+ * 对应 CiphersController.PutShareMany（批量分享到组织）
+ */
+ciphersRoute.put('/share', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const body = await c.req.json<{ ciphers: Array<{ cipher: CipherRequest & { id: string; organizationId: string }; collectionIds: string[] }> }>();
+
+    const now = new Date().toISOString();
+    for (const item of body.ciphers ?? []) {
+        const cipher = item.cipher;
+        if (!cipher.id || !cipher.organizationId) continue;
+
+        const existing = await db.select().from(ciphers)
+            .where(and(eq(ciphers.id, cipher.id), eq(ciphers.userId, userId))).get();
+        if (!existing) continue;
+
+        const data: any = {
+            name: cipher.name,
+            notes: cipher.notes || null,
+            fields: cipher.fields || null,
+            passwordHistory: cipher.passwordHistory || null,
+        };
+        if (cipher.type === 1) data.login = cipher.login;
+        if (cipher.type === 2) data.secureNote = cipher.secureNote;
+        if (cipher.type === 3) data.card = cipher.card;
+        if (cipher.type === 4) data.identity = cipher.identity;
+
+        await db.update(ciphers).set({
+            organizationId: cipher.organizationId,
+            userId: null,
+            data: JSON.stringify(data),
+            key: cipher.key ?? null,
+            revisionDate: now,
+        }).where(eq(ciphers.id, cipher.id));
+
+        // 添加 collection 关联
+        for (const colId of item.collectionIds ?? []) {
+            await db.insert(collectionCiphers).values({ collectionId: colId, cipherId: cipher.id }).onConflictDoNothing();
+        }
+    }
+
+    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+    return c.json({});
+});
+
+/**
+ * POST /api/ciphers/share
+ * 对应 CiphersController.PostShareMany（POST alias）
+ */
+ciphersRoute.post('/share', async (c) => {
+    // 转发到 PUT 逻辑
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const body = await c.req.json<{ ciphers: Array<{ cipher: CipherRequest & { id: string; organizationId: string }; collectionIds: string[] }> }>();
+
+    const now = new Date().toISOString();
+    for (const item of body.ciphers ?? []) {
+        const cipher = item.cipher;
+        if (!cipher.id || !cipher.organizationId) continue;
+
+        const existing = await db.select().from(ciphers)
+            .where(and(eq(ciphers.id, cipher.id), eq(ciphers.userId, userId))).get();
+        if (!existing) continue;
+
+        const data: any = {
+            name: cipher.name,
+            notes: cipher.notes || null,
+            fields: cipher.fields || null,
+            passwordHistory: cipher.passwordHistory || null,
+        };
+        if (cipher.type === 1) data.login = cipher.login;
+        if (cipher.type === 2) data.secureNote = cipher.secureNote;
+        if (cipher.type === 3) data.card = cipher.card;
+        if (cipher.type === 4) data.identity = cipher.identity;
+
+        await db.update(ciphers).set({
+            organizationId: cipher.organizationId,
+            userId: null,
+            data: JSON.stringify(data),
+            key: cipher.key ?? null,
+            revisionDate: now,
+        }).where(eq(ciphers.id, cipher.id));
+
+        for (const colId of item.collectionIds ?? []) {
+            await db.insert(collectionCiphers).values({ collectionId: colId, cipherId: cipher.id }).onConflictDoNothing();
+        }
+    }
+
+    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+    return c.json({});
+});
+
+/**
  * PUT /api/ciphers/move
  * 对应 CiphersController.PutMoveMany（批量移动到文件夹）
  */
@@ -1137,6 +1418,235 @@ ciphersRoute.post('/purge', async (c) => {
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
 
     return c.body(null, 204);
+});
+
+// ==================== 通配符 /:id 路由（必须在所有静态路由之后注册） ====================
+
+/**
+ * POST /api/ciphers/:id (alias for PUT, Bitwarden 客户端兼容)
+ */
+ciphersRoute.post('/:id', async (c) => {
+    const id = c.req.param('id');
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const body = await c.req.json<CipherRequest>();
+
+    const existing = await db.select().from(ciphers)
+        .where(and(eq(ciphers.id, id), eq(ciphers.userId, userId))).get();
+    if (!existing) throw new NotFoundError('Cipher not found.');
+
+    const now = new Date().toISOString();
+    const data: any = {
+        name: body.name,
+        notes: body.notes || null,
+        fields: body.fields || null,
+        passwordHistory: body.passwordHistory || null,
+    };
+    if (body.type === 1) data.login = body.login;
+    if (body.type === 2) data.secureNote = body.secureNote;
+    if (body.type === 3) data.card = body.card;
+    if (body.type === 4) data.identity = body.identity;
+    if (body.type === 5 && body.sshKey) {
+        data.privateKey = body.sshKey.privateKey;
+        data.publicKey = body.sshKey.publicKey;
+        data.keyFingerprint = body.sshKey.keyFingerprint;
+    }
+
+    const existingFavorites = existing.favorites ? JSON.parse(existing.favorites) : {};
+    const existingFolders = existing.folders ? JSON.parse(existing.folders) : {};
+    if (body.favorite !== undefined) {
+        if (body.favorite) existingFavorites[userId] = true;
+        else delete existingFavorites[userId];
+    }
+    if (body.folderId !== undefined) {
+        if (body.folderId) existingFolders[userId] = body.folderId;
+        else delete existingFolders[userId];
+    }
+
+    await db.update(ciphers).set({
+        type: body.type ?? existing.type,
+        data: JSON.stringify(data),
+        favorites: JSON.stringify(existingFavorites),
+        folders: JSON.stringify(existingFolders),
+        reprompt: body.reprompt ?? existing.reprompt,
+        key: body.key !== undefined ? body.key : existing.key,
+        revisionDate: now,
+    }).where(eq(ciphers.id, id));
+
+    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+    await logEvent(c.env.DB, 1101, { userId, cipherId: id });
+
+    const updated = await db.select().from(ciphers).where(eq(ciphers.id, id)).get();
+    return c.json(toCipherResponse(updated!, userId, getBaseUrl(c)));
+});
+
+/**
+ * DELETE /api/ciphers/:id
+ * 对应 CiphersController.Delete（永久删除）
+ */
+/**
+ * DELETE /api/ciphers
+ * 对应 CiphersController.DeleteMany（批量永久删除个人 cipher）
+ */
+ciphersRoute.delete('/', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const body = await c.req.json<{ ids: string[] }>();
+
+    if (!body.ids?.length) {
+        throw new BadRequestError('No cipher ids provided.');
+    }
+
+    for (const id of body.ids) {
+        const cipher = await db.select().from(ciphers)
+            .where(and(eq(ciphers.id, id), eq(ciphers.userId, userId))).get();
+        if (cipher) {
+            if (cipher.attachments) {
+                const attachmentsMap = JSON.parse(cipher.attachments);
+                for (const attachmentId of Object.keys(attachmentsMap)) {
+                    await c.env.ATTACHMENTS.delete(`${id}/${attachmentId}`);
+                }
+            }
+            await db.delete(collectionCiphers).where(eq(collectionCiphers.cipherId, id));
+            await db.delete(ciphers).where(eq(ciphers.id, id));
+            await logEvent(c.env.DB, 1102, { userId, cipherId: id });
+        }
+    }
+
+    const now = new Date().toISOString();
+    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+    return c.json(null, 200);
+});
+
+/**
+ * DELETE /api/ciphers/admin
+ * 对应 CiphersController.DeleteManyAdmin（管理员批量永久删除组织 cipher）
+ */
+ciphersRoute.delete('/admin', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const body = await c.req.json<{ ids: string[]; organizationId: string }>();
+
+    if (!body.ids?.length) {
+        throw new BadRequestError('No cipher ids provided.');
+    }
+
+    const orgUser = await getOrgUser(db, body.organizationId, userId);
+    if (!orgUser) throw new NotFoundError('Organization not found.');
+
+    for (const id of body.ids) {
+        const cipher = await db.select().from(ciphers)
+            .where(and(eq(ciphers.id, id), eq(ciphers.organizationId, body.organizationId))).get();
+        if (cipher) {
+            if (cipher.attachments) {
+                const attachmentsMap = JSON.parse(cipher.attachments);
+                for (const attachmentId of Object.keys(attachmentsMap)) {
+                    await c.env.ATTACHMENTS.delete(`${id}/${attachmentId}`);
+                }
+            }
+            await db.delete(collectionCiphers).where(eq(collectionCiphers.cipherId, id));
+            await db.delete(ciphers).where(eq(ciphers.id, id));
+            await logEvent(c.env.DB, 1102, { userId, cipherId: id, organizationId: body.organizationId });
+        }
+    }
+
+    const now = new Date().toISOString();
+    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+    return c.json(null, 200);
+});
+
+ciphersRoute.delete('/:id', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const cipherId = c.req.param('id');
+
+    const existing = await db.select().from(ciphers)
+        .where(and(eq(ciphers.id, cipherId), eq(ciphers.userId, userId))).get();
+    if (!existing) throw new NotFoundError('Cipher not found.');
+
+    if (existing.attachments) {
+        const attachmentsMap = JSON.parse(existing.attachments);
+        for (const attachmentId of Object.keys(attachmentsMap)) {
+            await c.env.ATTACHMENTS.delete(`${cipherId}/${attachmentId}`);
+        }
+    }
+
+    await db.delete(collectionCiphers).where(eq(collectionCiphers.cipherId, cipherId));
+    await db.delete(ciphers).where(eq(ciphers.id, cipherId));
+
+    const now = new Date().toISOString();
+    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+    await logEvent(c.env.DB, 1102, { userId, cipherId });
+
+    return c.body(null, 204);
+});
+
+/**
+ * PUT /api/ciphers/:id
+ * 对应 CiphersController.Put
+ */
+ciphersRoute.put('/:id', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const cipherId = c.req.param('id');
+    const body = await c.req.json<CipherRequest>();
+
+    // 同时支持个人和组织 cipher
+    let existing = await db.select().from(ciphers)
+        .where(and(eq(ciphers.id, cipherId), eq(ciphers.userId, userId))).get();
+    if (!existing) {
+        // 尝试查找组织 cipher（管理员编辑）
+        existing = await db.select().from(ciphers)
+            .where(eq(ciphers.id, cipherId)).get();
+        if (existing?.organizationId) {
+            await getOrgUser(db, existing.organizationId, userId);
+        } else {
+            throw new NotFoundError('Cipher not found.');
+        }
+    }
+
+    const now = new Date().toISOString();
+    const data: any = {
+        name: body.name,
+        notes: body.notes || null,
+        fields: body.fields || null,
+        passwordHistory: body.passwordHistory || null,
+    };
+    if (body.type === 1) data.login = body.login;
+    if (body.type === 2) data.secureNote = body.secureNote;
+    if (body.type === 3) data.card = body.card;
+    if (body.type === 4) data.identity = body.identity;
+    if (body.type === 5 && body.sshKey) {
+        data.privateKey = body.sshKey.privateKey;
+        data.publicKey = body.sshKey.publicKey;
+        data.keyFingerprint = body.sshKey.keyFingerprint;
+    }
+
+    const existingFavorites = existing.favorites ? JSON.parse(existing.favorites) : {};
+    const existingFolders = existing.folders ? JSON.parse(existing.folders) : {};
+    if (body.favorite !== undefined) {
+        if (body.favorite) existingFavorites[userId] = true;
+        else delete existingFavorites[userId];
+    }
+    if (body.folderId !== undefined) {
+        if (body.folderId) existingFolders[userId] = body.folderId;
+        else delete existingFolders[userId];
+    }
+
+    await db.update(ciphers).set({
+        type: body.type ?? existing.type,
+        data: JSON.stringify(data),
+        favorites: JSON.stringify(existingFavorites),
+        folders: JSON.stringify(existingFolders),
+        reprompt: body.reprompt ?? existing.reprompt,
+        key: body.key !== undefined ? body.key : existing.key,
+        revisionDate: now,
+    }).where(eq(ciphers.id, cipherId));
+
+    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+
+    const updated = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
+    return c.json(toCipherResponse(updated!, userId, getBaseUrl(c)));
 });
 
 export default ciphersRoute;
