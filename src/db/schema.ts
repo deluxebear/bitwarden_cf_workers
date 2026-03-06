@@ -4,7 +4,7 @@
  * 使用 Drizzle ORM 定义
  */
 
-import { sqliteTable, text, integer, index, primaryKey } from 'drizzle-orm/sqlite-core';
+import { sqliteTable, text, integer, index, uniqueIndex, primaryKey } from 'drizzle-orm/sqlite-core';
 
 // ==================== Users ====================
 // 对应 Core/Entities/User.cs
@@ -219,7 +219,7 @@ export const organizationLicenses = sqliteTable('organization_licenses', {
     creationDate: text('creation_date').notNull(),
     revisionDate: text('revision_date').notNull(),
 }, (table) => [
-    index('idx_org_licenses_license_key').on(table.licenseKey).unique(),
+    uniqueIndex('idx_org_licenses_license_key').on(table.licenseKey),
 ]);
 
 // ==================== Events ====================
@@ -379,7 +379,22 @@ export const webAuthnCredentials = sqliteTable('webauthn_credentials', {
     index('idx_webauthn_credentials_credential_id').on(table.credentialId),
 ]);
 
+// ==================== Policies ====================
+// 对应 Core/AdminConsole/Entities/Policy.cs
+export const policies = sqliteTable('policies', {
+    id: text('id').primaryKey(), // UUID
+    organizationId: text('organization_id').notNull().references(() => organizations.id, { onDelete: 'cascade' }),
+    type: integer('type').notNull(), // PolicyType enum (0=TwoFactorAuthentication, 1=MasterPassword, ...)
+    data: text('data'), // JSON
+    enabled: integer('enabled', { mode: 'boolean' }).notNull().default(false),
+    creationDate: text('creation_date').notNull(), // ISO 8601
+    revisionDate: text('revision_date').notNull(), // ISO 8601
+}, (table) => [
+    index('idx_policies_organization_id').on(table.organizationId),
+]);
+
 // ==================== 推断类型（供路由等使用，避免 any） ====================
 export type OrganizationUserRow = typeof organizationUsers.$inferSelect;
 export type OrganizationRow = typeof organizations.$inferSelect;
 export type UserRow = typeof users.$inferSelect;
+export type PolicyRow = typeof policies.$inferSelect;

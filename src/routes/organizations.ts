@@ -17,8 +17,9 @@ import {
     groupUsers,
     collectionGroups,
     collectionCiphers,
+    policies,
 } from '../db/schema';
-import type { OrganizationUserRow, OrganizationRow, UserRow } from '../db/schema';
+import type { OrganizationUserRow, OrganizationRow, UserRow, PolicyRow } from '../db/schema';
 import { authMiddleware } from '../middleware/auth';
 import { logEvent } from '../services/events';
 import { toEventResponse, getDateRange, getDeviceTypeFromRequest } from './events';
@@ -216,7 +217,7 @@ function buildOrgDefaults(planType: number) {
     const isPaid = planType > 0;
 
     return {
-        usePolicies: isEnterprise,
+        usePolicies: true,
         useSso: isEnterprise,
         useKeyConnector: isEnterprise,
         useScim: isEnterprise,
@@ -2613,6 +2614,229 @@ orgs.get('/:id/billing/vnext/self-host/metadata', async (c) => {
         isOnSecretsManagerStandalone: false,
         organizationOccupiedSeats: occupied.length,
     });
+});
+
+// ==================== Policies（组织策略） ====================
+// 对应官方 Api/AdminConsole/Controllers/PoliciesController.cs
+
+function isNoSuchTablePolicies(e: unknown): boolean {
+    const msg: string = e instanceof Error
+        ? e.message
+        : e && typeof (e as { cause?: unknown }).cause === 'object' && (e as { cause: Error }).cause instanceof Error
+            ? (e as { cause: Error }).cause.message
+            : String(e);
+    return /no such table:\s*policies/i.test(msg);
+}
+
+function toPolicyResponse(p: PolicyRow) {
+    let data: Record<string, unknown> | null = null;
+    if (p.data) {
+        try { data = JSON.parse(p.data); } catch { /* ignore */ }
+    }
+    return {
+        id: p.id,
+        organizationId: p.organizationId,
+        type: p.type,
+        data,
+        enabled: p.enabled,
+        object: 'policy',
+    };
+}
+
+/**
+ * GET /api/organizations/:id/policies
+ * 对应 PoliciesController.GetAll —— 列出组织所有策略
+ * 权限：Owner/Admin（对应官方 ManagePolicies）
+ */
+orgs.get('/:id/policies', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    const orgUser = await getOrgUser(db, orgId, userId);
+    requireOwnerOrAdmin(orgUser);
+
+    let policyList: PolicyRow[];
+    try {
+        policyList = await db.select().from(policies)
+            .where(eq(policies.organizationId, orgId)).all();
+    } catch (e) {
+        if (isNoSuchTablePolicies(e)) policyList = [];
+        else throw e;
+    }
+
+    return c.json({
+        data: policyList.map(toPolicyResponse),
+        object: 'list',
+        continuationToken: null,
+    });
+});
+
+/**
+ * GET /api/organizations/:id/policies/token
+ * 对应 PoliciesController.GetByToken —— 通过邀请 token 获取已启用的策略（匿名端点，但 Workers 里统一需 auth）
+ */
+orgs.get('/:id/policies/token', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) return c.json({ message: 'Not found', object: 'error' }, 404);
+
+    let policyList: PolicyRow[];
+    try {
+        policyList = await db.select().from(policies)
+            .where(and(eq(policies.organizationId, orgId), eq(policies.enabled, true))).all();
+    } catch (e) {
+        if (isNoSuchTablePolicies(e)) policyList = [];
+        else throw e;
+    }
+
+    return c.json({
+        data: policyList.map(toPolicyResponse),
+        object: 'list',
+        continuationToken: null,
+    });
+});
+
+/**
+ * GET /api/organizations/:id/policies/master-password
+ * 对应 PoliciesController.GetMasterPasswordPolicy
+ */
+orgs.get('/:id/policies/master-password', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) return c.json({ message: 'Not found', object: 'error' }, 404);
+
+    await getOrgUser(db, orgId, userId);
+
+    let policy: PolicyRow | undefined;
+    try {
+        policy = await db.select().from(policies)
+            .where(and(eq(policies.organizationId, orgId), eq(policies.type, 1)))
+            .get();
+    } catch (e) {
+        if (isNoSuchTablePolicies(e)) throw new NotFoundError('Policy not found.');
+        throw e;
+    }
+
+    if (!policy || !policy.enabled) return c.json({ message: 'Policy not found.', object: 'error' }, 404);
+    return c.json(toPolicyResponse(policy));
+});
+
+/**
+ * GET /api/organizations/:id/policies/:type
+ * 对应 PoliciesController.Get —— 获取单个策略
+ */
+orgs.get('/:id/policies/:type', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const policyType = parseInt(c.req.param('type'), 10);
+    const userId = c.get('userId');
+
+    if (Number.isNaN(policyType)) throw new BadRequestError('Invalid policy type.');
+
+    const orgUser = await getOrgUser(db, orgId, userId);
+    requireOwnerOrAdmin(orgUser);
+
+    let policy: PolicyRow | undefined;
+    try {
+        policy = await db.select().from(policies)
+            .where(and(eq(policies.organizationId, orgId), eq(policies.type, policyType)))
+            .get();
+    } catch (e) {
+        if (isNoSuchTablePolicies(e)) throw new NotFoundError('Policy not found.');
+        throw e;
+    }
+
+    if (!policy) {
+        return c.json({
+            id: null,
+            organizationId: orgId,
+            type: policyType,
+            data: null,
+            enabled: false,
+            object: 'policy',
+        });
+    }
+
+    return c.json(toPolicyResponse(policy));
+});
+
+/**
+ * PUT /api/organizations/:id/policies/:type
+ * 对应 PoliciesController.Put —— 创建或更新策略
+ */
+orgs.put('/:id/policies/:type', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const policyType = parseInt(c.req.param('type'), 10);
+    const userId = c.get('userId');
+
+    if (Number.isNaN(policyType)) throw new BadRequestError('Invalid policy type.');
+
+    const orgUser = await getOrgUser(db, orgId, userId);
+    requireOwnerOrAdmin(orgUser);
+
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+
+    const body = await c.req.json<{
+        enabled?: boolean;
+        data?: Record<string, unknown> | null;
+    }>();
+
+    const now = new Date().toISOString();
+    const dataStr = body.data ? JSON.stringify(body.data) : null;
+
+    let existing: PolicyRow | undefined;
+    try {
+        existing = await db.select().from(policies)
+            .where(and(eq(policies.organizationId, orgId), eq(policies.type, policyType)))
+            .get();
+    } catch (e) {
+        if (!isNoSuchTablePolicies(e)) throw e;
+    }
+
+    let policy: PolicyRow;
+    if (existing) {
+        await db.update(policies).set({
+            enabled: body.enabled ?? existing.enabled,
+            data: dataStr ?? existing.data,
+            revisionDate: now,
+        }).where(eq(policies.id, existing.id));
+        const updated = await db.select().from(policies).where(eq(policies.id, existing.id)).get();
+        if (!updated) throw new NotFoundError('Policy not found after update.');
+        policy = updated;
+    } else {
+        const policyId = generateUuid();
+        await db.insert(policies).values({
+            id: policyId,
+            organizationId: orgId,
+            type: policyType,
+            enabled: body.enabled ?? false,
+            data: dataStr,
+            creationDate: now,
+            revisionDate: now,
+        });
+        const created = await db.select().from(policies).where(eq(policies.id, policyId)).get();
+        if (!created) throw new NotFoundError('Policy not found after creation.');
+        policy = created;
+    }
+
+    await logEvent(c.env.DB, 1300, {
+        organizationId: orgId,
+        actingUserId: userId,
+        deviceType: getDeviceTypeFromRequest(c),
+    });
+
+    await bumpAccountRevisionDateByOrganizationId(db, orgId, now);
+    c.executionCtx.waitUntil(pushSyncVaultToOrgMembers(c.env, db, orgId));
+
+    return c.json(toPolicyResponse(policy));
 });
 
 // ==================== 其他辅助端点 ====================

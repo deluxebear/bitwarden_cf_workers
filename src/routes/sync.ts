@@ -7,7 +7,7 @@
 import { Hono } from 'hono';
 import { drizzle } from 'drizzle-orm/d1';
 import { eq, and, inArray } from 'drizzle-orm';
-import { users, ciphers, folders, sends, organizations, organizationUsers, collections, collectionCiphers } from '../db/schema';
+import { users, ciphers, folders, sends, organizations, organizationUsers, collections, collectionCiphers, policies } from '../db/schema';
 import { authMiddleware } from '../middleware/auth';
 import { NotFoundError } from '../middleware/error';
 import { batchedInArrayQuery, D1_BATCH_SIZE } from '../services/db';
@@ -355,12 +355,34 @@ sync.get('/', async (c) => {
         return baseResponse;
     });
 
+    // 查询用户所在组织的已启用策略
+    let syncPolicies: any[] = [];
+    if (orgIds.length > 0) {
+        try {
+            const policyRows = await db.select().from(policies)
+                .where(and(inArray(policies.organizationId, orgIds), eq(policies.enabled, true)))
+                .all();
+            syncPolicies = policyRows.map(p => {
+                let data: Record<string, unknown> | null = null;
+                if (p.data) { try { data = JSON.parse(p.data); } catch { /* ignore */ } }
+                return {
+                    id: p.id,
+                    organizationId: p.organizationId,
+                    type: p.type,
+                    data,
+                    enabled: p.enabled,
+                    object: 'policy',
+                };
+            });
+        } catch { /* policies table may not exist yet */ }
+    }
+
     const response: SyncResponse = {
         profile: profile,
         folders: formattedFolders,
         collections: myCollections,
-        policies: [],
-        ciphers: formattedCiphers, // 此处我们暂把个人 Ciphers 与组织的合并，稍微简化
+        policies: syncPolicies,
+        ciphers: formattedCiphers,
         sends: formattedSends,
         domains: excludeDomains ? null : {
             equivalentDomains: user.equivalentDomains ? JSON.parse(user.equivalentDomains) : null,
