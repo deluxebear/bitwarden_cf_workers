@@ -483,11 +483,11 @@ ciphersRoute.post('/:id/attachment/v2', async (c) => {
         fileName?: string;
         fileSize?: number;
         adminRequest?: boolean;
+        lastKnownRevisionDate?: string;
     }>();
 
     const attachmentId = generateUuid();
 
-    // 预创建附件元数据（validated=false，等待实际文件上传）
     const attachmentsMap = cipher.attachments ? JSON.parse(cipher.attachments) : {};
     attachmentsMap[attachmentId] = {
         fileName: body.fileName || 'file',
@@ -505,13 +505,16 @@ ciphersRoute.post('/:id/attachment/v2', async (c) => {
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
 
     const updated = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
+    const baseUrl = getBaseUrl(c);
+    const isAdmin = !!body.adminRequest;
+    const cipherResp = toCipherResponse(updated!, userId, baseUrl, isAdmin ? 'cipherMiniDetails' : 'cipherDetails');
 
     return c.json({
         attachmentId,
         url: `${cipherId}/attachment/${attachmentId}`,
         fileUploadType: 0, // Direct
-        cipherResponse: toCipherResponse(updated!, userId, getBaseUrl(c), 'cipherDetails'),
-        cipherMiniResponse: null,
+        cipherResponse: isAdmin ? null : cipherResp,
+        cipherMiniResponse: isAdmin ? cipherResp : null,
         object: 'attachment-fileUpload',
     });
 });
