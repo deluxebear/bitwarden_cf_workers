@@ -113,6 +113,9 @@ app.get('/attachments/:cipherId/:attachmentId', async (c) => {
 });
 
 // Hub (SignalR notifications) - WebSocket via Durable Object
+// 场景1: 用户只设 base URL → getNotificationsUrl() = base + "/notifications" → 请求 /notifications/hub
+// 场景2: config 返回 notifications=origin → getNotificationsUrl() = origin → 请求 /hub
+app.route('/notifications', hubRoutes);
 app.route('/', hubRoutes);
 
 // 404 处理
