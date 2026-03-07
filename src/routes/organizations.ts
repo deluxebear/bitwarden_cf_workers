@@ -1442,6 +1442,232 @@ orgs.post('/:id/users/public-keys', async (c) => {
 });
 
 /**
+ * PUT /api/organizations/:orgId/users/:orgUserId/revoke
+ * 对应 OrganizationUsersController.RevokeAsync
+ * 撤销组织成员访问权限（status → -1）
+ */
+const revokeHandler = async (c: any) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const orgUserId = c.req.param('orgUserId');
+    const userId = c.get('userId');
+
+    const actingUser = await getOrgUser(db, orgId, userId);
+    requireOwnerOrAdmin(actingUser);
+
+    const target = await db.select().from(organizationUsers)
+        .where(and(eq(organizationUsers.id, orgUserId), eq(organizationUsers.organizationId, orgId))).get();
+    if (!target) throw new NotFoundError('Member not found.');
+
+    // Owner 只能被其他 Owner 撤销
+    if (target.type === 0 && actingUser.type !== 0) {
+        throw new BadRequestError('Only owners can revoke other owners.');
+    }
+    // 不能撤销自己
+    if (target.userId === userId) {
+        throw new BadRequestError('You cannot revoke yourself.');
+    }
+
+    if (target.status === -1) {
+        return c.body(null, 204);
+    }
+
+    const now = new Date().toISOString();
+    await db.update(organizationUsers).set({
+        status: -1, // Revoked
+        revisionDate: now,
+    }).where(eq(organizationUsers.id, orgUserId));
+
+    await logEvent(c.env.DB, 1503, {
+        organizationId: orgId,
+        actingUserId: userId,
+        organizationUserId: orgUserId,
+        deviceType: getDeviceTypeFromRequest(c),
+    });
+
+    if (target.userId) {
+        await bumpAccountRevisionDateByOrganizationUserId(db, orgUserId, now);
+        c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncOrgKeys, target.userId, null));
+    }
+
+    return c.body(null, 204);
+};
+orgs.put('/:id/users/:orgUserId/revoke', revokeHandler);
+orgs.patch('/:id/users/:orgUserId/revoke', revokeHandler);
+
+/**
+ * PUT /api/organizations/:orgId/users/revoke (批量撤销)
+ * 对应 OrganizationUsersController.BulkRevokeAsync
+ */
+const bulkRevokeHandler = async (c: any) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    const actingUser = await getOrgUser(db, orgId, userId);
+    requireOwnerOrAdmin(actingUser);
+
+    const body = (await c.req.json()) as { ids: string[] };
+    const results: { id: string; error: string }[] = [];
+    const now = new Date().toISOString();
+
+    for (const ouId of body.ids ?? []) {
+        const target = await db.select().from(organizationUsers)
+            .where(and(eq(organizationUsers.id, ouId), eq(organizationUsers.organizationId, orgId))).get();
+        if (!target) {
+            results.push({ id: ouId, error: 'Member not found.' });
+            continue;
+        }
+        if (target.type === 0 && actingUser.type !== 0) {
+            results.push({ id: ouId, error: 'Only owners can revoke other owners.' });
+            continue;
+        }
+        if (target.userId === userId) {
+            results.push({ id: ouId, error: 'You cannot revoke yourself.' });
+            continue;
+        }
+        if (target.status !== -1) {
+            await db.update(organizationUsers).set({
+                status: -1,
+                revisionDate: now,
+            }).where(eq(organizationUsers.id, ouId));
+
+            if (target.userId) {
+                await bumpAccountRevisionDateByOrganizationUserId(db, ouId, now);
+                c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncOrgKeys, target.userId, null));
+            }
+        }
+        results.push({ id: ouId, error: '' });
+    }
+
+    return c.json({
+        data: results.map(r => ({
+            id: r.id,
+            error: r.error || null,
+            object: 'organizationUserBulkResponseModel',
+        })),
+        object: 'list',
+        continuationToken: null,
+    });
+};
+orgs.put('/:id/users/revoke', bulkRevokeHandler);
+orgs.patch('/:id/users/revoke', bulkRevokeHandler);
+
+/**
+ * PUT /api/organizations/:orgId/users/:orgUserId/restore
+ * 对应 OrganizationUsersController.RestoreAsync
+ * 恢复被撤销的组织成员（status → Confirmed/Accepted/Invited）
+ */
+const restoreHandler = async (c: any) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const orgUserId = c.req.param('orgUserId');
+    const userId = c.get('userId');
+
+    const actingUser = await getOrgUser(db, orgId, userId);
+    requireOwnerOrAdmin(actingUser);
+
+    const target = await db.select().from(organizationUsers)
+        .where(and(eq(organizationUsers.id, orgUserId), eq(organizationUsers.organizationId, orgId))).get();
+    if (!target) throw new NotFoundError('Member not found.');
+
+    if (target.status !== -1) {
+        throw new BadRequestError('User is not in a revoked state.');
+    }
+
+    // 根据官方逻辑确定恢复后的状态
+    let restoreStatus = 0; // Invited
+    if (target.userId) {
+        restoreStatus = 1; // Accepted
+        if (target.key) {
+            restoreStatus = 2; // Confirmed
+        }
+    }
+
+    const now = new Date().toISOString();
+    await db.update(organizationUsers).set({
+        status: restoreStatus,
+        revisionDate: now,
+    }).where(eq(organizationUsers.id, orgUserId));
+
+    await logEvent(c.env.DB, 1505, {
+        organizationId: orgId,
+        actingUserId: userId,
+        organizationUserId: orgUserId,
+        deviceType: getDeviceTypeFromRequest(c),
+    });
+
+    if (target.userId) {
+        await bumpAccountRevisionDateByOrganizationUserId(db, orgUserId, now);
+        c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncOrgKeys, target.userId, null));
+    }
+
+    return c.body(null, 204);
+};
+orgs.put('/:id/users/:orgUserId/restore', restoreHandler);
+orgs.put('/:id/users/:orgUserId/restore/vnext', restoreHandler);
+orgs.patch('/:id/users/:orgUserId/restore', restoreHandler);
+
+/**
+ * PUT /api/organizations/:orgId/users/restore (批量恢复)
+ * 对应 OrganizationUsersController.BulkRestoreAsync
+ */
+const bulkRestoreHandler = async (c: any) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    const actingUser = await getOrgUser(db, orgId, userId);
+    requireOwnerOrAdmin(actingUser);
+
+    const body = (await c.req.json()) as { ids: string[] };
+    const results: { id: string; error: string }[] = [];
+    const now = new Date().toISOString();
+
+    for (const ouId of body.ids ?? []) {
+        const target = await db.select().from(organizationUsers)
+            .where(and(eq(organizationUsers.id, ouId), eq(organizationUsers.organizationId, orgId))).get();
+        if (!target) {
+            results.push({ id: ouId, error: 'Member not found.' });
+            continue;
+        }
+        if (target.status !== -1) {
+            results.push({ id: ouId, error: 'User is not in a revoked state.' });
+            continue;
+        }
+
+        let restoreStatus = 0;
+        if (target.userId) {
+            restoreStatus = 1;
+            if (target.key) restoreStatus = 2;
+        }
+
+        await db.update(organizationUsers).set({
+            status: restoreStatus,
+            revisionDate: now,
+        }).where(eq(organizationUsers.id, ouId));
+
+        if (target.userId) {
+            await bumpAccountRevisionDateByOrganizationUserId(db, ouId, now);
+            c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncOrgKeys, target.userId, null));
+        }
+        results.push({ id: ouId, error: '' });
+    }
+
+    return c.json({
+        data: results.map(r => ({
+            id: r.id,
+            error: r.error || null,
+            object: 'organizationUserBulkResponseModel',
+        })),
+        object: 'list',
+        continuationToken: null,
+    });
+};
+orgs.put('/:id/users/restore', bulkRestoreHandler);
+orgs.patch('/:id/users/restore', bulkRestoreHandler);
+
+/**
  * PUT /api/organizations/:orgId/users/:orgUserId
  * 更新组织成员
  */
@@ -2722,7 +2948,7 @@ async function singleOrgOnEnableSideEffect(db: D1Db, orgId: string, actingUserId
     const now = new Date().toISOString();
     for (const m of toRevoke) {
         await db.update(organizationUsers).set({
-            status: 3, // Revoked
+            status: -1, // Revoked
             revisionDate: now,
         }).where(eq(organizationUsers.id, m.id));
     }
@@ -2753,7 +2979,7 @@ async function twoFactorOnEnableSideEffect(db: D1Db, orgId: string, actingUserId
         if (has2FA) continue;
 
         await db.update(organizationUsers).set({
-            status: 3, // Revoked
+            status: -1, // Revoked
             revisionDate: now,
         }).where(eq(organizationUsers.id, m.ouId));
     }
