@@ -170,13 +170,13 @@ authRequestsRoute.get('/:id/response', async (c) => {
         .where(eq(authRequests.id, id))
         .get();
 
-    // 验证 accessCode（对应 GetValidatedAuthRequestAsync）
     if (!authRequest || authRequest.accessCode !== code) {
         return c.json({ message: 'Auth request not found.', object: 'error' }, 404);
     }
 
-    // 检查是否已消费或过期（对应 IsAuthRequestValid / IsSpent）
-    if (authRequest.responseDate || authRequest.authenticationDate || isExpired(authRequest.creationDate)) {
+    // 官方 IsAuthRequestValid 对 AuthenticateAndUnlock 类型只检查 CreationDate 是否过期，
+    // 不检查 responseDate（批准后浏览器还需要轮询拿到 key 才能完成登录）。
+    if (isExpired(authRequest.creationDate)) {
         return c.json({ message: 'Auth request not found.', object: 'error' }, 404);
     }
 
