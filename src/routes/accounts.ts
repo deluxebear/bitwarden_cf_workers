@@ -6,8 +6,8 @@
 
 import { Hono } from 'hono';
 import { drizzle } from 'drizzle-orm/d1';
-import { eq } from 'drizzle-orm';
-import { users, organizations, organizationUsers } from '../db/schema';
+import { eq, and } from 'drizzle-orm';
+import { users, organizations, organizationUsers, ciphers, folders, sends, devices, webAuthnCredentials } from '../db/schema';
 import { authMiddleware } from '../middleware/auth';
 import { BadRequestError, NotFoundError } from '../middleware/error';
 import { generateSecureRandomString, verifyPassword } from '../services/crypto';
@@ -584,6 +584,190 @@ accounts.delete('/', async (c) => {
     }
 
     await db.delete(users).where(eq(users.id, userId));
+
+    return c.body(null, 204);
+});
+
+// ==================== Key Management ====================
+
+/**
+ * 将客户端 cipher 请求字段序列化为数据库 data JSON 格式
+ * （与 ciphers.ts 中的创建/更新逻辑一致）
+ */
+function serializeCipherData(cipher: any): string {
+    const data: any = {
+        name: cipher.name,
+        notes: cipher.notes || null,
+        fields: cipher.fields || null,
+        passwordHistory: cipher.passwordHistory || null,
+    };
+    if (cipher.type === 1) data.login = cipher.login;
+    if (cipher.type === 2) data.secureNote = cipher.secureNote;
+    if (cipher.type === 3) data.card = cipher.card;
+    if (cipher.type === 4) data.identity = cipher.identity;
+    if (cipher.type === 5 && cipher.sshKey) {
+        data.privateKey = cipher.sshKey.privateKey;
+        data.publicKey = cipher.sshKey.publicKey;
+        data.keyFingerprint = cipher.sshKey.keyFingerprint;
+    }
+    return JSON.stringify(data);
+}
+
+/**
+ * 将客户端 send 请求字段序列化为数据库 data JSON 格式
+ */
+function serializeSendData(send: any): string {
+    const data: any = { name: send.name || null, notes: send.notes || null };
+    if (send.type === 0) data.text = send.text;
+    if (send.type === 1) data.file = send.file;
+    return JSON.stringify(data);
+}
+
+/**
+ * POST /api/accounts/key-management/rotate-user-account-keys
+ * 对应 AccountsKeyManagementController.RotateUserAccountKeysAsync
+ *
+ * 密钥轮换：客户端在本地用新密钥重新加密所有数据后一次性提交，
+ * 服务端使用 D1 batch() 在单个事务中原子更新所有记录。
+ * 任一语句失败则全部回滚，保证不会出现密钥与数据不匹配的情况。
+ */
+accounts.post('/key-management/rotate-user-account-keys', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const body = await c.req.json<any>();
+
+    if (!body.oldMasterKeyAuthenticationHash) {
+        throw new BadRequestError('Old master key authentication hash is required.');
+    }
+    if (!body.accountUnlockData?.masterPasswordUnlockData) {
+        throw new BadRequestError('Master password unlock data is required.');
+    }
+
+    const user = await db.select().from(users).where(eq(users.id, userId)).get();
+    if (!user) throw new NotFoundError('User not found.');
+
+    const valid = await verifyPassword(body.oldMasterKeyAuthenticationHash, user.masterPassword || '');
+    if (!valid) throw new BadRequestError('Invalid master password.');
+
+    const now = new Date().toISOString();
+    const mpData = body.accountUnlockData.masterPasswordUnlockData;
+
+    const newPrivateKey =
+        body.accountKeys?.publicKeyEncryptionKeyPair?.wrappedPrivateKey
+        ?? body.accountKeys?.userKeyEncryptedAccountPrivateKey
+        ?? user.privateKey;
+
+    // -- 构建所有 UPDATE 语句 --
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const statements: any[] = [];
+
+    // 1) 更新用户密钥及主密码
+    statements.push(
+        db.update(users).set({
+            key: mpData.masterKeyEncryptedUserKey,
+            privateKey: newPrivateKey,
+            masterPassword: mpData.masterKeyAuthenticationHash,
+            masterPasswordHint: mpData.masterPasswordHint ?? user.masterPasswordHint,
+            securityStamp: generateSecureRandomString(50),
+            kdf: mpData.kdfType ?? user.kdf,
+            kdfIterations: mpData.kdfIterations ?? user.kdfIterations,
+            kdfMemory: mpData.kdfMemory ?? user.kdfMemory,
+            kdfParallelism: mpData.kdfParallelism ?? user.kdfParallelism,
+            signedPublicKey: body.accountKeys?.publicKeyEncryptionKeyPair?.signedPublicKey ?? user.signedPublicKey,
+            revisionDate: now,
+            accountRevisionDate: now,
+            lastKeyRotationDate: now,
+        }).where(eq(users.id, userId))
+    );
+
+    // 2) 重加密后的 Ciphers
+    const cipherList: any[] = body.accountData?.ciphers ?? [];
+    for (const cipher of cipherList) {
+        if (!cipher.id) continue;
+        statements.push(
+            db.update(ciphers).set({
+                data: serializeCipherData(cipher),
+                key: cipher.key ?? null,
+                revisionDate: now,
+            }).where(and(eq(ciphers.id, cipher.id), eq(ciphers.userId, userId)))
+        );
+    }
+
+    // 3) 重加密后的 Folders
+    const folderList: any[] = body.accountData?.folders ?? [];
+    for (const folder of folderList) {
+        if (!folder.id) continue;
+        statements.push(
+            db.update(folders).set({
+                name: folder.name,
+                revisionDate: now,
+            }).where(and(eq(folders.id, folder.id), eq(folders.userId, userId)))
+        );
+    }
+
+    // 4) 重加密后的 Sends
+    const sendList: any[] = body.accountData?.sends ?? [];
+    for (const send of sendList) {
+        if (!send.id) continue;
+        statements.push(
+            db.update(sends).set({
+                data: serializeSendData(send),
+                key: send.key ?? null,
+                revisionDate: now,
+            }).where(and(eq(sends.id, send.id), eq(sends.userId, userId)))
+        );
+    }
+
+    // 5) 组织用户恢复密钥
+    const orgRecoveryList: any[] = body.accountUnlockData?.organizationAccountRecoveryUnlockData ?? [];
+    for (const orgUser of orgRecoveryList) {
+        if (!orgUser.organizationId) continue;
+        statements.push(
+            db.update(organizationUsers).set({
+                resetPasswordKey: orgUser.resetPasswordKey ?? null,
+            }).where(and(
+                eq(organizationUsers.organizationId, orgUser.organizationId),
+                eq(organizationUsers.userId, userId)
+            ))
+        );
+    }
+
+    // 6) WebAuthn（Passkey）凭证
+    const passkeyList: any[] = body.accountUnlockData?.passkeyUnlockData ?? [];
+    for (const passkey of passkeyList) {
+        if (!passkey.id) continue;
+        statements.push(
+            db.update(webAuthnCredentials).set({
+                encryptedUserKey: passkey.encryptedUserKey ?? null,
+                encryptedPublicKey: passkey.encryptedPublicKey ?? null,
+            }).where(and(
+                eq(webAuthnCredentials.id, passkey.id),
+                eq(webAuthnCredentials.userId, userId)
+            ))
+        );
+    }
+
+    // 7) 设备信任密钥
+    const deviceList: any[] = body.accountUnlockData?.deviceKeyUnlockData ?? [];
+    for (const device of deviceList) {
+        if (!device.deviceId) continue;
+        statements.push(
+            db.update(devices).set({
+                encryptedPublicKey: device.encryptedPublicKey ?? null,
+                encryptedUserKey: device.encryptedUserKey ?? null,
+            }).where(and(
+                eq(devices.id, device.deviceId),
+                eq(devices.userId, userId)
+            ))
+        );
+    }
+
+    // 执行 D1 batch 事务（原子性：全部成功或全部回滚）
+    await db.batch(statements as [any, ...any[]]);
+
+    // 推送其他设备登出
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushLogOut(c.env, userId, contextId));
 
     return c.body(null, 204);
 });
