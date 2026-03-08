@@ -1106,6 +1106,103 @@ ciphersRoute.post('/import-organization', async (c) => {
 });
 
 /**
+ * POST /api/ciphers/import
+ * 对应 ImportCiphersController.PostImport：个人保险库导入（文件夹 + 密码条目 + 关系）
+ * 必须定义在 post('/:id') 之前，否则 "import" 会被当作 cipher id 匹配导致 Cipher not found.
+ */
+ciphersRoute.post('/import', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const body = await c.req.json<{
+        folders?: Array<{ id?: string; name: string }>;
+        ciphers: CipherRequest[];
+        folderRelationships?: Array<{ key: number; value: number }>;
+    }>();
+    const foldersList = body.folders ?? [];
+    const ciphersList = body.ciphers ?? [];
+    const folderRelationships = body.folderRelationships ?? [];
+
+    const userFolderIds = new Set(
+        (await db.select({ id: folders.id }).from(folders).where(eq(folders.userId, userId))).map((r) => r.id)
+    );
+
+    const now = new Date().toISOString();
+    const cipherIdMap = new Map<number, string>();
+    for (let i = 0; i < ciphersList.length; i++) {
+        cipherIdMap.set(i, generateUuid());
+    }
+    const folderIdMap = new Map<number, string>();
+    const newFolderRows: { id: string; userId: string; name: string; creationDate: string; revisionDate: string }[] = [];
+    for (let i = 0; i < foldersList.length; i++) {
+        const f = foldersList[i];
+        const existingId = f.id && userFolderIds.has(f.id) ? f.id : null;
+        if (existingId) {
+            folderIdMap.set(i, existingId);
+        } else {
+            const newId = generateUuid();
+            folderIdMap.set(i, newId);
+            newFolderRows.push({
+                id: newId,
+                userId,
+                name: f.name,
+                creationDate: now,
+                revisionDate: now,
+            });
+        }
+    }
+    if (newFolderRows.length > 0) {
+        for (const row of newFolderRows) {
+            await db.insert(folders).values(row);
+        }
+    }
+
+    for (let i = 0; i < ciphersList.length; i++) {
+        const bodyCipher = ciphersList[i];
+        const cipherId = cipherIdMap.get(i);
+        if (!cipherId) continue;
+        const folderForCipher = folderRelationships.find((r) => r.key === i);
+        const folderId = folderForCipher != null ? folderIdMap.get(folderForCipher.value) : null;
+        const foldersJson: Record<string, string> = folderId ? { [userId]: folderId } : {};
+
+        const data: Record<string, unknown> = {
+            name: bodyCipher.name,
+            notes: bodyCipher.notes ?? null,
+            fields: bodyCipher.fields ?? null,
+            passwordHistory: bodyCipher.passwordHistory ?? null,
+        };
+        if (bodyCipher.type === 1) data.login = bodyCipher.login;
+        if (bodyCipher.type === 2) data.secureNote = bodyCipher.secureNote;
+        if (bodyCipher.type === 3) data.card = bodyCipher.card;
+        if (bodyCipher.type === 4) data.identity = bodyCipher.identity;
+        if (bodyCipher.type === 5 && bodyCipher.sshKey) {
+            data.privateKey = bodyCipher.sshKey.privateKey;
+            data.publicKey = bodyCipher.sshKey.publicKey;
+            data.keyFingerprint = bodyCipher.sshKey.keyFingerprint;
+        }
+        const fav = bodyCipher.favorite ? { [userId]: true } : {};
+        await db.insert(ciphers).values({
+            id: cipherId,
+            userId,
+            organizationId: null,
+            type: bodyCipher.type,
+            data: JSON.stringify(data),
+            favorites: JSON.stringify(fav),
+            folders: JSON.stringify(foldersJson),
+            reprompt: bodyCipher.reprompt ?? 0,
+            key: bodyCipher.key ?? null,
+            creationDate: now,
+            revisionDate: now,
+        });
+        await logEvent(c.env.DB, 1100, { userId, cipherId });
+    }
+
+    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncVault, userId, contextId));
+    return c.json({});
+});
+
+/**
  * PUT /api/ciphers/:id/delete
  * 对应 CiphersController.PutDelete（软删除 alt 路由）
  */
