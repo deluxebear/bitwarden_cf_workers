@@ -86,6 +86,7 @@ app.route('/api/webauthn', webauthnRoutes);
 app.route('/api/emergency-access', emergencyAccessRoutes);
 app.route('/api/settings', settingsRoutes);
 app.route('/api/reports', reportsRoutes);
+app.route('/icons', iconsRoutes);
 app.route('/', iconsRoutes);
 
 // 自建组织 License 相关端点
