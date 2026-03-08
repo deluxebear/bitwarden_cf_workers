@@ -36,7 +36,7 @@ export async function readCachedIcon(kv: KVNamespace | undefined, keys: IconCach
         return null;
     }
     const meta = await readCachedMeta(kv, keys);
-    if (!meta || meta.status !== 'ok' || !meta.contentType || !meta.dataKey || meta.expiresAt <= Date.now()) {
+    if (!meta || meta.status !== 'ok' || !meta.contentType || !meta.dataKey) {
         return null;
     }
 
@@ -70,7 +70,6 @@ export async function writeSuccessCache(
         return;
     }
     const now = Date.now();
-    const expiresAt = now + config.successTtlSeconds * 1000;
     const meta: CachedIconMeta = {
         version: 1,
         status: 'ok',
@@ -78,12 +77,12 @@ export async function writeSuccessCache(
         contentType: icon.contentType,
         dataKey: keys.data,
         fetchedAt: now,
-        expiresAt,
+        expiresAt: 0,
     };
 
     await Promise.all([
-        kv.put(keys.data, icon.image, { expirationTtl: config.successTtlSeconds }),
-        kv.put(keys.meta, JSON.stringify(meta), { expirationTtl: config.successTtlSeconds }),
+        kv.put(keys.data, icon.image),
+        kv.put(keys.meta, JSON.stringify(meta)),
     ]);
 }
 
