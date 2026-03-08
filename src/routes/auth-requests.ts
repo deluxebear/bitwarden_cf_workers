@@ -183,16 +183,14 @@ authRequestsRoute.get('/:id/response', async (c) => {
     return c.json(buildAuthRequestResponse(authRequest));
 });
 
-// ---- 认证端点 ----
-authRequestsRoute.use('/', authMiddleware);
-authRequestsRoute.use('/:id', authMiddleware);
+// ---- 认证端点（每个路由单独挂 authMiddleware，避免影响上面的匿名端点） ----
 
 /**
  * GET /api/auth-requests
  * 对应 AuthRequestsController.GetAll
  * 获取当前用户所有登录请求
  */
-authRequestsRoute.get('/', async (c) => {
+authRequestsRoute.get('/', authMiddleware, async (c) => {
     const db = drizzle(c.env.DB);
     const userId = c.get('userId');
 
@@ -215,17 +213,15 @@ authRequestsRoute.get('/', async (c) => {
  * 对应 AuthRequestsController.GetPendingAuthRequestsAsync
  * 获取当前用户所有「待处理」的登录请求（每个设备只返回最新一条）。
  */
-authRequestsRoute.get('/pending', async (c) => {
+authRequestsRoute.get('/pending', authMiddleware, async (c) => {
     const db = drizzle(c.env.DB);
     const userId = c.get('userId');
 
-    // 取出该用户的所有请求，后续在内存中过滤「未过期 + 未处理」并按设备去重。
     const requests = await db.select()
         .from(authRequests)
         .where(eq(authRequests.userId, userId))
         .all();
 
-    // 过滤掉已过期或已消费的请求（参考 IsAuthRequestValid / GetExpirationDate）
     const pending = requests.filter((r) => {
         if (!r) {
             return false;
@@ -239,7 +235,6 @@ authRequestsRoute.get('/pending', async (c) => {
         return !isExpired(r.creationDate);
     });
 
-    // 按设备标识聚合：每个 requestDeviceIdentifier 仅返回最新一条
     const latestByDevice = new Map<string, (typeof pending)[number]>();
     for (const req of pending) {
         const key = req.requestDeviceIdentifier || '';
@@ -269,7 +264,7 @@ authRequestsRoute.get('/pending', async (c) => {
  * 对应 AuthRequestsController.Get
  * 获取指定的登录请求
  */
-authRequestsRoute.get('/:id', async (c) => {
+authRequestsRoute.get('/:id', authMiddleware, async (c) => {
     const db = drizzle(c.env.DB);
     const userId = c.get('userId');
     const id = c.req.param('id');
@@ -291,7 +286,7 @@ authRequestsRoute.get('/:id', async (c) => {
  * 对应 AuthRequestsController.Put
  * 批准或拒绝登录请求
  */
-authRequestsRoute.put('/:id', async (c) => {
+authRequestsRoute.put('/:id', authMiddleware, async (c) => {
     const db = drizzle(c.env.DB);
     const userId = c.get('userId');
     const id = c.req.param('id');
@@ -307,7 +302,6 @@ authRequestsRoute.put('/:id', async (c) => {
         return c.json({ message: 'Device identifier is required.', object: 'error' }, 400);
     }
 
-    // 获取 auth request
     const authRequest = await db.select()
         .from(authRequests)
         .where(eq(authRequests.id, id))
@@ -317,22 +311,18 @@ authRequestsRoute.put('/:id', async (c) => {
         return c.json({ message: 'Auth request not found.', object: 'error' }, 404);
     }
 
-    // 已设置过 approved，不能再更新（对应 DuplicateAuthRequestException）
     if (authRequest.approved !== null) {
         return c.json({ message: 'Auth request has already been processed.', object: 'error' }, 400);
     }
 
-    // 检查是否过期
     if (isExpired(authRequest.creationDate)) {
         return c.json({ message: 'Auth request not found.', object: 'error' }, 404);
     }
 
-    // 验证请求属于当前用户
     if (authRequest.userId !== userId) {
         return c.json({ message: 'Auth request not found.', object: 'error' }, 404);
     }
 
-    // 验证审批方设备（对应官方的 deviceRepository.GetByIdentifierAsync）
     const device = await db.select({ id: devices.id })
         .from(devices)
         .where(and(eq(devices.identifier, body.deviceIdentifier), eq(devices.userId, userId)))
@@ -344,7 +334,6 @@ authRequestsRoute.put('/:id', async (c) => {
 
     const now = new Date().toISOString();
 
-    // 更新 auth request
     const updateData: {
         responseDate: string;
         approved: boolean | null;
@@ -367,7 +356,6 @@ authRequestsRoute.put('/:id', async (c) => {
         .where(eq(authRequests.id, id))
         .execute();
 
-    // 返回更新后的结果
     const updated = await db.select()
         .from(authRequests)
         .where(eq(authRequests.id, id))
@@ -377,7 +365,6 @@ authRequestsRoute.put('/:id', async (c) => {
         return c.json({ message: 'Auth request not found.', object: 'error' }, 404);
     }
 
-    // 推送 AuthRequestResponse 通知（发到匿名 hub + 用户 hub）
     if (body.requestApproved) {
         c.executionCtx.waitUntil(pushAuthRequestResponse(c.env, id, authRequest.userId));
     }
