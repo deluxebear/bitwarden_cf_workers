@@ -8,3 +8,6 @@ dist/
 
 # 本地 dry-run 结果目录
 .dry-run-out/
+
+# 本地 D1 / 数据库备份
+backups/
