@@ -7,11 +7,15 @@
 import { Hono } from 'hono';
 import { drizzle } from 'drizzle-orm/d1';
 import { eq, and, inArray } from 'drizzle-orm';
-import { users, ciphers, folders, sends, organizations, organizationUsers, collections, collectionCiphers, policies } from '../db/schema';
+import {
+    users, ciphers, folders, sends, organizations, organizationUsers,
+    collections, collectionCiphers, collectionUsers, collectionGroups, groupUsers, policies,
+} from '../db/schema';
 import { authMiddleware } from '../middleware/auth';
 import { NotFoundError } from '../middleware/error';
 import { batchedInArrayQuery, D1_BATCH_SIZE } from '../services/db';
 import { toProfileOrganizationResponse } from '../models/organization-responses';
+import { buildAttachmentDownloadUrl } from '../services/attachment-token';
 import type {
     Bindings, Variables, CipherType, CipherRepromptType, SendType,
     ProfileResponse, SyncResponse, GlobalEquivalentDomain,
@@ -27,6 +31,69 @@ function toJsonBool(v: unknown, defaultWhenNull = false): boolean {
     if (v === true || v === 1) return true;
     if (v === false || v === 0) return false;
     return defaultWhenNull;
+}
+
+function getBaseUrl(c: any): string {
+    const url = new URL(c.req.url);
+    const proto = c.req.header('x-forwarded-proto') || url.protocol.replace(':', '');
+    return `${proto}://${url.host}`;
+}
+
+function parseOrgPermissions(permissions: string | null): Record<string, unknown> {
+    if (!permissions) return {};
+    try {
+        return JSON.parse(permissions) as Record<string, unknown>;
+    } catch {
+        return {};
+    }
+}
+
+function canSyncAllOrgItems(orgUser: typeof organizationUsers.$inferSelect, org: typeof organizations.$inferSelect): boolean {
+    if (orgUser.type === 0) return true;
+    if (orgUser.type === 1 && org.allowAdminAccessToAllCollectionItems === true) return true;
+    const permissions = parseOrgPermissions(orgUser.permissions);
+    return permissions.editAnyCollection === true || permissions.deleteAnyCollection === true;
+}
+
+async function getAllowedCollectionIds(
+    db: ReturnType<typeof drizzle>,
+    orgUserId: string,
+): Promise<Map<string, { readOnly: boolean; hidePasswords: boolean; manage: boolean }>> {
+    const directRows = await db.select().from(collectionUsers)
+        .where(eq(collectionUsers.organizationUserId, orgUserId))
+        .all();
+    const groupRows = await db.select({ groupId: groupUsers.groupId }).from(groupUsers)
+        .where(eq(groupUsers.organizationUserId, orgUserId))
+        .all();
+    const groupIds = groupRows.map((row) => row.groupId);
+    const groupAccess = groupIds.length > 0
+        ? await batchedInArrayQuery<typeof collectionGroups.$inferSelect>(
+            db, collectionGroups, collectionGroups.groupId, groupIds)
+        : [];
+
+    const access = new Map<string, { readOnly: boolean; hidePasswords: boolean; manage: boolean }>();
+    for (const row of directRows) {
+        access.set(row.collectionId, {
+            readOnly: row.readOnly ?? false,
+            hidePasswords: row.hidePasswords ?? false,
+            manage: row.manage ?? false,
+        });
+    }
+    for (const row of groupAccess) {
+        const existing = access.get(row.collectionId);
+        if (!existing) {
+            access.set(row.collectionId, {
+                readOnly: row.readOnly ?? false,
+                hidePasswords: row.hidePasswords ?? false,
+                manage: row.manage ?? false,
+            });
+            continue;
+        }
+        existing.readOnly = existing.readOnly && (row.readOnly ?? false);
+        existing.hidePasswords = existing.hidePasswords && (row.hidePasswords ?? false);
+        existing.manage = existing.manage || (row.manage ?? false);
+    }
+    return access;
 }
 
 // Bitwarden 内置的全局等价域名（简化版）
@@ -174,38 +241,51 @@ sync.get('/', async (c) => {
     const orgIds = orgsData.map(o => o.org.id);
 
     if (orgIds.length > 0) {
-        // 支持多组织：用 inArray 查询所有组织的 collections
-        const orgCollections = await db.select().from(collections)
-            .where(inArray(collections.organizationId, orgIds))
-            .all();
-
-        for (const col of orgCollections) {
-            myCollections.push({
-                id: col.id,
-                organizationId: col.organizationId,
-                name: col.name,
-                revisionDate: col.revisionDate,
-                hidePasswords: false,
-                readOnly: false,
-                object: 'collection',
-            });
-
-            const collectionCipherRelations = await db.select().from(collectionCiphers)
-                .where(eq(collectionCiphers.collectionId, col.id))
+        for (const orgData of orgsData) {
+            const orgCollections = await db.select().from(collections)
+                .where(eq(collections.organizationId, orgData.org.id))
                 .all();
+            const canAccessAll = canSyncAllOrgItems(orgData.orgUser, orgData.org);
+            const allowedAccess = canAccessAll
+                ? new Map(orgCollections.map((col) => [col.id, { readOnly: false, hidePasswords: false, manage: true }]))
+                : await getAllowedCollectionIds(db, orgData.orgUser.id);
 
-            const cipherIdsInCollection = collectionCipherRelations.map(cc => cc.cipherId);
+            const allowedCollections = orgCollections.filter((col) => allowedAccess.has(col.id));
+            for (const col of allowedCollections) {
+                const access = allowedAccess.get(col.id);
+                myCollections.push({
+                    id: col.id,
+                    organizationId: col.organizationId,
+                    name: col.name,
+                    revisionDate: col.revisionDate,
+                    hidePasswords: access?.hidePasswords ?? false,
+                    readOnly: access?.readOnly ?? false,
+                    object: 'collection',
+                });
 
-            // 记录 cipher -> collectionIds 映射
-            for (const cipherId of cipherIdsInCollection) {
-                if (!cipherCollectionMap[cipherId]) cipherCollectionMap[cipherId] = [];
-                cipherCollectionMap[cipherId].push(col.id);
+                const collectionCipherRelations = await db.select().from(collectionCiphers)
+                    .where(eq(collectionCiphers.collectionId, col.id))
+                    .all();
+
+                const cipherIdsInCollection = collectionCipherRelations.map(cc => cc.cipherId);
+
+                // 记录 cipher -> collectionIds 映射
+                for (const cipherId of cipherIdsInCollection) {
+                    if (!cipherCollectionMap[cipherId]) cipherCollectionMap[cipherId] = [];
+                    cipherCollectionMap[cipherId].push(col.id);
+                }
+
+                if (cipherIdsInCollection.length > 0) {
+                    const ciphersInCollection = await batchedInArrayQuery<typeof ciphers.$inferSelect>(
+                        db, ciphers, ciphers.id, cipherIdsInCollection);
+                    orgCiphersData.push(...ciphersInCollection);
+                }
             }
-
-            if (cipherIdsInCollection.length > 0) {
-                const ciphersInCollection = await batchedInArrayQuery<typeof ciphers.$inferSelect>(
-                    db, ciphers, ciphers.id, cipherIdsInCollection);
-                orgCiphersData.push(...ciphersInCollection);
+            if (canAccessAll) {
+                const allOrgCiphers = await db.select().from(ciphers)
+                    .where(eq(ciphers.organizationId, orgData.org.id))
+                    .all();
+                orgCiphersData.push(...allOrgCiphers);
             }
         }
     }
@@ -228,20 +308,19 @@ sync.get('/', async (c) => {
     // 合并个人和组织 ciphers，并去重
     const allCiphers = [...userCiphers, ...orgCiphersData];
     const uniqueCipherIds = new Set();
-    const reqUrl = new URL(c.req.url);
-    const attachmentBaseUrl = `${reqUrl.protocol}//${reqUrl.host}`;
-    const formattedCiphers = allCiphers.filter(cipher => {
+    const attachmentBaseUrl = getBaseUrl(c);
+    const formattedCiphers = await Promise.all(allCiphers.filter(cipher => {
         if (uniqueCipherIds.has(cipher.id)) {
             return false;
         }
         uniqueCipherIds.add(cipher.id);
         return true;
-    }).map((cipher) => {
+    }).map(async (cipher) => {
         const data = JSON.parse(cipher.data || '{}');
         const favorites = cipher.favorites ? JSON.parse(cipher.favorites) : {};
         const foldersMap = cipher.folders ? JSON.parse(cipher.folders) : {};
         const attachmentsMap = cipher.attachments ? JSON.parse(cipher.attachments) : {};
-        const attachmentsList = Object.keys(attachmentsMap).map(id => {
+        const attachmentsList = await Promise.all(Object.keys(attachmentsMap).map(async (id) => {
             const a = attachmentsMap[id];
             const sizeBytes = parseInt(a.size || '0');
             const sizeName = sizeBytes >= 1048576 ? `${(sizeBytes / 1048576).toFixed(2)} MB` :
@@ -253,9 +332,9 @@ sync.get('/', async (c) => {
                 key: a.key,
                 size: a.size || '0',
                 sizeName,
-                url: `${attachmentBaseUrl}/attachments/${cipher.id}/${id}`
+                url: await buildAttachmentDownloadUrl(attachmentBaseUrl, cipher.id, id, c.env.JWT_SECRET),
             };
-        });
+        }));
 
         // SSH key: 兼容旧的嵌套存储 (data.sshKey.xxx) 和新的扁平存储 (data.xxx)
         // 如果 keyFingerprint 缺失则不返回 sshKey（iOS 要求该字段为非空 String）
@@ -309,7 +388,7 @@ sync.get('/', async (c) => {
                 manage: true,
             },
         };
-    });
+    }));
 
     const formattedFolders = folderResponses; // Renamed for consistency
     const formattedSends = activeSends.map((send): SendResponse => {

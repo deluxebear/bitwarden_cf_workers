@@ -1,0 +1,502 @@
+/**
+ * Bitwarden Workers - Organization domains and SSO base routes.
+ *
+ * SSO runtime is intentionally not enabled here. The route stores disabled
+ * configuration data and returns a clear error if a client attempts to enable
+ * real SSO before an SSO login runtime exists.
+ */
+
+import { Hono } from 'hono';
+import type { Context } from 'hono';
+import { drizzle } from 'drizzle-orm/d1';
+import { and, eq, sql } from 'drizzle-orm';
+import {
+    organizationDomains,
+    organizations,
+    organizationUsers,
+    ssoConfigs,
+} from '../db/schema';
+import type { OrganizationDomainRow, OrganizationRow, OrganizationUserRow, SsoConfigRow } from '../db/schema';
+import { authMiddleware } from '../middleware/auth';
+import { BadRequestError, NotFoundError } from '../middleware/error';
+import { generateSecureRandomString, generateUuid } from '../services/crypto';
+import { logEvent } from '../services/events';
+import type { Bindings, Variables } from '../types';
+import { getDeviceTypeFromRequest } from './events';
+
+const organizationDomainsRoutes = new Hono<{ Bindings: Bindings; Variables: Variables }>();
+type D1Db = ReturnType<typeof drizzle>;
+type OrgDomainContext = Context<{ Bindings: Bindings; Variables: Variables }>;
+
+interface OrganizationUserPermissions {
+    manageSso?: boolean;
+}
+
+function parsePermissions(permissions: string | null): OrganizationUserPermissions | null {
+    if (!permissions) return null;
+    try {
+        return JSON.parse(permissions) as OrganizationUserPermissions;
+    } catch {
+        return null;
+    }
+}
+
+async function getManageSsoOrgUser(db: D1Db, orgId: string, userId: string): Promise<OrganizationUserRow> {
+    const orgUser = await db.select().from(organizationUsers)
+        .where(and(eq(organizationUsers.organizationId, orgId), eq(organizationUsers.userId, userId)))
+        .get();
+
+    if (!orgUser || orgUser.status !== 2) {
+        throw new NotFoundError('Organization not found or access denied.');
+    }
+    if (orgUser.type === 0 || orgUser.type === 1) return orgUser;
+
+    const permissions = parsePermissions(orgUser.permissions);
+    if (permissions?.manageSso === true) return orgUser;
+
+    throw new NotFoundError('Organization not found or access denied.');
+}
+
+function normalizeDomainName(value: unknown): string {
+    if (typeof value !== 'string') {
+        throw new BadRequestError('DomainName is required.');
+    }
+
+    const domain = value.trim().toLowerCase();
+    if (
+        domain.length === 0 ||
+        domain.length > 255 ||
+        domain.includes('@') ||
+        domain.includes('/') ||
+        domain.includes(':') ||
+        domain.startsWith('.') ||
+        domain.endsWith('.') ||
+        !domain.includes('.')
+    ) {
+        throw new BadRequestError('Invalid domain name.');
+    }
+
+    return domain;
+}
+
+function getEmailDomain(email: string): string | null {
+    const at = email.lastIndexOf('@');
+    if (at < 0) return null;
+    const domain = email.slice(at + 1).trim().toLowerCase();
+    return domain.length > 0 ? domain : null;
+}
+
+function toOrganizationDomainResponse(domain: OrganizationDomainRow) {
+    return {
+        id: domain.id,
+        organizationId: domain.organizationId,
+        txt: domain.txt,
+        domainName: domain.domainName,
+        creationDate: domain.creationDate,
+        nextRunDate: domain.nextRunDate,
+        jobRunCount: domain.jobRunCount,
+        verifiedDate: domain.verifiedDate ?? null,
+        lastCheckedDate: domain.lastCheckedDate ?? null,
+        object: 'organizationDomain',
+    };
+}
+
+function getRequestString(body: Record<string, unknown>, ...keys: string[]): string | null {
+    for (const key of keys) {
+        const value = body[key];
+        if (typeof value === 'string' && value.trim().length > 0) {
+            return value.trim();
+        }
+    }
+    return null;
+}
+
+function getSsoBaseUrl(c: OrgDomainContext): string {
+    const envValue = (c.env as { SSO_BASE_URL?: string }).SSO_BASE_URL?.trim();
+    if (envValue) return envValue.replace(/\/$/, '');
+    const url = new URL(c.req.url);
+    return url.origin;
+}
+
+function buildSsoUrls(c: OrgDomainContext, orgId: string) {
+    const base = getSsoBaseUrl(c);
+    const samlBase = `${base}/saml2`;
+    const orgSamlBase = `${samlBase}/${orgId}`;
+    return {
+        callbackPath: `${base}/oidc-signin`,
+        signedOutCallbackPath: `${base}/oidc-signedout`,
+        spEntityId: orgSamlBase,
+        spEntityIdStatic: samlBase,
+        spMetadataUrl: orgSamlBase,
+        spAcsUrl: `${orgSamlBase}/Acs`,
+    };
+}
+
+function defaultSsoData() {
+    return {
+        configType: 0,
+        memberDecryptionType: 0,
+        keyConnectorUrl: null,
+        authority: null,
+        clientId: null,
+        clientSecret: null,
+        metadataAddress: null,
+        redirectBehavior: 0,
+        getClaimsFromUserInfoEndpoint: false,
+        additionalScopes: null,
+        additionalUserIdClaimTypes: null,
+        additionalEmailClaimTypes: null,
+        additionalNameClaimTypes: null,
+        acrValues: null,
+        expectedReturnAcrValue: null,
+        idpEntityId: null,
+        idpSingleSignOnServiceUrl: null,
+        idpSingleLogoutServiceUrl: null,
+        idpX509PublicCert: null,
+        idpBindingType: 0,
+        idpAllowUnsolicitedAuthnResponse: false,
+        idpArtifactResolutionServiceUrl: null,
+        idpDisableOutboundLogoutRequests: false,
+        idpOutboundSigningAlgorithm: null,
+        idpWantAuthnRequestsSigned: false,
+        spUniqueEntityId: false,
+        spNameIdFormat: 0,
+        spOutboundSigningAlgorithm: 'rsa-sha256',
+        spSigningBehavior: 0,
+        spWantAssertionsSigned: false,
+        spValidateCertificates: false,
+        spMinIncomingSigningAlgorithm: null,
+    };
+}
+
+function normalizeSsoData(value: unknown): Record<string, unknown> {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return defaultSsoData();
+    }
+    return {
+        ...defaultSsoData(),
+        ...(value as Record<string, unknown>),
+    };
+}
+
+function parseSsoConfigData(config: SsoConfigRow | undefined): Record<string, unknown> {
+    if (!config?.data) return defaultSsoData();
+    try {
+        return normalizeSsoData(JSON.parse(config.data));
+    } catch {
+        return defaultSsoData();
+    }
+}
+
+function toOrganizationSsoResponse(
+    c: OrgDomainContext,
+    organization: OrganizationRow,
+    config?: SsoConfigRow,
+) {
+    return {
+        enabled: config?.enabled ?? false,
+        identifier: organization.identifier ?? null,
+        data: parseSsoConfigData(config),
+        urls: buildSsoUrls(c, organization.id),
+        object: 'organizationSso',
+    };
+}
+
+async function getOrganizationOrNotFound(db: D1Db, orgId: string): Promise<OrganizationRow> {
+    const organization = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!organization) throw new NotFoundError('Organization not found.');
+    return organization;
+}
+
+/**
+ * POST /api/organizations/domain/sso/verified
+ */
+organizationDomainsRoutes.post('/domain/sso/verified', async (c) => {
+    const db = drizzle(c.env.DB);
+    const body = await c.req.json<Record<string, unknown>>();
+    const email = getRequestString(body, 'email', 'Email');
+    if (!email) throw new BadRequestError('Email is required.');
+
+    const emailDomain = getEmailDomain(email);
+    if (!emailDomain) throw new BadRequestError('Invalid email.');
+
+    const rows = await db.select({
+        domainName: organizationDomains.domainName,
+        organizationIdentifier: organizations.identifier,
+        organizationName: organizations.name,
+    })
+        .from(organizationDomains)
+        .innerJoin(organizations, eq(organizationDomains.organizationId, organizations.id))
+        .innerJoin(ssoConfigs, eq(ssoConfigs.organizationId, organizations.id))
+        .where(and(
+            eq(organizationDomains.domainName, emailDomain),
+            sql`${organizationDomains.verifiedDate} IS NOT NULL`,
+            eq(organizations.enabled, true),
+            eq(organizations.useSso, true),
+            eq(ssoConfigs.enabled, true),
+        ))
+        .all();
+
+    const data = rows
+        .filter((row) => row.organizationIdentifier)
+        .map((row) => ({
+            domainName: row.domainName,
+            organizationIdentifier: row.organizationIdentifier,
+            organizationName: row.organizationName,
+            object: 'verifiedOrganizationDomainSsoDetails',
+        }));
+
+    return c.json({
+        data,
+        object: 'list',
+        continuationToken: null,
+    });
+});
+
+organizationDomainsRoutes.use('/:id/domain/*', authMiddleware);
+organizationDomainsRoutes.use('/:id/domain', authMiddleware);
+organizationDomainsRoutes.use('/:id/sso', authMiddleware);
+
+/**
+ * GET /api/organizations/:id/domain
+ */
+organizationDomainsRoutes.get('/:id/domain', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    await getManageSsoOrgUser(db, orgId, userId);
+    await getOrganizationOrNotFound(db, orgId);
+
+    const domains = await db.select().from(organizationDomains)
+        .where(eq(organizationDomains.organizationId, orgId))
+        .all();
+
+    return c.json({
+        data: domains.map(toOrganizationDomainResponse),
+        object: 'list',
+        continuationToken: null,
+    });
+});
+
+/**
+ * GET /api/organizations/:id/domain/:domainId
+ */
+organizationDomainsRoutes.get('/:id/domain/:domainId', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const domainId = c.req.param('domainId');
+    const userId = c.get('userId');
+
+    await getManageSsoOrgUser(db, orgId, userId);
+    await getOrganizationOrNotFound(db, orgId);
+
+    const domain = await db.select().from(organizationDomains)
+        .where(and(eq(organizationDomains.id, domainId), eq(organizationDomains.organizationId, orgId)))
+        .get();
+    if (!domain) throw new NotFoundError('Organization domain not found.');
+
+    return c.json(toOrganizationDomainResponse(domain));
+});
+
+/**
+ * POST /api/organizations/:id/domain
+ */
+organizationDomainsRoutes.post('/:id/domain', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    await getManageSsoOrgUser(db, orgId, userId);
+    const organization = await getOrganizationOrNotFound(db, orgId);
+    if (!organization.useOrganizationDomains) {
+        throw new BadRequestError("Your organization's plan does not support organization domains.");
+    }
+
+    const body = await c.req.json<Record<string, unknown>>();
+    const domainName = normalizeDomainName(body.domainName ?? body.DomainName);
+
+    const existingForOrg = await db.select({ id: organizationDomains.id }).from(organizationDomains)
+        .where(and(eq(organizationDomains.organizationId, orgId), eq(organizationDomains.domainName, domainName)))
+        .get();
+    if (existingForOrg) {
+        throw new BadRequestError('Domain already exists for this organization.');
+    }
+
+    const verifiedClaim = await db.select({ id: organizationDomains.id }).from(organizationDomains)
+        .where(and(eq(organizationDomains.domainName, domainName), sql`${organizationDomains.verifiedDate} IS NOT NULL`))
+        .get();
+    if (verifiedClaim) {
+        throw new BadRequestError('Domain has already been claimed.');
+    }
+
+    const now = new Date().toISOString();
+    const nextRunDate = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
+    const domainId = generateUuid();
+    await db.insert(organizationDomains).values({
+        id: domainId,
+        organizationId: orgId,
+        txt: `bw=${generateSecureRandomString(32)}`,
+        domainName,
+        creationDate: now,
+        nextRunDate,
+        jobRunCount: 0,
+    });
+
+    const domain = await db.select().from(organizationDomains).where(eq(organizationDomains.id, domainId)).get();
+    if (!domain) throw new NotFoundError('Organization domain not found after creation.');
+
+    await logEvent(c.env.DB, 2000, {
+        organizationId: orgId,
+        actingUserId: userId,
+        deviceType: getDeviceTypeFromRequest(c),
+    });
+
+    return c.json(toOrganizationDomainResponse(domain), 201);
+});
+
+/**
+ * DELETE /api/organizations/:id/domain/:domainId
+ */
+async function removeDomainHandler(c: OrgDomainContext) {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const domainId = c.req.param('domainId');
+    const userId = c.get('userId');
+
+    await getManageSsoOrgUser(db, orgId, userId);
+    await getOrganizationOrNotFound(db, orgId);
+
+    const domain = await db.select().from(organizationDomains)
+        .where(and(eq(organizationDomains.id, domainId), eq(organizationDomains.organizationId, orgId)))
+        .get();
+    if (!domain) throw new NotFoundError('Organization domain not found.');
+
+    await db.delete(organizationDomains).where(eq(organizationDomains.id, domain.id));
+    await logEvent(c.env.DB, 2001, {
+        organizationId: orgId,
+        actingUserId: userId,
+        deviceType: getDeviceTypeFromRequest(c),
+    });
+
+    return c.body(null, 200);
+}
+
+organizationDomainsRoutes.delete('/:id/domain/:domainId', removeDomainHandler);
+organizationDomainsRoutes.post('/:id/domain/:domainId/remove', removeDomainHandler);
+
+/**
+ * POST /api/organizations/:id/domain/:domainId/verify
+ */
+organizationDomainsRoutes.post('/:id/domain/:domainId/verify', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const domainId = c.req.param('domainId');
+    const userId = c.get('userId');
+
+    await getManageSsoOrgUser(db, orgId, userId);
+    await getOrganizationOrNotFound(db, orgId);
+
+    const domain = await db.select().from(organizationDomains)
+        .where(and(eq(organizationDomains.id, domainId), eq(organizationDomains.organizationId, orgId)))
+        .get();
+    if (!domain) throw new NotFoundError('Organization domain not found.');
+
+    const now = new Date().toISOString();
+    await db.update(organizationDomains).set({
+        verifiedDate: domain.verifiedDate ?? now,
+        lastCheckedDate: now,
+        jobRunCount: Math.min((domain.jobRunCount ?? 0) + 1, 3),
+    }).where(eq(organizationDomains.id, domain.id));
+
+    const verified = await db.select().from(organizationDomains).where(eq(organizationDomains.id, domain.id)).get();
+    if (!verified) throw new NotFoundError('Organization domain not found after verification.');
+
+    await logEvent(c.env.DB, 2002, {
+        organizationId: orgId,
+        actingUserId: userId,
+        deviceType: getDeviceTypeFromRequest(c),
+    });
+
+    return c.json(toOrganizationDomainResponse(verified));
+});
+
+/**
+ * GET /api/organizations/:id/sso
+ */
+organizationDomainsRoutes.get('/:id/sso', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    await getManageSsoOrgUser(db, orgId, userId);
+    const organization = await getOrganizationOrNotFound(db, orgId);
+    const ssoConfig = await db.select().from(ssoConfigs)
+        .where(eq(ssoConfigs.organizationId, orgId))
+        .get();
+
+    return c.json(toOrganizationSsoResponse(c, organization, ssoConfig));
+});
+
+/**
+ * POST /api/organizations/:id/sso
+ */
+organizationDomainsRoutes.post('/:id/sso', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    await getManageSsoOrgUser(db, orgId, userId);
+    const organization = await getOrganizationOrNotFound(db, orgId);
+    if (!organization.useSso) {
+        throw new BadRequestError("Your organization's plan does not support SSO.");
+    }
+
+    const body = await c.req.json<Record<string, unknown>>();
+    const enabled = body.enabled === true || body.Enabled === true;
+    if (enabled) {
+        throw new BadRequestError('SSO login runtime is not implemented for this Workers deployment. Save SSO configuration with enabled=false.');
+    }
+
+    const identifier = getRequestString(body, 'identifier', 'Identifier');
+    if (identifier && identifier.length > 50) {
+        throw new BadRequestError('Identifier must be at most 50 characters.');
+    }
+
+    const data = normalizeSsoData(body.data ?? body.Data);
+    const now = new Date().toISOString();
+    const existing = await db.select().from(ssoConfigs)
+        .where(eq(ssoConfigs.organizationId, orgId))
+        .get();
+
+    if (existing) {
+        await db.update(ssoConfigs).set({
+            enabled: false,
+            data: JSON.stringify(data),
+            revisionDate: now,
+        }).where(eq(ssoConfigs.id, existing.id));
+    } else {
+        await db.insert(ssoConfigs).values({
+            id: generateUuid(),
+            organizationId: orgId,
+            enabled: false,
+            data: JSON.stringify(data),
+            creationDate: now,
+            revisionDate: now,
+        });
+    }
+
+    await db.update(organizations).set({
+        identifier: identifier ?? null,
+        revisionDate: now,
+    }).where(eq(organizations.id, orgId));
+
+    const updatedOrg = await getOrganizationOrNotFound(db, orgId);
+    const updatedConfig = await db.select().from(ssoConfigs)
+        .where(eq(ssoConfigs.organizationId, orgId))
+        .get();
+
+    return c.json(toOrganizationSsoResponse(c, updatedOrg, updatedConfig));
+});
+
+export default organizationDomainsRoutes;

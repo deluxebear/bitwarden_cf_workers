@@ -23,8 +23,10 @@ import {
 import { authMiddleware } from '../middleware/auth';
 import { BadRequestError, NotFoundError } from '../middleware/error';
 import { generateUuid } from '../services/crypto';
+import { logEvent } from '../services/events';
 import { toOrganizationResponse } from '../models/organization-responses';
 import type { Bindings, Variables } from '../types';
+import { getDeviceTypeFromRequest } from './events';
 
 type AppEnv = { Bindings: Bindings; Variables: Variables };
 
@@ -148,6 +150,7 @@ function mapLicenseToOrganizationFields(license: unknown) {
         useOrganizationDomains: boolField('UseOrganizationDomains', false),
         useAdminSponsoredFamilies: boolField('UseAdminSponsoredFamilies', false),
         useAutomaticUserConfirmation: boolField('UseAutomaticUserConfirmation', false),
+        useInviteLinks: boolField('UseInviteLinks', false),
         useDisableSmAdsForUsers: boolField('UseDisableSmAdsForUsers', false),
         usePhishingBlocker: boolField('UsePhishingBlocker', false),
         useMyItems: boolField('UseMyItems', true),
@@ -360,6 +363,7 @@ orgLicenses.post('/self-hosted', async (c) => {
         useOrganizationDomains: orgFields.useOrganizationDomains,
         useAdminSponsoredFamilies: orgFields.useAdminSponsoredFamilies,
         useAutomaticUserConfirmation: orgFields.useAutomaticUserConfirmation,
+        useInviteLinks: orgFields.useInviteLinks,
         useDisableSmAdsForUsers: orgFields.useDisableSmAdsForUsers,
         usePhishingBlocker: orgFields.usePhishingBlocker,
         useMyItems: orgFields.useMyItems,
@@ -419,6 +423,8 @@ orgLicenses.post('/self-hosted', async (c) => {
             manage: true,
         });
     }
+
+    await logEvent(c.env.DB, 1600, { userId, organizationId: orgId, deviceType: getDeviceTypeFromRequest(c) });
 
     const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
     return c.json(toOrganizationResponse(org));
@@ -492,6 +498,7 @@ orgLicenses.post('/self-hosted/:id', async (c) => {
             useOrganizationDomains: orgFields.useOrganizationDomains,
             useAdminSponsoredFamilies: orgFields.useAdminSponsoredFamilies,
             useAutomaticUserConfirmation: orgFields.useAutomaticUserConfirmation,
+            useInviteLinks: orgFields.useInviteLinks,
             useDisableSmAdsForUsers: orgFields.useDisableSmAdsForUsers,
             usePhishingBlocker: orgFields.usePhishingBlocker,
             useMyItems: orgFields.useMyItems,
@@ -575,4 +582,3 @@ orgLicenses.post('/self-hosted/:id/sync/', async (c) => {
 });
 
 export default orgLicenses;
-

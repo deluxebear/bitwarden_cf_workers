@@ -6,12 +6,13 @@
 
 import { Hono } from 'hono';
 import { drizzle } from 'drizzle-orm/d1';
-import { eq, and } from 'drizzle-orm';
-import { users, devices, authRequests } from '../db/schema';
+import { eq, and, inArray } from 'drizzle-orm';
+import { users, devices, authRequests, organizationUsers } from '../db/schema';
 import { authMiddleware } from '../middleware/auth';
 import type { Bindings, Variables, AuthRequestCreateRequest, AuthRequestUpdateRequest } from '../types';
 import { AuthRequestType } from '../types';
 import { pushAuthRequest, pushAuthRequestResponse } from '../services/push-notification';
+import { logEvent } from '../services/events';
 
 const authRequestsRoute = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
@@ -34,9 +35,11 @@ function buildAuthRequestResponse(authRequest: {
     authenticationDate?: string | null;
     responseDeviceId?: string | null;
     approved: boolean | null;
+    organizationId?: string | null;
 }) {
     return {
         id: authRequest.id,
+        organizationId: authRequest.organizationId ?? null,
         publicKey: authRequest.publicKey,
         requestDeviceIdentifier: authRequest.requestDeviceIdentifier,
         requestDeviceType: getDeviceTypeName(authRequest.requestDeviceType),
@@ -78,6 +81,19 @@ function isExpired(creationDate: string): boolean {
     const created = new Date(creationDate).getTime();
     const now = Date.now();
     return now - created > 15 * 60 * 1000; // 15 分钟
+}
+
+function isAuthRequestExpired(authRequest: { type: number; creationDate: string; responseDate: string | null; approved: boolean | null }): boolean {
+    if (authRequest.type === AuthRequestType.AdminApproval) {
+        const baseDate = authRequest.approved === true && authRequest.responseDate
+            ? authRequest.responseDate
+            : authRequest.creationDate;
+        const lifetime = authRequest.approved === true
+            ? 12 * 60 * 60 * 1000
+            : 7 * 24 * 60 * 60 * 1000;
+        return Date.now() - new Date(baseDate).getTime() > lifetime;
+    }
+    return isExpired(authRequest.creationDate);
 }
 
 // ---- 匿名端点 ----
@@ -126,6 +142,7 @@ authRequestsRoute.post('/', async (c) => {
     const newAuthRequest = {
         id,
         userId: user.id,
+        organizationId: null,
         type: body.type ?? AuthRequestType.AuthenticateAndUnlock,
         requestDeviceIdentifier: body.deviceIdentifier,
         requestDeviceType: requestDeviceType,
@@ -149,6 +166,91 @@ authRequestsRoute.post('/', async (c) => {
         authenticationDate: null,
         responseDeviceId: null,
     }));
+});
+
+/**
+ * POST /api/auth-requests/admin-request
+ * 对应 AuthRequestsController.PostAdminRequest
+ * 为当前用户所属组织创建 AdminApproval 请求。Workers 使用 auth_requests.organization_id
+ * 保存组织关联，便于组织管理员后续审批。
+ */
+authRequestsRoute.post('/admin-request', authMiddleware, async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+
+    let body: AuthRequestCreateRequest;
+    try {
+        body = await c.req.json();
+    } catch {
+        return c.json({ message: 'Invalid JSON.', object: 'error' }, 400);
+    }
+
+    if (body.type !== AuthRequestType.AdminApproval) {
+        return c.json({ message: 'Invalid AuthRequestType. Expected AdminApproval.', object: 'error' }, 400);
+    }
+    if (!body.email || !body.publicKey || !body.deviceIdentifier || !body.accessCode) {
+        return c.json({ message: 'Missing required fields.', object: 'error' }, 400);
+    }
+
+    const user = await db.select({ id: users.id, email: users.email })
+        .from(users)
+        .where(eq(users.email, body.email.toLowerCase().trim()))
+        .get();
+    if (!user || user.id !== userId) {
+        return c.json({ message: 'User or known device not found.', object: 'error' }, 400);
+    }
+
+    const memberships = await db.select({ organizationId: organizationUsers.organizationId })
+        .from(organizationUsers)
+        .where(and(
+            eq(organizationUsers.userId, userId),
+            inArray(organizationUsers.status, [1, 2]),
+        ))
+        .all();
+    if (memberships.length === 0) {
+        return c.json({ message: 'User does not belong to any organizations.', object: 'error' }, 400);
+    }
+
+    const deviceTypeHeader = c.req.header('Device-Type');
+    const requestDeviceType = deviceTypeHeader ? parseInt(deviceTypeHeader, 10) : 14;
+    const now = new Date().toISOString();
+    let firstAuthRequest: ReturnType<typeof buildAuthRequestResponse> | null = null;
+
+    for (const membership of memberships) {
+        const id = crypto.randomUUID();
+        const newAuthRequest = {
+            id,
+            userId,
+            organizationId: membership.organizationId,
+            type: AuthRequestType.AdminApproval,
+            requestDeviceIdentifier: body.deviceIdentifier,
+            requestDeviceType,
+            requestIpAddress: c.req.header('CF-Connecting-IP') || c.req.header('X-Forwarded-For') || '',
+            accessCode: body.accessCode,
+            publicKey: body.publicKey,
+            creationDate: now,
+        };
+
+        await db.insert(authRequests).values(newAuthRequest).execute();
+        const response = buildAuthRequestResponse({
+            ...newAuthRequest,
+            key: null,
+            masterPasswordHash: null,
+            approved: null,
+            responseDate: null,
+            authenticationDate: null,
+            responseDeviceId: null,
+        });
+        firstAuthRequest ??= response;
+    }
+
+    await logEvent(c.env.DB, 1010, {
+        userId,
+        deviceType: requestDeviceType,
+        ipAddress: c.req.header('CF-Connecting-IP') || c.req.header('x-forwarded-for') || undefined,
+    });
+
+    return c.json(firstAuthRequest);
 });
 
 /**
@@ -176,7 +278,7 @@ authRequestsRoute.get('/:id/response', async (c) => {
 
     // 官方 IsAuthRequestValid 对 AuthenticateAndUnlock 类型只检查 CreationDate 是否过期，
     // 不检查 responseDate（批准后浏览器还需要轮询拿到 key 才能完成登录）。
-    if (isExpired(authRequest.creationDate)) {
+    if (isAuthRequestExpired(authRequest)) {
         return c.json({ message: 'Auth request not found.', object: 'error' }, 404);
     }
 

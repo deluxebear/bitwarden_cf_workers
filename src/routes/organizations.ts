@@ -4,6 +4,7 @@
  */
 
 import { Hono } from 'hono';
+import type { Context } from 'hono';
 import { drizzle } from 'drizzle-orm/d1';
 import { eq, and, desc, inArray, sql } from 'drizzle-orm';
 import {
@@ -18,17 +19,18 @@ import {
     collectionGroups,
     collectionCiphers,
     policies,
+    organizationInviteLinks,
 } from '../db/schema';
-import type { OrganizationUserRow, OrganizationRow, UserRow, PolicyRow } from '../db/schema';
+import type { OrganizationUserRow, OrganizationRow, UserRow, PolicyRow, OrganizationInviteLinkRow } from '../db/schema';
 import { authMiddleware } from '../middleware/auth';
 import { logEvent } from '../services/events';
 import { toEventResponse, getDateRange, getDeviceTypeFromRequest } from './events';
 import { BadRequestError, NotFoundError } from '../middleware/error';
-import { generateUuid, createInviteToken, verifyInviteToken, verifyPassword } from '../services/crypto';
+import { generateUuid, generateSecureRandomString, createInviteToken, verifyInviteToken, verifyPassword } from '../services/crypto';
 import { toOrganizationResponse, toOrganizationSubscriptionResponse, toOrganizationUserResponse } from '../models/organization-responses';
 import type { Bindings, Variables } from '../types';
 import { batchedInArrayQuery, D1_BATCH_SIZE } from '../services/db';
-import { pushSyncUser, pushSyncOrganizationStatus } from '../services/push-notification';
+import { pushLogOut, pushSyncUser, pushSyncOrganizationStatus } from '../services/push-notification';
 import { PushType } from '../types/push-notification';
 import {
     PolicyType,
@@ -42,6 +44,7 @@ orgs.use('/*', authMiddleware);
 
 type HubEnv = { NOTIFICATION_HUB: DurableObjectNamespace };
 type D1DbType = ReturnType<typeof drizzle>;
+type OrgContext = Context<{ Bindings: Bindings; Variables: Variables }>;
 
 /** 向组织所有已确认成员推送 SyncVault 通知 */
 async function pushSyncVaultToOrgMembers(env: HubEnv, db: D1DbType, orgId: string): Promise<void> {
@@ -62,6 +65,8 @@ async function pushSyncVaultToOrgMembers(env: HubEnv, db: D1DbType, orgId: strin
 interface OrganizationUserPermissions {
     manageGroups?: boolean;
     manageUsers?: boolean;
+    manageResetPassword?: boolean;
+    manageSso?: boolean;
     createNewCollections?: boolean;
     editAnyCollection?: boolean;
     deleteAnyCollection?: boolean;
@@ -69,6 +74,19 @@ interface OrganizationUserPermissions {
     /** 对应官方 AccessImportExport，用于组织导入/导出及向已有集合导入条目 */
     accessImportExport?: boolean;
 }
+
+type CollectionAccessEntry = {
+    id: string;
+    readOnly?: boolean;
+    hidePasswords?: boolean;
+    manage?: boolean;
+};
+
+type GroupMutationPayload = {
+    name: string;
+    collections?: CollectionAccessEntry[];
+    users?: string[];
+};
 
 /** Drizzle D1 实例（用于 getOrgUser 等，避免 any） */
 type D1Db = ReturnType<typeof drizzle>;
@@ -150,6 +168,27 @@ function requireOwnerOrAdmin(orgUser: OrganizationUserRow): void {
     }
 }
 
+function requireManageGroups(orgUser: OrganizationUserRow): void {
+    if (orgUser.type === 0 || orgUser.type === 1) return;
+    const perms = parseOrgUserPermissions(orgUser.permissions);
+    if (perms?.manageGroups === true) return;
+    throw new BadRequestError('Requires Owner, Admin, or Manage Groups permission.');
+}
+
+function requireManageUsers(orgUser: OrganizationUserRow): void {
+    if (orgUser.type === 0 || orgUser.type === 1 || orgUser.type === 3) return;
+    const perms = parseOrgUserPermissions(orgUser.permissions);
+    if (perms?.manageUsers === true) return;
+    throw new BadRequestError('Requires Owner, Admin, Manager, or Manage Users permission.');
+}
+
+function requireManageAccountRecovery(orgUser: OrganizationUserRow): void {
+    if (orgUser.type === 0 || orgUser.type === 1) return;
+    const perms = parseOrgUserPermissions(orgUser.permissions);
+    if (perms?.manageResetPassword === true) return;
+    throw new BadRequestError('Requires Account Recovery management permission.');
+}
+
 /**
  * 验证是否为 Owner
  */
@@ -213,6 +252,261 @@ function canAccessEventLogs(org: OrganizationRow | null | undefined, orgUser: Or
     return !!(perms?.accessEventLogs);
 }
 
+function validateCollectionAccessEntries(entries: CollectionAccessEntry[]): void {
+    const invalidAssoc = entries.find((x) => x.manage && (x.readOnly || x.hidePasswords));
+    if (invalidAssoc) {
+        throw new BadRequestError(
+            'The Manage property is mutually exclusive and cannot be true while the ReadOnly or HidePasswords properties are also true.'
+        );
+    }
+}
+
+function uniqueAccessEntries(entries: CollectionAccessEntry[]): CollectionAccessEntry[] {
+    return Array.from(new Map(entries.map((entry) => [entry.id, entry])).values());
+}
+
+function toBulkResponseList(results: Array<{ id: string; error?: string | null }>) {
+    return {
+        data: results.map((r) => ({
+            id: r.id,
+            error: r.error || null,
+            object: 'OrganizationBulkConfirmResponseModel',
+        })),
+        object: 'list',
+        continuationToken: null,
+    };
+}
+
+function toResetPasswordDetailsResponse(orgUser: OrganizationUserRow, user: UserRow, org: OrganizationRow) {
+    return {
+        organizationUserId: orgUser.id,
+        kdf: user.kdf,
+        kdfIterations: user.kdfIterations,
+        kdfMemory: user.kdfMemory ?? null,
+        kdfParallelism: user.kdfParallelism ?? null,
+        masterPasswordSalt: user.email.toLowerCase().trim(),
+        resetPasswordKey: orgUser.resetPasswordKey ?? null,
+        encryptedPrivateKey: org.privateKey ?? null,
+        object: 'organizationUserResetPasswordDetails',
+    };
+}
+
+async function isPolicyEnabled(db: D1Db, orgId: string, policyType: number): Promise<boolean> {
+    try {
+        const policy = await db.select().from(policies)
+            .where(and(eq(policies.organizationId, orgId), eq(policies.type, policyType)))
+            .get();
+        return policy?.enabled === true;
+    } catch (e) {
+        if (isNoSuchTable(e)) return false;
+        const msg = e instanceof Error ? e.message : String(e);
+        if (/no such table:\s*policies/i.test(msg)) return false;
+        throw e;
+    }
+}
+
+async function assertAccountRecoveryEnabled(db: D1Db, orgId: string): Promise<OrganizationRow> {
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+    if (!org.useResetPassword) {
+        throw new BadRequestError('This organization does not allow account recovery.');
+    }
+    if (!await isPolicyEnabled(db, orgId, PolicyType.ResetPassword)) {
+        throw new BadRequestError('Account recovery policy is not enabled.');
+    }
+    return org;
+}
+
+async function buildInviteLinkForOrgUser(c: OrgContext, db: D1Db, orgId: string, orgUser: OrganizationUserRow): Promise<string> {
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    const orgName = org?.name || 'Organization';
+    const vaultBase = ((c.env as { VAULT_BASE_URL?: string }).VAULT_BASE_URL || 'https://vault.example.com').replace(/#\/?$/, '').replace(/\/$/, '');
+    const forceRegister = (c.env as { FORCE_INVITE_REGISTER?: string }).FORCE_INVITE_REGISTER === 'true';
+    const existingUser = await db.select().from(users).where(eq(users.email, orgUser.email)).get();
+    const token = await createInviteToken(orgUser.id, orgUser.email, orgId, c.env.JWT_SECRET);
+    const params = new URLSearchParams({
+        organizationId: orgId,
+        organizationUserId: orgUser.id,
+        email: orgUser.email,
+        organizationName: orgName,
+        token,
+        initOrganization: 'false',
+        orgUserHasExistingUser: forceRegister ? 'false' : (existingUser ? 'true' : 'false'),
+    });
+    return `${vaultBase}#/accept-organization?${params.toString()}`;
+}
+
+function sanitizeInviteDomains(domains: unknown): string[] {
+    if (!Array.isArray(domains)) return [];
+    const normalized = domains
+        .filter((domain): domain is string => typeof domain === 'string')
+        .map((domain) => domain.trim().toLowerCase())
+        .filter((domain) => domain.length > 0 && !domain.includes('@'));
+    return Array.from(new Set(normalized));
+}
+
+function getVaultBaseUrl(env: Bindings): string | null {
+    const raw = (env as { VAULT_BASE_URL?: string }).VAULT_BASE_URL?.trim();
+    if (!raw) return null;
+    return raw.replace(/#\/?$/, '').replace(/\/$/, '');
+}
+
+function buildOrganizationInviteLinkUrl(c: OrgContext, link: OrganizationInviteLinkRow): string | null {
+    const vaultBase = getVaultBaseUrl(c.env);
+    if (!vaultBase) {
+        console.warn('[invite-link] VAULT_BASE_URL is not configured; returning code without URL.');
+        return null;
+    }
+
+    const params = new URLSearchParams({ code: link.code });
+    return `${vaultBase}#/accept-organization-invite?${params.toString()}`;
+}
+
+function toOrganizationInviteLinkResponse(c: OrgContext, link: OrganizationInviteLinkRow) {
+    let allowedDomains: string[] = [];
+    try {
+        allowedDomains = JSON.parse(link.allowedDomains) as string[];
+    } catch {
+        allowedDomains = [];
+    }
+
+    return {
+        id: link.id,
+        code: link.code,
+        organizationId: link.organizationId,
+        allowedDomains,
+        invite: link.invite,
+        supportsConfirmation: link.supportsConfirmation,
+        creationDate: link.creationDate,
+        revisionDate: link.revisionDate,
+        url: buildOrganizationInviteLinkUrl(c, link),
+        object: 'organizationInviteLink',
+    };
+}
+
+function assertInviteLinksAvailable(org: OrganizationRow): void {
+    if (!org.enabled) {
+        throw new NotFoundError('Organization not found.');
+    }
+    if (!org.useInviteLinks) {
+        throw new BadRequestError("Your organization's plan does not support invite links.");
+    }
+}
+
+async function assertCollectionAccessTargets(
+    db: D1Db,
+    orgId: string,
+    usersList: CollectionAccessEntry[],
+    groupsList: CollectionAccessEntry[],
+    useGroups: boolean,
+): Promise<void> {
+    const userIds = Array.from(new Set(usersList.map((u) => u.id)));
+    if (userIds.length > 0) {
+        const orgUsersList = await db.select({ id: organizationUsers.id }).from(organizationUsers)
+            .where(and(eq(organizationUsers.organizationId, orgId), inArray(organizationUsers.id, userIds)))
+            .all();
+        if (orgUsersList.length !== userIds.length) {
+            throw new BadRequestError('One or more users do not belong to this organization.');
+        }
+    }
+
+    const groupIds = Array.from(new Set(groupsList.map((g) => g.id)));
+    if (groupIds.length > 0) {
+        if (!useGroups) {
+            throw new BadRequestError('This organization cannot use groups.');
+        }
+        const orgGroups = await db.select({ id: groups.id }).from(groups)
+            .where(and(eq(groups.organizationId, orgId), inArray(groups.id, groupIds)))
+            .all();
+        if (orgGroups.length !== groupIds.length) {
+            throw new BadRequestError('One or more groups do not belong to this organization.');
+        }
+    }
+}
+
+async function replaceCollectionAccess(
+    db: D1Db,
+    collectionId: string,
+    usersList: CollectionAccessEntry[],
+    groupsList: CollectionAccessEntry[],
+): Promise<void> {
+    await db.delete(collectionUsers).where(eq(collectionUsers.collectionId, collectionId));
+    await db.delete(collectionGroups).where(eq(collectionGroups.collectionId, collectionId));
+
+    if (usersList.length > 0) {
+        await db.insert(collectionUsers).values(
+            usersList.map((u) => ({
+                collectionId,
+                organizationUserId: u.id,
+                readOnly: u.readOnly ?? false,
+                hidePasswords: u.hidePasswords ?? false,
+                manage: u.manage ?? false,
+            }))
+        );
+    }
+    if (groupsList.length > 0) {
+        await db.insert(collectionGroups).values(
+            groupsList.map((g) => ({
+                collectionId,
+                groupId: g.id,
+                readOnly: g.readOnly ?? false,
+                hidePasswords: g.hidePasswords ?? false,
+                manage: g.manage ?? false,
+            }))
+        );
+    }
+}
+
+async function addOrUpdateCollectionAccessForMany(
+    db: D1Db,
+    collectionIds: string[],
+    usersList: CollectionAccessEntry[],
+    groupsList: CollectionAccessEntry[],
+): Promise<void> {
+    const userIds = Array.from(new Set(usersList.map((u) => u.id)));
+    const groupIds = Array.from(new Set(groupsList.map((g) => g.id)));
+
+    for (const collectionId of collectionIds) {
+        for (const organizationUserId of userIds) {
+            await db.delete(collectionUsers).where(and(
+                eq(collectionUsers.collectionId, collectionId),
+                eq(collectionUsers.organizationUserId, organizationUserId),
+            ));
+        }
+        for (const groupId of groupIds) {
+            await db.delete(collectionGroups).where(and(
+                eq(collectionGroups.collectionId, collectionId),
+                eq(collectionGroups.groupId, groupId),
+            ));
+        }
+    }
+
+    for (const collectionId of collectionIds) {
+        if (usersList.length > 0) {
+            await db.insert(collectionUsers).values(
+                usersList.map((u) => ({
+                    collectionId,
+                    organizationUserId: u.id,
+                    readOnly: u.readOnly ?? false,
+                    hidePasswords: u.hidePasswords ?? false,
+                    manage: u.manage ?? false,
+                }))
+            );
+        }
+        if (groupsList.length > 0) {
+            await db.insert(collectionGroups).values(
+                groupsList.map((g) => ({
+                    collectionId,
+                    groupId: g.id,
+                    readOnly: g.readOnly ?? false,
+                    hidePasswords: g.hidePasswords ?? false,
+                    manage: g.manage ?? false,
+                }))
+            );
+        }
+    }
+}
+
 /**
  * 构建新组织的默认字段值
  */
@@ -243,6 +537,7 @@ function buildOrgDefaults(planType: number) {
         useOrganizationDomains: isEnterprise,
         useAdminSponsoredFamilies: isEnterprise,
         useAutomaticUserConfirmation: false,
+        useInviteLinks: false,
         useDisableSmAdsForUsers: false,
         usePhishingBlocker: false,
         useMyItems: true,
@@ -263,6 +558,232 @@ function buildOrgDefaults(planType: number) {
 orgs.get('/connections/enabled', async (c) => {
     const enabled = (c.env as { ENABLE_CLOUD_COMMUNICATION?: string }).ENABLE_CLOUD_COMMUNICATION === 'true';
     return c.json(enabled);
+});
+
+// ==================== Organization Invite Links ====================
+// 对应官方 OrganizationInviteLinksController 管理端接口
+
+/**
+ * GET /api/organizations/:id/invite-link
+ */
+orgs.get('/:id/invite-link', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    const orgUser = await getOrgUser(db, orgId, userId);
+    requireManageUsers(orgUser);
+
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+    assertInviteLinksAvailable(org);
+
+    const inviteLink = await db.select().from(organizationInviteLinks)
+        .where(eq(organizationInviteLinks.organizationId, orgId))
+        .get();
+    if (!inviteLink) throw new NotFoundError('Invite link not found.');
+
+    return c.json(toOrganizationInviteLinkResponse(c, inviteLink));
+});
+
+/**
+ * POST /api/organizations/:id/invite-link
+ */
+orgs.post('/:id/invite-link', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    const orgUser = await getOrgUser(db, orgId, userId);
+    requireManageUsers(orgUser);
+
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+    assertInviteLinksAvailable(org);
+
+    const existing = await db.select({ id: organizationInviteLinks.id }).from(organizationInviteLinks)
+        .where(eq(organizationInviteLinks.organizationId, orgId))
+        .get();
+    if (existing) {
+        throw new BadRequestError('Invite link already exists.');
+    }
+
+    const body = await c.req.json<{
+        allowedDomains?: unknown;
+        AllowedDomains?: unknown;
+        invite?: string;
+        Invite?: string;
+        supportsConfirmation?: boolean;
+        SupportsConfirmation?: boolean;
+    }>();
+    const allowedDomains = sanitizeInviteDomains(body.allowedDomains ?? body.AllowedDomains);
+    if (allowedDomains.length === 0) {
+        throw new BadRequestError('At least one allowed domain is required.');
+    }
+    const inviteValue = body.invite ?? body.Invite;
+    const invite = typeof inviteValue === 'string' && inviteValue.trim().length > 0 ? inviteValue : null;
+    if (!invite) {
+        throw new BadRequestError('Invite is required.');
+    }
+
+    const now = new Date().toISOString();
+    const inviteLinkId = generateUuid();
+    await db.insert(organizationInviteLinks).values({
+        id: inviteLinkId,
+        code: generateUuid(),
+        organizationId: orgId,
+        allowedDomains: JSON.stringify(allowedDomains),
+        invite,
+        supportsConfirmation: body.supportsConfirmation ?? body.SupportsConfirmation ?? false,
+        creationDate: now,
+        revisionDate: now,
+    });
+
+    const inviteLink = await db.select().from(organizationInviteLinks).where(eq(organizationInviteLinks.id, inviteLinkId)).get();
+    if (!inviteLink) throw new NotFoundError('Invite link not found after creation.');
+
+    await logEvent(c.env.DB, 1624, {
+        organizationId: orgId,
+        actingUserId: userId,
+        deviceType: getDeviceTypeFromRequest(c),
+    });
+
+    return c.json(toOrganizationInviteLinkResponse(c, inviteLink), 201);
+});
+
+/**
+ * PUT /api/organizations/:id/invite-link
+ */
+orgs.put('/:id/invite-link', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    const orgUser = await getOrgUser(db, orgId, userId);
+    requireManageUsers(orgUser);
+
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+    assertInviteLinksAvailable(org);
+
+    const inviteLink = await db.select().from(organizationInviteLinks)
+        .where(eq(organizationInviteLinks.organizationId, orgId))
+        .get();
+    if (!inviteLink) throw new NotFoundError('Invite link not found.');
+
+    const body = await c.req.json<{ allowedDomains?: unknown; AllowedDomains?: unknown }>();
+    const allowedDomains = sanitizeInviteDomains(body.allowedDomains ?? body.AllowedDomains);
+    if (allowedDomains.length === 0) {
+        throw new BadRequestError('At least one allowed domain is required.');
+    }
+
+    const now = new Date().toISOString();
+    await db.update(organizationInviteLinks).set({
+        allowedDomains: JSON.stringify(allowedDomains),
+        revisionDate: now,
+    }).where(eq(organizationInviteLinks.id, inviteLink.id));
+
+    const updated = await db.select().from(organizationInviteLinks).where(eq(organizationInviteLinks.id, inviteLink.id)).get();
+    if (!updated) throw new NotFoundError('Invite link not found after update.');
+
+    await logEvent(c.env.DB, 1625, {
+        organizationId: orgId,
+        actingUserId: userId,
+        deviceType: getDeviceTypeFromRequest(c),
+    });
+
+    return c.json(toOrganizationInviteLinkResponse(c, updated));
+});
+
+async function deleteInviteLinkHandler(c: OrgContext) {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    const orgUser = await getOrgUser(db, orgId, userId);
+    requireManageUsers(orgUser);
+
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+    assertInviteLinksAvailable(org);
+
+    const inviteLink = await db.select().from(organizationInviteLinks)
+        .where(eq(organizationInviteLinks.organizationId, orgId))
+        .get();
+    if (!inviteLink) throw new NotFoundError('Invite link not found.');
+
+    await db.delete(organizationInviteLinks).where(eq(organizationInviteLinks.id, inviteLink.id));
+    await logEvent(c.env.DB, 1626, {
+        organizationId: orgId,
+        actingUserId: userId,
+        deviceType: getDeviceTypeFromRequest(c),
+    });
+
+    return c.body(null, 200);
+}
+
+/**
+ * DELETE /api/organizations/:id/invite-link
+ */
+orgs.delete('/:id/invite-link', deleteInviteLinkHandler);
+
+/**
+ * POST /api/organizations/:id/invite-link/refresh
+ */
+orgs.post('/:id/invite-link/refresh', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    const orgUser = await getOrgUser(db, orgId, userId);
+    requireManageUsers(orgUser);
+
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+    assertInviteLinksAvailable(org);
+
+    const inviteLink = await db.select().from(organizationInviteLinks)
+        .where(eq(organizationInviteLinks.organizationId, orgId))
+        .get();
+    if (!inviteLink) throw new NotFoundError('Invite link not found.');
+
+    const body = await c.req.json<{
+        invite?: string;
+        Invite?: string;
+        supportsConfirmation?: boolean;
+        SupportsConfirmation?: boolean;
+    }>();
+    const inviteValue = body.invite ?? body.Invite;
+    const invite = typeof inviteValue === 'string' && inviteValue.trim().length > 0 ? inviteValue : null;
+    if (!invite) {
+        throw new BadRequestError('Invite is required.');
+    }
+
+    const now = new Date().toISOString();
+    const refreshedId = generateUuid();
+
+    await db.delete(organizationInviteLinks).where(eq(organizationInviteLinks.id, inviteLink.id));
+    await db.insert(organizationInviteLinks).values({
+        id: refreshedId,
+        code: generateUuid(),
+        organizationId: orgId,
+        allowedDomains: inviteLink.allowedDomains,
+        invite,
+        supportsConfirmation: body.supportsConfirmation ?? body.SupportsConfirmation ?? false,
+        creationDate: now,
+        revisionDate: now,
+    });
+
+    const refreshed = await db.select().from(organizationInviteLinks).where(eq(organizationInviteLinks.id, refreshedId)).get();
+    if (!refreshed) throw new NotFoundError('Invite link not found after refresh.');
+
+    await logEvent(c.env.DB, 1628, {
+        organizationId: orgId,
+        actingUserId: userId,
+        deviceType: getDeviceTypeFromRequest(c),
+    });
+
+    return c.json(toOrganizationInviteLinkResponse(c, refreshed));
 });
 
 // ==================== 组织 CRUD ====================
@@ -1102,6 +1623,496 @@ orgs.get('/:id/users/mini-details', async (c) => {
 });
 
 /**
+ * POST /api/organizations/:id/users/reinvite
+ * 批量重新发送邀请。Workers 当前未接邮件服务，生成邀请链接并写入日志。
+ */
+orgs.post('/:id/users/reinvite', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+    const body = await c.req.json<{ ids?: string[] }>();
+    const ids = Array.from(new Set(body.ids ?? []));
+    if (ids.length === 0) throw new BadRequestError('Ids are required.');
+
+    const inviter = await getOrgUser(db, orgId, userId);
+    requireManageUsers(inviter);
+
+    const results: Array<{ id: string; error?: string | null }> = [];
+    for (const orgUserId of ids) {
+        const target = await db.select().from(organizationUsers)
+            .where(and(eq(organizationUsers.id, orgUserId), eq(organizationUsers.organizationId, orgId)))
+            .get();
+        if (!target) {
+            results.push({ id: orgUserId, error: 'Organization user not found.' });
+            continue;
+        }
+        if (target.status !== 0) {
+            results.push({ id: orgUserId, error: 'User is not in an invited state.' });
+            continue;
+        }
+
+        const link = await buildInviteLinkForOrgUser(c, db, orgId, target);
+        console.log(`[REINVITE] ${target.email} -> ${link}`);
+        results.push({ id: orgUserId, error: null });
+    }
+
+    return c.json(toBulkResponseList(results));
+});
+
+/**
+ * GET /api/organizations/:id/users/pending-auto-confirm
+ * 返回已接受邀请、待管理员提交组织 key 的成员。
+ */
+orgs.get('/:id/users/pending-auto-confirm', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    const orgUser = await getOrgUser(db, orgId, userId);
+    requireManageUsers(orgUser);
+
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+    if (!org.useAutomaticUserConfirmation || !await isPolicyEnabled(db, orgId, PolicyType.AutomaticUserConfirmation)) {
+        return c.json({ data: [], object: 'list', continuationToken: null });
+    }
+
+    const pending = await db.select().from(organizationUsers)
+        .where(and(
+            eq(organizationUsers.organizationId, orgId),
+            eq(organizationUsers.status, 1),
+            sql`${organizationUsers.userId} IS NOT NULL`,
+            sql`${organizationUsers.key} IS NULL`,
+        ))
+        .all();
+
+    return c.json({
+        data: pending.map((u) => ({
+            id: u.id,
+            userId: u.userId,
+            object: 'OrganizationUserPendingAutoConfirmResponseModel',
+        })),
+        object: 'list',
+        continuationToken: null,
+    });
+});
+
+/**
+ * GET /api/organizations/:id/users/:orgUserId/reset-password-details
+ */
+orgs.get('/:id/users/:orgUserId/reset-password-details', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const orgUserId = c.req.param('orgUserId');
+    const userId = c.get('userId');
+
+    const manager = await getOrgUser(db, orgId, userId);
+    requireManageAccountRecovery(manager);
+    const org = await assertAccountRecoveryEnabled(db, orgId);
+
+    const targetOrgUser = await db.select().from(organizationUsers)
+        .where(and(eq(organizationUsers.id, orgUserId), eq(organizationUsers.organizationId, orgId)))
+        .get();
+    if (!targetOrgUser?.userId) throw new NotFoundError('Organization user not found.');
+    if (!targetOrgUser.resetPasswordKey) throw new BadRequestError('User is not enrolled in account recovery.');
+
+    const targetUser = await db.select().from(users).where(eq(users.id, targetOrgUser.userId)).get();
+    if (!targetUser) throw new NotFoundError('User not found.');
+
+    return c.json(toResetPasswordDetailsResponse(targetOrgUser, targetUser, org));
+});
+
+/**
+ * POST /api/organizations/:id/users/account-recovery-details
+ */
+orgs.post('/:id/users/account-recovery-details', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+    const body = await c.req.json<{ ids?: string[] }>();
+    const ids = Array.from(new Set(body.ids ?? []));
+    if (ids.length === 0) throw new BadRequestError('Ids are required.');
+
+    const manager = await getOrgUser(db, orgId, userId);
+    requireManageAccountRecovery(manager);
+    const org = await assertAccountRecoveryEnabled(db, orgId);
+
+    const orgUsersList = await db.select().from(organizationUsers)
+        .where(and(eq(organizationUsers.organizationId, orgId), inArray(organizationUsers.id, ids)))
+        .all();
+    const userIds = orgUsersList
+        .filter((u): u is OrganizationUserRow & { userId: string } => !!u.userId && !!u.resetPasswordKey)
+        .map((u) => u.userId);
+    const userRecords = userIds.length > 0 ? await batchedInArrayQuery<UserRow>(db, users, users.id, userIds) : [];
+    const usersById = new Map(userRecords.map((u) => [u.id, u]));
+
+    return c.json({
+        data: orgUsersList
+            .filter((ou) => !!ou.userId && !!ou.resetPasswordKey && usersById.has(ou.userId))
+            .map((ou) => toResetPasswordDetailsResponse(ou, usersById.get(ou.userId!)!, org)),
+        object: 'list',
+        continuationToken: null,
+    });
+});
+
+/**
+ * PUT /api/organizations/:id/users/:orgUserId/recover-account
+ * 支持旧版 NewMasterPasswordHash + Key，以及 salt 仍为 email 的新版 UnlockData/AuthenticationData。
+ */
+orgs.put('/:id/users/:orgUserId/recover-account', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const orgUserId = c.req.param('orgUserId');
+    const userId = c.get('userId');
+    const body = await c.req.json<{
+        resetMasterPassword?: boolean;
+        resetTwoFactor?: boolean;
+        newMasterPasswordHash?: string;
+        key?: string;
+        authenticationData?: {
+            masterPasswordAuthenticationHash?: string;
+            masterKeyAuthenticationHash?: string;
+            salt?: string;
+            kdf?: { kdfType?: number; iterations?: number; memory?: number | null; parallelism?: number | null };
+        };
+        unlockData?: {
+            masterKeyWrappedUserKey?: string;
+            masterKeyEncryptedUserKey?: string;
+            salt?: string;
+            kdf?: { kdfType?: number; iterations?: number; memory?: number | null; parallelism?: number | null };
+        };
+    }>();
+
+    const manager = await getOrgUser(db, orgId, userId);
+    requireManageAccountRecovery(manager);
+    await assertAccountRecoveryEnabled(db, orgId);
+
+    if (!body.resetMasterPassword && !body.resetTwoFactor) {
+        throw new BadRequestError('At least one recovery action is required.');
+    }
+
+    const targetOrgUser = await db.select().from(organizationUsers)
+        .where(and(eq(organizationUsers.id, orgUserId), eq(organizationUsers.organizationId, orgId)))
+        .get();
+    if (!targetOrgUser?.userId) throw new NotFoundError('Organization user not found.');
+    if (![1, 2, -1].includes(targetOrgUser.status) || !targetOrgUser.resetPasswordKey) {
+        throw new BadRequestError('User is not eligible for account recovery.');
+    }
+
+    const targetUser = await db.select().from(users).where(eq(users.id, targetOrgUser.userId)).get();
+    if (!targetUser) throw new NotFoundError('User not found.');
+    if (targetUser.usesKeyConnector && body.resetMasterPassword) {
+        throw new BadRequestError('Key Connector users cannot be recovered by resetting master password.');
+    }
+
+    const now = new Date().toISOString();
+    const userUpdate: Partial<UserRow> = {
+        accountRevisionDate: now,
+        revisionDate: now,
+    };
+
+    if (body.resetMasterPassword) {
+        const authData = body.authenticationData;
+        const unlockData = body.unlockData;
+        if (authData || unlockData) {
+            const masterPasswordHash = authData?.masterPasswordAuthenticationHash ?? authData?.masterKeyAuthenticationHash;
+            const wrappedUserKey = unlockData?.masterKeyWrappedUserKey ?? unlockData?.masterKeyEncryptedUserKey;
+            if (!authData || !unlockData || !masterPasswordHash || !wrappedUserKey || !authData.kdf || !unlockData.kdf) {
+                throw new BadRequestError('AuthenticationData and UnlockData are required to reset master password.');
+            }
+            const authSalt = authData.salt?.toLowerCase().trim();
+            const unlockSalt = unlockData.salt?.toLowerCase().trim();
+            const currentSalt = targetUser.email.toLowerCase().trim();
+            if (authSalt !== currentSalt || unlockSalt !== currentSalt) {
+                throw new BadRequestError('Custom master password salt is not supported by this Workers schema yet.');
+            }
+            if (
+                authData.kdf.kdfType !== unlockData.kdf.kdfType ||
+                authData.kdf.iterations !== unlockData.kdf.iterations ||
+                authData.kdf.memory !== unlockData.kdf.memory ||
+                authData.kdf.parallelism !== unlockData.kdf.parallelism
+            ) {
+                throw new BadRequestError('AuthenticationData and UnlockData KDF settings must match.');
+            }
+            userUpdate.masterPassword = masterPasswordHash;
+            userUpdate.key = wrappedUserKey;
+            userUpdate.kdf = authData.kdf.kdfType ?? targetUser.kdf;
+            userUpdate.kdfIterations = authData.kdf.iterations ?? targetUser.kdfIterations;
+            userUpdate.kdfMemory = authData.kdf.memory ?? null;
+            userUpdate.kdfParallelism = authData.kdf.parallelism ?? null;
+        } else if (!body.newMasterPasswordHash || !body.key) {
+            throw new BadRequestError('NewMasterPasswordHash and Key are required to reset master password.');
+        } else {
+            userUpdate.masterPassword = body.newMasterPasswordHash;
+            userUpdate.key = body.key;
+        }
+        userUpdate.forcePasswordReset = true;
+        userUpdate.lastPasswordChangeDate = now;
+        userUpdate.securityStamp = generateSecureRandomString(50);
+    }
+
+    if (body.resetTwoFactor) {
+        userUpdate.twoFactorProviders = null;
+        userUpdate.twoFactorRecoveryCode = null;
+    }
+
+    await db.update(users).set(userUpdate).where(eq(users.id, targetUser.id));
+
+    if (body.resetMasterPassword) {
+        await logEvent(c.env.DB, 1508, {
+            userId: targetUser.id,
+            actingUserId: userId,
+            organizationId: orgId,
+            organizationUserId: orgUserId,
+            deviceType: getDeviceTypeFromRequest(c),
+        });
+    }
+    if (body.resetTwoFactor) {
+        await logEvent(c.env.DB, 1519, {
+            userId: targetUser.id,
+            actingUserId: userId,
+            organizationId: orgId,
+            organizationUserId: orgUserId,
+            deviceType: getDeviceTypeFromRequest(c),
+        });
+    }
+
+    c.executionCtx.waitUntil(pushLogOut(c.env, targetUser.id, null));
+
+    return c.body(null, 200);
+});
+
+/**
+ * PUT /api/organizations/:id/users/revoke-self
+ */
+orgs.put('/:id/users/revoke-self', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    const orgUser = await getOrgUser(db, orgId, userId);
+    if (orgUser.type === 0) {
+        const owners = await db.select({ id: organizationUsers.id }).from(organizationUsers)
+            .where(and(eq(organizationUsers.organizationId, orgId), eq(organizationUsers.type, 0), eq(organizationUsers.status, 2)))
+            .all();
+        if (owners.length <= 1) {
+            throw new BadRequestError('Organization must have at least one confirmed owner.');
+        }
+    }
+
+    if (orgUser.status !== -1) {
+        const now = new Date().toISOString();
+        await db.update(organizationUsers).set({ status: -1, revisionDate: now }).where(eq(organizationUsers.id, orgUser.id));
+        await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+        await logEvent(c.env.DB, 1518, {
+            userId,
+            organizationId: orgId,
+            organizationUserId: orgUser.id,
+            deviceType: getDeviceTypeFromRequest(c),
+        });
+        c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncOrganizations, userId, null));
+    }
+
+    return c.body(null, 200);
+});
+
+/**
+ * PUT/PATCH /api/organizations/:id/users/enable-secrets-manager
+ */
+async function enableSecretsManagerHandler(c: OrgContext) {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+    const body = await c.req.json<{ ids?: string[] }>();
+    const ids = Array.from(new Set(body.ids ?? []));
+    if (ids.length === 0) throw new BadRequestError('Ids are required.');
+
+    const manager = await getOrgUser(db, orgId, userId);
+    requireManageUsers(manager);
+
+    const targets = await db.select().from(organizationUsers)
+        .where(and(eq(organizationUsers.organizationId, orgId), inArray(organizationUsers.id, ids)))
+        .all();
+    const toEnable = targets.filter((u) => !u.accessSecretsManager);
+    if (toEnable.length === 0) {
+        throw new BadRequestError('Users invalid.');
+    }
+
+    const now = new Date().toISOString();
+    for (const target of toEnable) {
+        await db.update(organizationUsers).set({
+            accessSecretsManager: true,
+            revisionDate: now,
+        }).where(eq(organizationUsers.id, target.id));
+        if (target.userId) {
+            await bumpAccountRevisionDateByOrganizationUserId(db, target.id, now);
+            c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncOrganizations, target.userId, null));
+        }
+    }
+
+    return c.body(null, 200);
+}
+
+orgs.put('/:id/users/enable-secrets-manager', enableSecretsManagerHandler);
+orgs.patch('/:id/users/enable-secrets-manager', enableSecretsManagerHandler);
+
+/**
+ * POST /api/organizations/:id/users/:orgUserId/auto-confirm
+ */
+orgs.post('/:id/users/:orgUserId/auto-confirm', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const orgUserId = c.req.param('orgUserId');
+    const userId = c.get('userId');
+    const body = await c.req.json<{ key?: string }>();
+    if (!body.key) throw new BadRequestError('Key is required.');
+
+    const manager = await getOrgUser(db, orgId, userId);
+    requireManageUsers(manager);
+
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+    if (!org.useAutomaticUserConfirmation || !await isPolicyEnabled(db, orgId, PolicyType.AutomaticUserConfirmation)) {
+        throw new BadRequestError('Cannot confirm this member because the Automatically Confirm Users policy is not enabled.');
+    }
+
+    const target = await db.select().from(organizationUsers)
+        .where(and(eq(organizationUsers.id, orgUserId), eq(organizationUsers.organizationId, orgId)))
+        .get();
+    if (!target?.userId) throw new NotFoundError('Organization user not found.');
+    if (target.status !== 1) throw new BadRequestError('User is not in an accepted state.');
+
+    const now = new Date().toISOString();
+    await db.update(organizationUsers).set({
+        key: body.key,
+        status: 2,
+        revisionDate: now,
+    }).where(eq(organizationUsers.id, orgUserId));
+
+    await logEvent(c.env.DB, 1517, {
+        userId: target.userId,
+        actingUserId: userId,
+        organizationId: orgId,
+        organizationUserId: orgUserId,
+        deviceType: getDeviceTypeFromRequest(c),
+    });
+    await bumpAccountRevisionDateByOrganizationUserId(db, orgUserId, now);
+    c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncOrgKeys, target.userId, null));
+
+    return c.body(null, 200);
+});
+
+/**
+ * POST /api/organizations/:id/users/bulk-auto-confirm
+ */
+orgs.post('/:id/users/bulk-auto-confirm', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+    const body = await c.req.json<{ keys?: Array<{ id: string; key: string }> | Record<string, string> }>();
+
+    const entries = Array.isArray(body.keys)
+        ? body.keys
+        : Object.entries(body.keys ?? {}).map(([id, key]) => ({ id, key }));
+    if (entries.length === 0) throw new BadRequestError('Keys are required.');
+
+    const manager = await getOrgUser(db, orgId, userId);
+    requireManageUsers(manager);
+
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+    if (!org.useAutomaticUserConfirmation || !await isPolicyEnabled(db, orgId, PolicyType.AutomaticUserConfirmation)) {
+        throw new BadRequestError('Cannot confirm members because the Automatically Confirm Users policy is not enabled.');
+    }
+
+    const now = new Date().toISOString();
+    const results: Array<{ id: string; error?: string | null }> = [];
+
+    for (const entry of entries) {
+        const target = await db.select().from(organizationUsers)
+            .where(and(eq(organizationUsers.id, entry.id), eq(organizationUsers.organizationId, orgId)))
+            .get();
+        if (!target?.userId) {
+            results.push({ id: entry.id, error: 'Organization user not found.' });
+            continue;
+        }
+        if (target.status !== 1) {
+            results.push({ id: entry.id, error: 'User is not in an accepted state.' });
+            continue;
+        }
+        if (!entry.key) {
+            results.push({ id: entry.id, error: 'Key is required.' });
+            continue;
+        }
+
+        await db.update(organizationUsers).set({
+            key: entry.key,
+            status: 2,
+            revisionDate: now,
+        }).where(eq(organizationUsers.id, entry.id));
+        await logEvent(c.env.DB, 1517, {
+            userId: target.userId,
+            actingUserId: userId,
+            organizationId: orgId,
+            organizationUserId: entry.id,
+            deviceType: getDeviceTypeFromRequest(c),
+        });
+        await bumpAccountRevisionDateByOrganizationUserId(db, entry.id, now);
+        c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncOrgKeys, target.userId, null));
+        results.push({ id: entry.id, error: null });
+    }
+
+    return c.json(toBulkResponseList(results));
+});
+
+/**
+ * DELETE/POST /api/organizations/:id/users/delete-account
+ * 当前 Workers 不支持 claimed-account 删除事务，明确返回每个目标的受限错误。
+ */
+async function bulkDeleteAccountHandler(c: OrgContext) {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+    const body = await c.req.json<{ ids?: string[] }>();
+    const ids = Array.from(new Set(body.ids ?? []));
+    if (ids.length === 0) throw new BadRequestError('Ids are required.');
+
+    const manager = await getOrgUser(db, orgId, userId);
+    requireManageUsers(manager);
+
+    return c.json(toBulkResponseList(ids.map((id) => ({
+        id,
+        error: 'Claimed organization account deletion is not supported by this Workers schema. Use remove/revoke for membership changes.',
+    }))));
+}
+
+orgs.delete('/:id/users/delete-account', bulkDeleteAccountHandler);
+orgs.post('/:id/users/delete-account', bulkDeleteAccountHandler);
+
+/**
+ * DELETE/POST /api/organizations/:id/users/:orgUserId/delete-account
+ */
+async function deleteAccountHandler(c: OrgContext) {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const orgUserId = c.req.param('orgUserId');
+    const userId = c.get('userId');
+
+    const manager = await getOrgUser(db, orgId, userId);
+    requireManageUsers(manager);
+
+    const target = await db.select({ id: organizationUsers.id }).from(organizationUsers)
+        .where(and(eq(organizationUsers.id, orgUserId), eq(organizationUsers.organizationId, orgId)))
+        .get();
+    if (!target) throw new NotFoundError('Organization user not found.');
+
+    throw new BadRequestError('Claimed organization account deletion is not supported by this Workers schema. Use remove/revoke for membership changes.');
+}
+
+orgs.delete('/:id/users/:orgUserId/delete-account', deleteAccountHandler);
+orgs.post('/:id/users/:orgUserId/delete-account', deleteAccountHandler);
+
+/**
  * GET /api/organizations/:id/users/:orgUserId
  * 获取组织成员详情
  */
@@ -1780,7 +2791,7 @@ orgs.post('/:id/users/:orgUserId/reinvite', async (c) => {
     const userId = c.get('userId');
 
     const inviter = await getOrgUser(db, orgId, userId);
-    requireOwnerOrAdmin(inviter);
+    requireManageUsers(inviter);
 
     const targetOrgUser = await db.select().from(organizationUsers)
         .where(and(eq(organizationUsers.id, orgUserId), eq(organizationUsers.organizationId, orgId))).get();
@@ -1790,22 +2801,7 @@ orgs.post('/:id/users/:orgUserId/reinvite', async (c) => {
         throw new BadRequestError('User is not in an invited state.');
     }
 
-    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
-    const orgName = org?.name || 'Organization';
-    const vaultBase = ((c.env as { VAULT_BASE_URL?: string }).VAULT_BASE_URL || 'https://vault.example.com').replace(/#\/?$/, '').replace(/\/$/, '');
-    const forceRegister = (c.env as { FORCE_INVITE_REGISTER?: string }).FORCE_INVITE_REGISTER === 'true';
-    const existingUser = await db.select().from(users).where(eq(users.email, targetOrgUser.email)).get();
-    const token = await createInviteToken(orgUserId, targetOrgUser.email, orgId, c.env.JWT_SECRET);
-    const params = new URLSearchParams({
-        organizationId: orgId,
-        organizationUserId: orgUserId,
-        email: targetOrgUser.email,
-        organizationName: orgName,
-        token,
-        initOrganization: 'false',
-        orgUserHasExistingUser: forceRegister ? 'false' : (existingUser ? 'true' : 'false'),
-    });
-    const link = `${vaultBase}#/accept-organization?${params.toString()}`;
+    const link = await buildInviteLinkForOrgUser(c, db, orgId, targetOrgUser);
     console.log(`[REINVITE] ${targetOrgUser.email} -> ${link}`);
     return c.json({ email: targetOrgUser.email, link }, 200);
 });
@@ -2006,16 +3002,16 @@ orgs.post('/:id/collections', async (c) => {
 interface CollectionUpdateBody {
     name: string;
     externalId?: string;
-    groups?: Array<{ id: string; readOnly?: boolean; hidePasswords?: boolean; manage?: boolean }>;
-    users?: Array<{ id: string; readOnly?: boolean; hidePasswords?: boolean; manage?: boolean }>;
+    groups?: CollectionAccessEntry[];
+    users?: CollectionAccessEntry[];
 }
 
 /**
- * PUT /api/organizations/:id/collections/:collectionId
+ * PUT/POST /api/organizations/:id/collections/:collectionId
  * 更新集合名称、externalId，并整体替换群组/成员访问权限（与官方 UpdateCollectionCommand 一致）
  * 需 editAnyCollection 或 (Owner/Admin 且 allowAdminAccessToAllCollectionItems)
  */
-orgs.put('/:id/collections/:collectionId', async (c) => {
+async function updateCollectionHandler(c: OrgContext) {
     const db = drizzle(c.env.DB);
     const orgId = c.req.param('id');
     const collectionId = c.req.param('collectionId');
@@ -2037,17 +3033,11 @@ orgs.put('/:id/collections/:collectionId', async (c) => {
         .where(and(eq(collections.id, collectionId), eq(collections.organizationId, orgId))).get();
     if (!col) throw new NotFoundError('Collection not found.');
 
-    const groupsList = body.groups ?? [];
-    const usersList = body.users ?? [];
+    const groupsList = uniqueAccessEntries(body.groups ?? []);
+    const usersList = uniqueAccessEntries(body.users ?? []);
 
-    const invalidAssoc = [...groupsList, ...usersList].find(
-        (x) => x.manage && (x.readOnly || x.hidePasswords)
-    );
-    if (invalidAssoc) {
-        throw new BadRequestError(
-            'The Manage property is mutually exclusive and cannot be true while the ReadOnly or HidePasswords properties are also true.'
-        );
-    }
+    validateCollectionAccessEntries([...groupsList, ...usersList]);
+    await assertCollectionAccessTargets(db, orgId, usersList, groupsList, org.useGroups === true);
 
     const groupHasManage = groupsList.some((g) => g.manage);
     const userHasManage = usersList.some((u) => u.manage);
@@ -2063,31 +3053,7 @@ orgs.put('/:id/collections/:collectionId', async (c) => {
         revisionDate: now,
     }).where(eq(collections.id, collectionId));
 
-    await db.delete(collectionUsers).where(eq(collectionUsers.collectionId, collectionId));
-    await db.delete(collectionGroups).where(eq(collectionGroups.collectionId, collectionId));
-
-    if (usersList.length > 0) {
-        await db.insert(collectionUsers).values(
-            usersList.map((u) => ({
-                collectionId,
-                organizationUserId: u.id,
-                readOnly: u.readOnly ?? false,
-                hidePasswords: u.hidePasswords ?? false,
-                manage: u.manage ?? false,
-            }))
-        );
-    }
-    if (org.useGroups && groupsList.length > 0) {
-        await db.insert(collectionGroups).values(
-            groupsList.map((g) => ({
-                collectionId,
-                groupId: g.id,
-                readOnly: g.readOnly ?? false,
-                hidePasswords: g.hidePasswords ?? false,
-                manage: g.manage ?? false,
-            }))
-        );
-    }
+    await replaceCollectionAccess(db, collectionId, usersList, groupsList);
 
     const cuList = await db.select().from(collectionUsers).where(eq(collectionUsers.collectionId, collectionId)).all();
     const cgList = await db.select().from(collectionGroups).where(eq(collectionGroups.collectionId, collectionId)).all();
@@ -2116,13 +3082,16 @@ orgs.put('/:id/collections/:collectionId', async (c) => {
             manage: cu.manage ?? false,
         })),
     });
-});
+}
+
+orgs.put('/:id/collections/:collectionId', updateCollectionHandler);
+orgs.post('/:id/collections/:collectionId', updateCollectionHandler);
 
 /**
- * DELETE /api/organizations/:id/collections/:collectionId
+ * DELETE/POST /api/organizations/:id/collections/:collectionId[/delete]
  * 需 deleteAnyCollection 或 (Owner/Admin 且 allowAdminAccessToAllCollectionItems)
  */
-orgs.delete('/:id/collections/:collectionId', async (c) => {
+async function deleteCollectionHandler(c: OrgContext) {
     const db = drizzle(c.env.DB);
     const orgId = c.req.param('id');
     const collectionId = c.req.param('collectionId');
@@ -2147,6 +3116,89 @@ orgs.delete('/:id/collections/:collectionId', async (c) => {
     // 删除单个集合，按组织维度刷新 AccountRevisionDate
     await bumpAccountRevisionDateByOrganizationId(db, orgId);
 
+    c.executionCtx.waitUntil(pushSyncVaultToOrgMembers(c.env, db, orgId));
+
+    return c.json({});
+}
+
+orgs.delete('/:id/collections/:collectionId', deleteCollectionHandler);
+orgs.post('/:id/collections/:collectionId/delete', deleteCollectionHandler);
+
+/**
+ * GET /api/organizations/:id/collections/:collectionId/users
+ * 返回集合直接授权的组织成员访问权限（SelectionReadOnlyResponseModel[]）
+ */
+orgs.get('/:id/collections/:collectionId/users', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const collectionId = c.req.param('collectionId');
+    const userId = c.get('userId');
+
+    const orgUser = await getOrgUser(db, orgId, userId);
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+    if (!canEditCollection(orgUser, org)) {
+        throw new NotFoundError('Collection not found.');
+    }
+
+    const col = await db.select().from(collections)
+        .where(and(eq(collections.id, collectionId), eq(collections.organizationId, orgId))).get();
+    if (!col) throw new NotFoundError('Collection not found.');
+
+    const cuList = await db.select().from(collectionUsers).where(eq(collectionUsers.collectionId, collectionId)).all();
+    return c.json(cuList.map((cu) => ({
+        id: cu.organizationUserId,
+        readOnly: cu.readOnly ?? false,
+        hidePasswords: cu.hidePasswords ?? false,
+        manage: cu.manage ?? false,
+    })));
+});
+
+/**
+ * POST /api/organizations/:id/collections/bulk-access
+ * 对多个集合追加或更新相同的 users/groups 访问关系。
+ */
+orgs.post('/:id/collections/bulk-access', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    const body = await c.req.json<{
+        collectionIds?: string[];
+        users?: CollectionAccessEntry[];
+        groups?: CollectionAccessEntry[];
+    }>();
+    const collectionIds = Array.from(new Set(body.collectionIds ?? []));
+    if (collectionIds.length === 0) {
+        throw new BadRequestError('No collections were provided.');
+    }
+
+    const orgUser = await getOrgUser(db, orgId, userId);
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+    if (!canEditCollection(orgUser, org)) {
+        throw new NotFoundError('One or more collections not found.');
+    }
+
+    const orgCollections = await db.select({ id: collections.id }).from(collections)
+        .where(and(eq(collections.organizationId, orgId), inArray(collections.id, collectionIds)))
+        .all();
+    if (orgCollections.length !== collectionIds.length) {
+        throw new NotFoundError('One or more collections not found.');
+    }
+
+    const usersList = uniqueAccessEntries(body.users ?? []);
+    const groupsList = uniqueAccessEntries(body.groups ?? []);
+    validateCollectionAccessEntries([...usersList, ...groupsList]);
+    await assertCollectionAccessTargets(db, orgId, usersList, groupsList, org.useGroups === true);
+
+    await addOrUpdateCollectionAccessForMany(db, collectionIds, usersList, groupsList);
+
+    const now = new Date().toISOString();
+    for (const collectionId of collectionIds) {
+        await db.update(collections).set({ revisionDate: now }).where(eq(collections.id, collectionId));
+    }
+    await bumpAccountRevisionDateByOrganizationId(db, orgId, now);
     c.executionCtx.waitUntil(pushSyncVaultToOrgMembers(c.env, db, orgId));
 
     return c.json({});
@@ -2341,7 +3393,7 @@ orgs.post('/:id/groups', async (c) => {
     const userId = c.get('userId');
 
     const orgUser = await getOrgUser(db, orgId, userId);
-    requireOwnerOrAdmin(orgUser);
+    requireManageGroups(orgUser);
 
     const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
     if (!org) throw new NotFoundError('Organization not found.');
@@ -2349,20 +3401,13 @@ orgs.post('/:id/groups', async (c) => {
         throw new BadRequestError('This organization cannot use groups.');
     }
 
-    const body = await c.req.json<{
-        name: string;
-        collections?: Array<{ id: string; readOnly?: boolean; hidePasswords?: boolean; manage?: boolean }>;
-        users?: string[];
-    }>();
+    const body = await c.req.json<GroupMutationPayload>();
     if (!body?.name || typeof body.name !== 'string' || body.name.length > 100) {
         throw new BadRequestError('Name is required and must be at most 100 characters.');
     }
 
-    const collectionsList = body.collections ?? [];
-    const invalidAssoc = collectionsList.find(c => c.manage && (c.readOnly || c.hidePasswords));
-    if (invalidAssoc) {
-        throw new BadRequestError('The Manage property is mutually exclusive with ReadOnly or HidePasswords.');
-    }
+    const collectionsList = uniqueAccessEntries(body.collections ?? []);
+    validateCollectionAccessEntries(collectionsList);
 
     const groupId = generateUuid();
     const now = new Date().toISOString();
@@ -2381,6 +3426,9 @@ orgs.post('/:id/groups', async (c) => {
         const orgCollections = await db.select().from(collections)
             .where(and(eq(collections.organizationId, orgId), inArray(collections.id, collectionIds)))
             .all();
+        if (orgCollections.length !== collectionIds.length) {
+            throw new BadRequestError('One or more collections do not belong to this organization.');
+        }
         const orgCollectionIds = new Set(orgCollections.map(c => c.id));
         for (const col of collectionsList) {
             if (!orgCollectionIds.has(col.id)) continue;
@@ -2394,11 +3442,14 @@ orgs.post('/:id/groups', async (c) => {
         }
     }
 
-    const userIds = body.users ?? [];
+    const userIds = Array.from(new Set(body.users ?? []));
     if (userIds.length > 0) {
         const orgUserIds = await db.select().from(organizationUsers)
             .where(and(eq(organizationUsers.organizationId, orgId), inArray(organizationUsers.id, userIds)))
             .all();
+        if (orgUserIds.length !== userIds.length) {
+            throw new BadRequestError('One or more users do not belong to this organization.');
+        }
         for (const ou of orgUserIds) {
             await db.insert(groupUsers).values({ groupId, organizationUserId: ou.id });
         }
@@ -2426,17 +3477,17 @@ orgs.post('/:id/groups', async (c) => {
 });
 
 /**
- * PUT /api/organizations/:id/groups/:groupId
+ * PUT/POST /api/organizations/:id/groups/:groupId
  * 更新群组（对应官方 GroupsController.Put）
  */
-orgs.put('/:id/groups/:groupId', async (c) => {
+async function updateGroupHandler(c: OrgContext) {
     const db = drizzle(c.env.DB);
     const orgId = c.req.param('id');
     const groupId = c.req.param('groupId');
     const userId = c.get('userId');
 
     const orgUser = await getOrgUser(db, orgId, userId);
-    requireOwnerOrAdmin(orgUser);
+    requireManageGroups(orgUser);
 
     const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
     if (!org) throw new NotFoundError('Organization not found.');
@@ -2449,20 +3500,13 @@ orgs.put('/:id/groups/:groupId', async (c) => {
         .get();
     if (!group) throw new NotFoundError('Group not found.');
 
-    const body = await c.req.json<{
-        name: string;
-        collections?: Array<{ id: string; readOnly?: boolean; hidePasswords?: boolean; manage?: boolean }>;
-        users?: string[];
-    }>();
+    const body = await c.req.json<GroupMutationPayload>();
     if (!body?.name || typeof body.name !== 'string' || body.name.length > 100) {
         throw new BadRequestError('Name is required and must be at most 100 characters.');
     }
 
-    const collectionsList = body.collections ?? [];
-    const invalidAssoc = collectionsList.find(c => c.manage && (c.readOnly || c.hidePasswords));
-    if (invalidAssoc) {
-        throw new BadRequestError('The Manage property is mutually exclusive with ReadOnly or HidePasswords.');
-    }
+    const collectionsList = uniqueAccessEntries(body.collections ?? []);
+    validateCollectionAccessEntries(collectionsList);
 
     const now = new Date().toISOString();
     await db.update(groups).set({
@@ -2476,6 +3520,9 @@ orgs.put('/:id/groups/:groupId', async (c) => {
         const orgCollections = await db.select().from(collections)
             .where(and(eq(collections.organizationId, orgId), inArray(collections.id, collectionIds)))
             .all();
+        if (orgCollections.length !== collectionIds.length) {
+            throw new BadRequestError('One or more collections do not belong to this organization.');
+        }
         const orgCollectionIds = new Set(orgCollections.map(c => c.id));
         for (const col of collectionsList) {
             if (!orgCollectionIds.has(col.id)) continue;
@@ -2490,11 +3537,14 @@ orgs.put('/:id/groups/:groupId', async (c) => {
     }
 
     await db.delete(groupUsers).where(eq(groupUsers.groupId, groupId));
-    const userIds = body.users ?? [];
+    const userIds = Array.from(new Set(body.users ?? []));
     if (userIds.length > 0) {
         const orgUserList = await db.select().from(organizationUsers)
             .where(and(eq(organizationUsers.organizationId, orgId), inArray(organizationUsers.id, userIds)))
             .all();
+        if (orgUserList.length !== userIds.length) {
+            throw new BadRequestError('One or more users do not belong to this organization.');
+        }
         for (const ou of orgUserList) {
             await db.insert(groupUsers).values({ groupId, organizationUserId: ou.id });
         }
@@ -2519,7 +3569,10 @@ orgs.put('/:id/groups/:groupId', async (c) => {
         externalId: group.externalId ?? null,
         object: 'group',
     }, 200);
-});
+}
+
+orgs.put('/:id/groups/:groupId', updateGroupHandler);
+orgs.post('/:id/groups/:groupId', updateGroupHandler);
 
 /**
  * GET /api/organizations/:id/groups/:groupId/details
@@ -2532,7 +3585,7 @@ orgs.get('/:id/groups/:groupId/details', async (c) => {
     const userId = c.get('userId');
 
     const orgUser = await getOrgUser(db, orgId, userId);
-    requireOwnerOrAdmin(orgUser);
+    requireManageGroups(orgUser);
 
     let group: { id: string; organizationId: string; name: string; externalId: string | null };
     try {
@@ -2573,7 +3626,7 @@ orgs.get('/:id/groups/:groupId/users', async (c) => {
     const userId = c.get('userId');
 
     const orgUser = await getOrgUser(db, orgId, userId);
-    requireOwnerOrAdmin(orgUser);
+    requireManageGroups(orgUser);
 
     try {
         const group = await db.select().from(groups)
@@ -2590,17 +3643,17 @@ orgs.get('/:id/groups/:groupId/users', async (c) => {
 });
 
 /**
- * DELETE /api/organizations/:id/groups/:groupId
+ * DELETE/POST /api/organizations/:id/groups/:groupId[/delete]
  * 删除群组（对应官方 GroupsController.Delete）
  */
-orgs.delete('/:id/groups/:groupId', async (c) => {
+async function deleteGroupHandler(c: OrgContext) {
     const db = drizzle(c.env.DB);
     const orgId = c.req.param('id');
     const groupId = c.req.param('groupId');
     const userId = c.get('userId');
 
     const orgUser = await getOrgUser(db, orgId, userId);
-    requireOwnerOrAdmin(orgUser);
+    requireManageGroups(orgUser);
 
     const group = await db.select().from(groups)
         .where(and(eq(groups.id, groupId), eq(groups.organizationId, orgId)))
@@ -2624,7 +3677,97 @@ orgs.delete('/:id/groups/:groupId', async (c) => {
     c.executionCtx.waitUntil(pushSyncVaultToOrgMembers(c.env, db, orgId));
 
     return c.json({}, 200);
-});
+}
+
+orgs.delete('/:id/groups/:groupId', deleteGroupHandler);
+orgs.post('/:id/groups/:groupId/delete', deleteGroupHandler);
+
+/**
+ * DELETE/POST /api/organizations/:id/groups[/delete]
+ * 批量删除群组。
+ */
+async function deleteGroupsHandler(c: OrgContext) {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+    const body = await c.req.json<{ ids?: string[] }>();
+    const groupIds = Array.from(new Set(body.ids ?? []));
+    if (groupIds.length === 0) {
+        throw new BadRequestError('No group ids provided.');
+    }
+
+    const orgUser = await getOrgUser(db, orgId, userId);
+    requireManageGroups(orgUser);
+
+    const orgGroups = await db.select({ id: groups.id }).from(groups)
+        .where(and(eq(groups.organizationId, orgId), inArray(groups.id, groupIds)))
+        .all();
+    if (orgGroups.length !== groupIds.length) {
+        throw new NotFoundError('One or more groups not found.');
+    }
+
+    for (const groupId of groupIds) {
+        await db.delete(groupUsers).where(eq(groupUsers.groupId, groupId));
+        await db.delete(collectionGroups).where(eq(collectionGroups.groupId, groupId));
+        await db.delete(groups).where(eq(groups.id, groupId));
+        await logEvent(c.env.DB, 1402, {
+            organizationId: orgId,
+            actingUserId: userId,
+            groupId,
+            deviceType: getDeviceTypeFromRequest(c),
+        });
+    }
+
+    await bumpAccountRevisionDateByOrganizationId(db, orgId);
+    c.executionCtx.waitUntil(pushSyncVaultToOrgMembers(c.env, db, orgId));
+
+    return c.json({}, 200);
+}
+
+orgs.delete('/:id/groups', deleteGroupsHandler);
+orgs.post('/:id/groups/delete', deleteGroupsHandler);
+
+/**
+ * DELETE/POST /api/organizations/:id/groups/:groupId/user/:orgUserId
+ * 从群组移除组织成员。
+ */
+async function deleteGroupUserHandler(c: OrgContext) {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const groupId = c.req.param('groupId');
+    const orgUserId = c.req.param('orgUserId');
+    const userId = c.get('userId');
+
+    const orgUser = await getOrgUser(db, orgId, userId);
+    requireManageGroups(orgUser);
+
+    const group = await db.select().from(groups)
+        .where(and(eq(groups.id, groupId), eq(groups.organizationId, orgId)))
+        .get();
+    if (!group) throw new NotFoundError('Group not found.');
+
+    const targetOrgUser = await db.select().from(organizationUsers)
+        .where(and(eq(organizationUsers.id, orgUserId), eq(organizationUsers.organizationId, orgId)))
+        .get();
+    if (!targetOrgUser) throw new NotFoundError('Organization user not found.');
+
+    await db.delete(groupUsers).where(and(
+        eq(groupUsers.groupId, groupId),
+        eq(groupUsers.organizationUserId, orgUserId),
+    ));
+    const now = new Date().toISOString();
+    await db.update(groups).set({ revisionDate: now }).where(eq(groups.id, groupId));
+    await bumpAccountRevisionDateByOrganizationUserId(db, orgUserId, now);
+
+    if (targetOrgUser.userId) {
+        c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncVault, targetOrgUser.userId, null));
+    }
+
+    return c.json({}, 200);
+}
+
+orgs.delete('/:id/groups/:groupId/user/:orgUserId', deleteGroupUserHandler);
+orgs.post('/:id/groups/:groupId/delete-user/:orgUserId', deleteGroupUserHandler);
 
 /**
  * GET /api/organizations/:id/collections
@@ -2870,6 +4013,68 @@ orgs.get('/:id/billing/vnext/self-host/metadata', async (c) => {
         isOnSecretsManagerStandalone: false,
         organizationOccupiedSeats: occupied.length,
     });
+});
+
+orgs.get('/:id/billing/vnext/warnings', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    await getOrgUser(db, orgId, userId);
+
+    return c.json({
+        freeTrial: null,
+        inactiveSubscription: null,
+        resellerRenewal: null,
+        scheduledPriceIncrease: null,
+        taxId: null,
+        object: 'organizationWarnings',
+    });
+});
+
+orgs.get('/:id/billing/vnext/address', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    await getOrgUser(db, orgId, userId);
+
+    return c.json(null);
+});
+
+orgs.get('/:id/billing/vnext/payment-method', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    await getOrgUser(db, orgId, userId);
+
+    return c.json(null);
+});
+
+orgs.put('/:id/billing/vnext/payment-method', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    await getOrgUser(db, orgId, userId);
+
+    return c.json({
+        type: 'card',
+        brand: 'visa',
+        last4: '4242',
+        expiration: '12/2099',
+    });
+});
+
+orgs.get('/:id/billing/vnext/credit', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+
+    await getOrgUser(db, orgId, userId);
+
+    return c.json(null);
 });
 
 // ==================== Policies（组织策略） ====================

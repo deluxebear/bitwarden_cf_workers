@@ -7,11 +7,14 @@
 import { Hono } from 'hono';
 import { drizzle } from 'drizzle-orm/d1';
 import { eq, and } from 'drizzle-orm';
-import { users, organizations, organizationUsers, ciphers, folders, sends, devices, webAuthnCredentials } from '../db/schema';
+import { users, organizations, organizationUsers, ciphers, folders, sends, devices, webAuthnCredentials, refreshTokens } from '../db/schema';
 import { authMiddleware } from '../middleware/auth';
 import { BadRequestError, NotFoundError } from '../middleware/error';
 import { generateSecureRandomString, verifyPassword } from '../services/crypto';
 import { isSignupAllowed } from '../services/signup-guard';
+import { normalizeRegistrationRequest } from '../services/registration';
+import { buildDevTokenResponse, consumeVerificationToken, sendEmailChangeToken, sendPasswordHint } from '../services/email';
+import { touchUser } from '../services/revisions';
 import type { Bindings, Variables, ProfileResponse, AccountKeysResponse } from '../types';
 import { pushLogOut, pushSyncUser } from '../services/push-notification';
 import { PushType } from '../types/push-notification';
@@ -24,13 +27,14 @@ const accounts = new Hono<{ Bindings: Bindings; Variables: Variables }>();
  */
 accounts.post('/register', async (c) => {
     const body = await c.req.json<any>();
+    const registration = normalizeRegistrationRequest(body);
 
-    if (!body.email || !body.masterPasswordHash) {
+    if (!registration.email || !registration.masterPasswordHash) {
         throw new BadRequestError('Email and master password hash are required.');
     }
 
     const db = drizzle(c.env.DB);
-    const email = body.email.toLowerCase().trim();
+    const email = registration.email.toLowerCase().trim();
 
     if (!await isSignupAllowed(c.env, db, email)) {
         throw new BadRequestError('Registration is disabled. Please contact the administrator for an invitation.');
@@ -46,20 +50,20 @@ accounts.post('/register', async (c) => {
 
     await db.insert(users).values({
         id: userId,
-        name: body.name || null,
+        name: registration.name || null,
         email,
         emailVerified: false,
-        masterPassword: body.masterPasswordHash,
-        masterPasswordHint: body.masterPasswordHint || null,
+        masterPassword: registration.masterPasswordHash,
+        masterPasswordHint: registration.masterPasswordHint || null,
         culture: 'en-US',
         securityStamp: generateSecureRandomString(50),
-        key: body.key,
-        publicKey: body.keys?.publicKey || null,
-        privateKey: body.keys?.encryptedPrivateKey || null,
-        kdf: body.kdf ?? 0,
-        kdfIterations: body.kdfIterations ?? 600000,
-        kdfMemory: body.kdfMemory ?? null,
-        kdfParallelism: body.kdfParallelism ?? null,
+        key: registration.key,
+        publicKey: registration.publicKey,
+        privateKey: registration.privateKey,
+        kdf: registration.kdf,
+        kdfIterations: registration.kdfIterations,
+        kdfMemory: registration.kdfMemory,
+        kdfParallelism: registration.kdfParallelism,
         apiKey: generateSecureRandomString(30),
         accountRevisionDate: now,
         creationDate: now,
@@ -69,8 +73,47 @@ accounts.post('/register', async (c) => {
     return c.json(null, 200);
 });
 
+/**
+ * POST /api/accounts/password-hint
+ * 对应 AccountsController.PostPasswordHint。匿名端点，不泄漏账号是否存在。
+ */
+accounts.post('/password-hint', async (c) => {
+    const body = await c.req.json<{ email?: string }>().catch(() => ({} as { email?: string }));
+    if (!body.email) return c.json(null, 200);
+
+    const db = drizzle(c.env.DB);
+    const email = body.email.toLowerCase().trim();
+    const user = await db.select({
+        email: users.email,
+        masterPasswordHint: users.masterPasswordHint,
+    }).from(users).where(eq(users.email, email)).get();
+
+    if (user) {
+        try {
+            await sendPasswordHint(c.env, user.email, user.masterPasswordHint);
+        } catch (error) {
+            console.log(JSON.stringify({
+                event: 'email.password_hint.skipped',
+                reason: error instanceof Error ? error.message : 'unknown',
+            }));
+        }
+    }
+
+    return c.json(null, 200);
+});
+
 // 其他端点都需要认证
 accounts.use('/*', authMiddleware);
+
+/**
+ * GET /api/accounts/sso/user-identifier
+ * 返回 SSO link 流程使用的 user identifier。完整 SSO link token 校验链路尚未实现，
+ * 这里返回安全随机 token，避免使用可预测占位值。
+ */
+accounts.get('/sso/user-identifier', async (c) => {
+    const userId = c.get('userId');
+    return c.text(`${userId},${generateSecureRandomString(64)}`);
+});
 
 /**
  * 构建 ProfileResponse - 对应 ProfileResponseModel.cs
@@ -212,20 +255,25 @@ accounts.get('/profile', async (c) => {
 accounts.put('/profile', async (c) => {
     const db = drizzle(c.env.DB);
     const userId = c.get('userId');
-    const body = await c.req.json<{ name?: string; masterPasswordHint?: string }>();
+    const body = await c.req.json<{
+        name?: string | null;
+        masterPasswordHint?: string | null;
+        culture?: string | null;
+        avatarColor?: string | null;
+    }>();
 
     const user = await db.select().from(users).where(eq(users.id, userId)).get();
     if (!user) {
         throw new NotFoundError('User not found.');
     }
 
-    const now = new Date().toISOString();
     await db.update(users).set({
         name: body.name !== undefined ? body.name : user.name,
         masterPasswordHint: body.masterPasswordHint !== undefined ? body.masterPasswordHint : user.masterPasswordHint,
-        revisionDate: now,
-        accountRevisionDate: now,
+        culture: body.culture !== undefined && body.culture !== null ? body.culture : user.culture,
+        avatarColor: body.avatarColor !== undefined ? body.avatarColor : user.avatarColor,
     }).where(eq(users.id, userId));
+    await touchUser(db, userId);
 
     const updated = await db.select().from(users).where(eq(users.id, userId)).get();
 
@@ -241,18 +289,23 @@ accounts.put('/profile', async (c) => {
 accounts.post('/profile', async (c) => {
     const db = drizzle(c.env.DB);
     const userId = c.get('userId');
-    const body = await c.req.json<{ name?: string; masterPasswordHint?: string }>();
+    const body = await c.req.json<{
+        name?: string | null;
+        masterPasswordHint?: string | null;
+        culture?: string | null;
+        avatarColor?: string | null;
+    }>();
 
     const user = await db.select().from(users).where(eq(users.id, userId)).get();
     if (!user) throw new NotFoundError('User not found.');
 
-    const now = new Date().toISOString();
     await db.update(users).set({
         name: body.name !== undefined ? body.name : user.name,
         masterPasswordHint: body.masterPasswordHint !== undefined ? body.masterPasswordHint : user.masterPasswordHint,
-        revisionDate: now,
-        accountRevisionDate: now,
+        culture: body.culture !== undefined && body.culture !== null ? body.culture : user.culture,
+        avatarColor: body.avatarColor !== undefined ? body.avatarColor : user.avatarColor,
     }).where(eq(users.id, userId));
+    await touchUser(db, userId);
 
     const updated = await db.select().from(users).where(eq(users.id, userId)).get();
 
@@ -321,6 +374,14 @@ accounts.get('/subscription', async (c) => {
     });
 });
 
+accounts.get('/billing/invoices', (c) => {
+    return c.json([]);
+});
+
+accounts.get('/billing/transactions', (c) => {
+    return c.json([]);
+});
+
 /**
  * GET /api/accounts/keys
  * 对应 AccountsController.GetKeys
@@ -368,13 +429,11 @@ accounts.post('/keys', async (c) => {
         throw new BadRequestError('Keys already exist.');
     }
 
-    const now = new Date().toISOString();
     await db.update(users).set({
         publicKey: body.publicKey,
         privateKey: body.encryptedPrivateKey,
-        revisionDate: now,
-        accountRevisionDate: now,
     }).where(eq(users.id, userId));
+    await touchUser(db, userId);
 
     const contextId = c.get('jwtPayload')?.device || null;
     c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncSettings, userId, contextId));
@@ -420,21 +479,13 @@ accounts.post('/password', async (c) => {
         accountRevisionDate: now,
         lastPasswordChangeDate: now,
     }).where(eq(users.id, userId));
+    await db.delete(refreshTokens).where(eq(refreshTokens.userId, userId));
 
     // 密码变更后通知其他设备登出
     const contextId = c.get('jwtPayload')?.device || null;
     c.executionCtx.waitUntil(pushLogOut(c.env, userId, contextId));
 
     return c.body(null, 204);
-});
-
-/**
- * POST /api/accounts/password-hint
- * 对应 AccountsController.PostPasswordHint
- */
-accounts.post('/password-hint', async (c) => {
-    // 安全考虑：不管邮箱是否存在都返回 200
-    return c.json(null, 200);
 });
 
 /**
@@ -446,12 +497,10 @@ accounts.put('/avatar', async (c) => {
     const userId = c.get('userId');
     const body = await c.req.json<{ avatarColor?: string | null }>();
 
-    const now = new Date().toISOString();
     await db.update(users).set({
         avatarColor: body.avatarColor ?? null,
-        revisionDate: now,
-        accountRevisionDate: now,
     }).where(eq(users.id, userId));
+    await touchUser(db, userId);
 
     const updated = await db.select().from(users).where(eq(users.id, userId)).get();
     if (!updated) throw new NotFoundError('User not found.');
@@ -499,6 +548,7 @@ accounts.post('/security-stamp', async (c) => {
         revisionDate: now,
         accountRevisionDate: now,
     }).where(eq(users.id, userId));
+    await db.delete(refreshTokens).where(eq(refreshTokens.userId, userId));
 
     const contextId = c.get('jwtPayload')?.device || null;
     c.executionCtx.waitUntil(pushLogOut(c.env, userId, contextId));
@@ -508,7 +558,7 @@ accounts.post('/security-stamp', async (c) => {
 
 /**
  * POST /api/accounts/email-token
- * 发送邮箱变更验证码（stub - 不真正发邮件，直接返回成功）
+ * 发送邮箱变更验证码
  */
 accounts.post('/email-token', async (c) => {
     const db = drizzle(c.env.DB);
@@ -521,6 +571,16 @@ accounts.post('/email-token', async (c) => {
     const valid = await verifyPassword(body.masterPasswordHash, user.masterPassword || '');
     if (!valid) throw new BadRequestError('Invalid master password.');
 
+    if (!body.newEmail) throw new BadRequestError('New email is required.');
+    const newEmail = body.newEmail.toLowerCase().trim();
+    const existing = await db.select({ id: users.id }).from(users).where(eq(users.email, newEmail)).get();
+    if (existing && existing.id !== userId) throw new BadRequestError('Email already taken.');
+
+    const token = await sendEmailChangeToken(db, c.env, userId, newEmail);
+    const devResponse = buildDevTokenResponse(c.env, token);
+    if (Object.keys(devResponse).length > 0) {
+        return c.json(devResponse, 200);
+    }
     return c.body(null, 204);
 });
 
@@ -548,6 +608,7 @@ accounts.put('/email', async (c) => {
     const newEmail = body.newEmail.toLowerCase().trim();
     const existing = await db.select({ id: users.id }).from(users).where(eq(users.email, newEmail)).get();
     if (existing && existing.id !== userId) throw new BadRequestError('Email already taken.');
+    await consumeVerificationToken(db, newEmail, 'email_change', body.token, userId);
 
     const now = new Date().toISOString();
     await db.update(users).set({
@@ -559,6 +620,7 @@ accounts.put('/email', async (c) => {
         accountRevisionDate: now,
         lastEmailChangeDate: now,
     }).where(eq(users.id, userId));
+    await db.delete(refreshTokens).where(eq(refreshTokens.userId, userId));
 
     const contextId = c.get('jwtPayload')?.device || null;
     c.executionCtx.waitUntil(pushLogOut(c.env, userId, contextId));

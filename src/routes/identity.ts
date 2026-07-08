@@ -7,19 +7,27 @@
 import { Hono } from 'hono';
 import { drizzle } from 'drizzle-orm/d1';
 import { eq, and } from 'drizzle-orm';
-import { users, devices, refreshTokens, organizationUsers } from '../db/schema';
-import { signJwt } from '../middleware/auth';
-import { generateUuid, generateSecureRandomString, generateRefreshToken, sha256, verifyPassword } from '../services/crypto';
+import { users, devices, refreshTokens, organizationUsers, sends } from '../db/schema';
+import { signJwt, signJwtClaims } from '../middleware/auth';
+import { generateUuid, generateSecureRandomString, generateRefreshToken, sha256, verifyPassword, verifySendPassword } from '../services/crypto';
 import { verifyAuthenticatorCode } from '../services/totp';
 import { logEvent } from '../services/events';
 import { BadRequestError } from '../middleware/error';
 import { bytesToBase64Url, base64UrlToBytes, verifyWebAuthnAuthentication } from '../services/webauthn';
 import { webAuthnCredentials, authRequests } from '../db/schema';
 import { isSignupAllowed } from '../services/signup-guard';
+import { normalizeRegistrationRequest } from '../services/registration';
+import {
+    buildDevTokenResponse,
+    consumeVerificationToken,
+    sendRegistrationVerification,
+    verifyVerificationToken,
+} from '../services/email';
 import { AuthRequestType } from '../types';
 import type { Bindings, Variables, KdfType, PreloginRequest, PreloginResponse, RegisterRequest, TokenRequest, TokenResponse } from '../types';
 
 const identity = new Hono<{ Bindings: Bindings; Variables: Variables }>();
+const SEND_ACCESS_TOKEN_LIFETIME_SECONDS = 15 * 60;
 
 /**
  * POST /identity/accounts/prelogin
@@ -133,13 +141,14 @@ identity.get('/accounts/webauthn/assertion-options', async (c) => {
  */
 identity.post('/accounts/register', async (c) => {
     const body = await c.req.json<any>();
+    const registration = normalizeRegistrationRequest(body);
 
-    if (!body.email || !body.masterPasswordHash) {
+    if (!registration.email || !registration.masterPasswordHash) {
         throw new BadRequestError('Email and master password hash are required.');
     }
 
     const db = drizzle(c.env.DB);
-    const email = body.email.toLowerCase().trim();
+    const email = registration.email.toLowerCase().trim();
 
     if (!await isSignupAllowed(c.env, db, email)) {
         throw new BadRequestError('Registration is disabled. Please contact the administrator for an invitation.');
@@ -158,20 +167,20 @@ identity.post('/accounts/register', async (c) => {
 
     await db.insert(users).values({
         id: userId,
-        name: body.name || null,
+        name: registration.name || null,
         email,
         emailVerified: false,
-        masterPassword: body.masterPasswordHash,
-        masterPasswordHint: body.masterPasswordHint || null,
+        masterPassword: registration.masterPasswordHash,
+        masterPasswordHint: registration.masterPasswordHint || null,
         culture: 'en-US',
         securityStamp: generateSecureRandomString(50),
-        key: body.key,
-        publicKey: body.keys?.publicKey || null,
-        privateKey: body.keys?.encryptedPrivateKey || null,
-        kdf: body.kdf ?? 0,
-        kdfIterations: body.kdfIterations ?? 600000,
-        kdfMemory: body.kdfMemory ?? null,
-        kdfParallelism: body.kdfParallelism ?? null,
+        key: registration.key,
+        publicKey: registration.publicKey,
+        privateKey: registration.privateKey,
+        kdf: registration.kdf,
+        kdfIterations: registration.kdfIterations,
+        kdfMemory: registration.kdfMemory,
+        kdfParallelism: registration.kdfParallelism,
         apiKey: generateSecureRandomString(30),
         accountRevisionDate: now,
         creationDate: now,
@@ -182,23 +191,8 @@ identity.post('/accounts/register', async (c) => {
 });
 
 /**
- * 生成注册验证 token（HMAC-SHA256，无需存储，1小时有效）
- */
-async function generateRegistrationToken(email: string, secret: string): Promise<string> {
-    const hour = Math.floor(Date.now() / 3600000);
-    const data = new TextEncoder().encode(`register:${email}:${hour}`);
-    const key = await crypto.subtle.importKey(
-        'raw', new TextEncoder().encode(secret),
-        { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
-    );
-    const sig = await crypto.subtle.sign('HMAC', key, data);
-    return btoa(String.fromCharCode(...new Uint8Array(sig)));
-}
-
-/**
  * POST /identity/accounts/register/send-verification-email
  * 新注册流程第一步：发送验证邮件。
- * 自托管无邮件服务时，直接在响应中返回 token（客户端/管理员可取用）。
  */
 identity.post('/accounts/register/send-verification-email', async (c) => {
     const body = await c.req.json() as { email: string; name?: string; receiveMarketingEmails?: boolean };
@@ -215,9 +209,8 @@ identity.post('/accounts/register/send-verification-email', async (c) => {
     const existing = await db.select({ id: users.id }).from(users).where(eq(users.email, email)).get();
     if (existing) throw new BadRequestError('Email is already registered.');
 
-    // 自托管：直接返回 token（无邮件服务时的 bypass）
-    const token = await generateRegistrationToken(email, c.env.JWT_SECRET);
-    return c.json({ emailVerificationToken: token }, 200);
+    const token = await sendRegistrationVerification(db, c.env, email);
+    return c.json(buildDevTokenResponse(c.env, token), 200);
 });
 
 /**
@@ -231,7 +224,12 @@ identity.post('/accounts/register/verification-email-clicked', async (c) => {
         throw new BadRequestError('Email and token are required.');
     }
 
-    // 自托管：接受任意 token（不严格验证），直接返回成功
+    await verifyVerificationToken(
+        drizzle(c.env.DB),
+        body.email.toLowerCase().trim(),
+        'registration',
+        body.emailVerificationToken,
+    );
     return c.json(null, 200);
 });
 
@@ -258,13 +256,14 @@ identity.post('/accounts/register/finish', async (c) => {
         emailVerificationToken?: string;
         name?: string;
     };
+    const registration = normalizeRegistrationRequest(body);
 
-    if (!body.email || !body.masterPasswordHash) {
+    if (!registration.email || !registration.masterPasswordHash) {
         throw new BadRequestError('Email and master password hash are required.');
     }
 
     const db = drizzle(c.env.DB);
-    const email = body.email.toLowerCase().trim();
+    const email = registration.email.toLowerCase().trim();
     const { generateSecureRandomString } = await import('../services/crypto');
     const now = new Date().toISOString();
 
@@ -278,23 +277,20 @@ identity.post('/accounts/register/finish', async (c) => {
         if (!pendingInvite) {
             throw new BadRequestError('Email is already registered.');
         }
-        const symmetricKey = body.userSymmetricKey || body.key || null;
-        const asymKeys = body.userAsymmetricKeys || body.keys;
-        const kdfType = body.kdfType ?? body.kdf ?? 0;
         await db.update(users).set({
-            masterPassword: body.masterPasswordHash,
-            masterPasswordHint: body.masterPasswordHint ?? null,
-            key: symmetricKey,
-            publicKey: asymKeys?.publicKey ?? null,
-            privateKey: asymKeys?.encryptedPrivateKey ?? null,
-            kdf: kdfType,
-            kdfIterations: body.kdfIterations ?? 600000,
-            kdfMemory: body.kdfMemory ?? null,
-            kdfParallelism: body.kdfParallelism ?? null,
+            masterPassword: registration.masterPasswordHash,
+            masterPasswordHint: registration.masterPasswordHint ?? null,
+            key: registration.key,
+            publicKey: registration.publicKey,
+            privateKey: registration.privateKey,
+            kdf: registration.kdf,
+            kdfIterations: registration.kdfIterations,
+            kdfMemory: registration.kdfMemory,
+            kdfParallelism: registration.kdfParallelism,
             accountRevisionDate: now,
             revisionDate: now,
             emailVerified: true,
-            name: body.name ?? existingUser.name,
+            name: registration.name ?? existingUser.name,
         }).where(eq(users.id, existingUser.id));
         return c.json(null, 200);
     }
@@ -303,28 +299,29 @@ identity.post('/accounts/register/finish', async (c) => {
     if (!await isSignupAllowed(c.env, db, email)) {
         throw new BadRequestError('Registration is disabled. Please contact the administrator for an invitation.');
     }
+    if (!body.emailVerificationToken) {
+        throw new BadRequestError('Email verification token is required.');
+    }
+    await consumeVerificationToken(db, email, 'registration', body.emailVerificationToken);
 
     const userId = crypto.randomUUID();
-    const symmetricKey = body.userSymmetricKey || body.key || null;
-    const asymKeys = body.userAsymmetricKeys || body.keys;
-    const kdfType = body.kdfType ?? body.kdf ?? 0;
 
     await db.insert(users).values({
         id: userId,
-        name: body.name || null,
+        name: registration.name || null,
         email,
         emailVerified: true,
-        masterPassword: body.masterPasswordHash,
-        masterPasswordHint: body.masterPasswordHint || null,
+        masterPassword: registration.masterPasswordHash,
+        masterPasswordHint: registration.masterPasswordHint || null,
         culture: 'en-US',
         securityStamp: generateSecureRandomString(50),
-        key: symmetricKey,
-        publicKey: asymKeys?.publicKey || null,
-        privateKey: asymKeys?.encryptedPrivateKey || null,
-        kdf: kdfType,
-        kdfIterations: body.kdfIterations ?? 600000,
-        kdfMemory: body.kdfMemory ?? null,
-        kdfParallelism: body.kdfParallelism ?? null,
+        key: registration.key,
+        publicKey: registration.publicKey,
+        privateKey: registration.privateKey,
+        kdf: registration.kdf,
+        kdfIterations: registration.kdfIterations,
+        kdfMemory: registration.kdfMemory,
+        kdfParallelism: registration.kdfParallelism,
         apiKey: generateSecureRandomString(30),
         accountRevisionDate: now,
         creationDate: now,
@@ -333,6 +330,120 @@ identity.post('/accounts/register/finish', async (c) => {
 
     return c.json(null, 200);
 });
+
+type SendAccessTokenRequest = {
+    send_id?: string;
+    password_hash_b64?: string;
+    email?: string;
+    otp?: string;
+};
+
+type LoginDeviceInfo = {
+    id: string;
+    type: number;
+};
+
+function readStringField(source: object, ...keys: string[]): string | undefined {
+    for (const key of keys) {
+        const value = (source as { [key: string]: unknown })[key];
+        if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+    return undefined;
+}
+
+function readNumberField(source: object, ...keys: string[]): number | undefined {
+    for (const key of keys) {
+        const value = (source as { [key: string]: unknown })[key];
+        if (typeof value === 'number' && Number.isInteger(value)) return value;
+        if (typeof value === 'string' && value.trim()) {
+            const parsed = Number(value);
+            if (Number.isInteger(parsed)) return parsed;
+        }
+    }
+    return undefined;
+}
+
+async function upsertLoginDevice(db: any, userId: string, body: object): Promise<LoginDeviceInfo> {
+    const identifier = readStringField(body, 'deviceIdentifier', 'DeviceIdentifier', 'device_identifier');
+    const name = readStringField(body, 'deviceName', 'DeviceName', 'device_name');
+    const type = readNumberField(body, 'deviceType', 'DeviceType', 'device_type');
+
+    if (!identifier || !name || type === undefined) {
+        throw new BadRequestError('deviceIdentifier, deviceType, and deviceName are required.');
+    }
+    if (type < 0 || type > 25) {
+        throw new BadRequestError('deviceType is invalid.');
+    }
+
+    const now = new Date().toISOString();
+    const existingDevice = await db.select().from(devices)
+        .where(and(eq(devices.userId, userId), eq(devices.identifier, identifier)))
+        .get();
+    if (existingDevice) {
+        await db.update(devices).set({
+            name,
+            type,
+            active: true,
+            revisionDate: now,
+        }).where(eq(devices.id, existingDevice.id));
+        return { id: existingDevice.id, type };
+    }
+
+    const deviceId = generateUuid();
+    await db.insert(devices).values({
+        id: deviceId,
+        userId,
+        name,
+        type,
+        identifier,
+        active: true,
+        creationDate: now,
+        revisionDate: now,
+    });
+    return { id: deviceId, type };
+}
+
+function uuidFromSendAccessId(accessId: string): string {
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(accessId)) {
+        return accessId.toLowerCase();
+    }
+
+    let bytes: Uint8Array;
+    try {
+        bytes = base64UrlToBytes(accessId);
+    } catch {
+        throw new Error('invalid_send_id');
+    }
+    if (bytes.length !== 16) {
+        throw new Error('invalid_send_id');
+    }
+
+    // .NET Guid.ToByteArray uses little-endian order for the first three fields.
+    const guidBytes = [
+        bytes[3], bytes[2], bytes[1], bytes[0],
+        bytes[5], bytes[4],
+        bytes[7], bytes[6],
+        ...bytes.slice(8),
+    ];
+    const hex = guidBytes.map((b) => b.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function sendAccessError(c: any, error: 'invalid_request' | 'invalid_grant', errorDescription: string, errorType: string) {
+    return c.json({
+        error,
+        error_description: errorDescription,
+        send_access_error_type: errorType,
+    }, 400);
+}
+
+function sendCanBeAccessed(send: typeof sends.$inferSelect): boolean {
+    const now = new Date().toISOString();
+    return !send.disabled &&
+        send.deletionDate > now &&
+        (!send.expirationDate || send.expirationDate > now) &&
+        (send.maxAccessCount === null || send.accessCount < send.maxAccessCount);
+}
 
 /**
  * POST /identity/connect/token
@@ -360,20 +471,24 @@ identity.post('/connect/token', async (c) => {
             password: formData['password'] as string,
             scope: formData['scope'] as string,
             client_id: formData['client_id'] as string,
-            deviceType: formData['deviceType'] ? Number(formData['deviceType']) : undefined,
-            deviceIdentifier: formData['deviceIdentifier'] as string,
-            deviceName: formData['deviceName'] as string,
+            deviceType: formData['deviceType'] !== undefined ? Number(formData['deviceType']) : (formData['DeviceType'] !== undefined ? Number(formData['DeviceType']) : undefined),
+            deviceIdentifier: (formData['deviceIdentifier'] || formData['DeviceIdentifier']) as string,
+            deviceName: (formData['deviceName'] || formData['DeviceName']) as string,
             refresh_token: formData['refresh_token'] as string,
             authRequest: (formData['authRequest'] || formData['AuthRequest']) as string,
+            send_id: formData['send_id'] as string,
+            password_hash_b64: formData['password_hash_b64'] as string,
+            email: formData['email'] as string,
+            otp: formData['otp'] as string,
             TwoFactorProvider: formData['TwoFactorProvider'] ? Number(formData['TwoFactorProvider']) : (formData['twoFactorProvider'] ? Number(formData['twoFactorProvider']) : undefined),
             TwoFactorToken: (formData['TwoFactorToken'] || formData['twoFactorToken']) as string,
-        };
+        } as TokenRequest & SendAccessTokenRequest;
         webAuthnToken = formData['token'] as string;
         webAuthnDeviceResponse = formData['deviceResponse'] as string;
     } else {
         const rawBody = await c.req.json<any>();
         console.log(`[TOKEN] JSON body keys: ${Object.keys(rawBody).join(', ')}`);
-        body = rawBody as TokenRequest;
+        body = rawBody as TokenRequest & SendAccessTokenRequest;
         webAuthnToken = rawBody.token;
         webAuthnDeviceResponse = rawBody.deviceResponse;
     }
@@ -388,10 +503,71 @@ identity.post('/connect/token', async (c) => {
         return await handleRefreshTokenGrant(c, db, body);
     } else if (body.grant_type === 'webauthn') {
         return await handleWebAuthnGrant(c, db, body, webAuthnToken, webAuthnDeviceResponse);
+    } else if (body.grant_type === 'send_access') {
+        return await handleSendAccessGrant(c, db, body as TokenRequest & SendAccessTokenRequest);
     }
 
     throw new BadRequestError('Unsupported grant_type.');
 });
+
+async function handleSendAccessGrant(
+    c: any,
+    db: any,
+    body: TokenRequest & SendAccessTokenRequest,
+) {
+    if (!body.send_id) {
+        return sendAccessError(c, 'invalid_request', 'send_id is required.', 'send_id_required');
+    }
+
+    let sendId: string;
+    try {
+        sendId = uuidFromSendAccessId(body.send_id);
+    } catch {
+        return sendAccessError(c, 'invalid_grant', 'send_id is invalid.', 'send_id_invalid');
+    }
+
+    const send = await db.select().from(sends).where(eq(sends.id, sendId)).get();
+    if (!send || !sendCanBeAccessed(send)) {
+        return sendAccessError(c, 'invalid_grant', 'send_id is invalid.', 'send_id_invalid');
+    }
+
+    if (send.password) {
+        const passwordHash = body.password_hash_b64;
+        if (!passwordHash) {
+            return sendAccessError(c, 'invalid_request', 'password_hash_b64 is required.', 'password_hash_b64_required');
+        }
+
+        let valid = passwordHash === send.password;
+        if (!valid) {
+            try {
+                valid = await verifySendPassword(passwordHash, send.password);
+            } catch {
+                valid = false;
+            }
+        }
+        if (!valid) {
+            return sendAccessError(c, 'invalid_grant', 'password_hash_b64 is invalid.', 'password_hash_b64_invalid');
+        }
+    }
+
+    const accessToken = await signJwtClaims({
+        sub: sendId,
+        send_id: sendId,
+        type: 'Send',
+        scope: ['api.send.access'],
+        amr: ['send_access'],
+    }, c.env.JWT_SECRET, SEND_ACCESS_TOKEN_LIFETIME_SECONDS);
+    const expiresAt = Date.now() + SEND_ACCESS_TOKEN_LIFETIME_SECONDS * 1000;
+
+    return c.json({
+        access_token: accessToken,
+        token: accessToken,
+        expires_in: SEND_ACCESS_TOKEN_LIFETIME_SECONDS,
+        expiresAt,
+        token_type: 'Bearer',
+        scope: 'api.send.access',
+    });
+}
 
 /**
  * 构建 2FA provider 的元数据，用于 TwoFactorProviders2 响应
@@ -586,6 +762,25 @@ async function handlePasswordGrant(c: any, db: any, body: TokenRequest) {
         } else if (providerType === 0) { // Authenticator
             const authProvider = providers[0];
             isValid = verifyAuthenticatorCode(authProvider.metaData.Key, token);
+        } else if (providerType === 1) { // Email
+            const emailProvider = providers[1];
+            const metaData = emailProvider?.metaData ?? {};
+            const storedToken = String(metaData.Token ?? metaData.token ?? '');
+            const expiresRaw = metaData.TokenExpirationDate ?? metaData.tokenExpirationDate;
+            isValid = !!storedToken &&
+                storedToken === String(token).trim() &&
+                !!expiresRaw &&
+                Date.now() <= new Date(String(expiresRaw)).getTime();
+            if (isValid) {
+                delete metaData.Token;
+                delete metaData.token;
+                delete metaData.TokenExpirationDate;
+                delete metaData.tokenExpirationDate;
+                providers[1] = { ...emailProvider, metaData };
+                await db.update(users).set({
+                    twoFactorProviders: JSON.stringify(providers),
+                }).where(eq(users.id, user.id));
+            }
         } else if (providerType === 7) { // WebAuthn
             try {
                 const assertionResponse = typeof token === 'string' ? JSON.parse(token) : token;
@@ -666,30 +861,8 @@ async function handlePasswordGrant(c: any, db: any, body: TokenRequest) {
     // ================= 2FA 检查完毕 =================
     console.log(`[TOKEN] 2FA check passed, proceeding to device/token generation`);
 
-    // 处理设备
-    let deviceId = generateUuid();
-    if (body.deviceIdentifier) {
-        const existingDevice = await db.select().from(devices)
-            .where(and(eq(devices.userId, user.id), eq(devices.identifier, body.deviceIdentifier))).get();
-        if (existingDevice) {
-            deviceId = existingDevice.id;
-            await db.update(devices).set({
-                name: body.deviceName || existingDevice.name,
-                type: body.deviceType ?? existingDevice.type,
-                revisionDate: new Date().toISOString(),
-            }).where(eq(devices.id, deviceId));
-        } else {
-            await db.insert(devices).values({
-                id: deviceId,
-                userId: user.id,
-                name: body.deviceName || 'Unknown',
-                type: body.deviceType ?? 14,
-                identifier: body.deviceIdentifier,
-                creationDate: new Date().toISOString(),
-                revisionDate: new Date().toISOString(),
-            });
-        }
-    }
+    // 处理设备。revisionDate 同时作为 devices 响应中的 lastActivityDate。
+    const loginDevice = await upsertLoginDevice(db, user.id, body);
 
     // 签发 access token
     const expiresIn = parseInt(c.env.JWT_EXPIRATION || '3600');
@@ -700,7 +873,7 @@ async function handlePasswordGrant(c: any, db: any, body: TokenRequest) {
         name: user.name || '',
         premium: user.premium || String(c.env.GLOBAL_PREMIUM).toLowerCase() === 'true',
         sstamp: user.securityStamp,
-        device: deviceId,
+        device: loginDevice.id,
         scope: ['api', 'offline_access'],
         amr: ['Application'],
     }, c.env.JWT_SECRET, expiresIn);
@@ -713,7 +886,7 @@ async function handlePasswordGrant(c: any, db: any, body: TokenRequest) {
     await db.insert(refreshTokens).values({
         id: generateUuid(),
         userId: user.id,
-        deviceId,
+        deviceId: loginDevice.id,
         tokenHash: refreshTokenHash,
         expirationDate: new Date(Date.now() + refreshExpiresIn * 1000).toISOString(),
         creationDate: new Date().toISOString(),
@@ -729,7 +902,7 @@ async function handlePasswordGrant(c: any, db: any, body: TokenRequest) {
     // 记录审计日志
     await logEvent(c.env.DB, 1000, {
         userId: user.id,
-        deviceType: body.deviceType,
+        deviceType: loginDevice.type,
         ipAddress: c.req.header('CF-Connecting-IP') || c.req.header('x-forwarded-for') || null,
     });
 
@@ -808,6 +981,20 @@ async function handleRefreshTokenGrant(c: any, db: any, body: TokenRequest) {
 
     // 删除旧 refresh token
     await db.delete(refreshTokens).where(eq(refreshTokens.id, storedToken.id));
+    if (storedToken.deviceId) {
+        const tokenDevice = await db.select({
+            id: devices.id,
+            active: devices.active,
+        }).from(devices)
+            .where(and(eq(devices.id, storedToken.deviceId), eq(devices.userId, user.id)))
+            .get();
+        if (!tokenDevice || !tokenDevice.active) {
+            return c.json({ error: 'invalid_grant', error_description: 'Device is inactive.' }, 400);
+        }
+        await db.update(devices).set({
+            revisionDate: new Date().toISOString(),
+        }).where(eq(devices.id, tokenDevice.id));
+    }
 
     // 新的 access token
     const expiresIn = parseInt(c.env.JWT_EXPIRATION || '3600');
@@ -1020,29 +1207,7 @@ async function handleWebAuthnGrant(c: any, db: any, body: TokenRequest, rawToken
     }).where(eq(webAuthnCredentials.id, credential.id));
 
     // 7. 签发 token（与 password grant 相同流程）
-    let deviceId = generateUuid();
-    if (body.deviceIdentifier) {
-        const existingDevice = await db.select().from(devices)
-            .where(and(eq(devices.userId, user.id), eq(devices.identifier, body.deviceIdentifier))).get();
-        if (existingDevice) {
-            deviceId = existingDevice.id;
-            await db.update(devices).set({
-                name: body.deviceName || existingDevice.name,
-                type: body.deviceType ?? existingDevice.type,
-                revisionDate: new Date().toISOString(),
-            }).where(eq(devices.id, deviceId));
-        } else {
-            await db.insert(devices).values({
-                id: deviceId,
-                userId: user.id,
-                name: body.deviceName || 'Unknown',
-                type: body.deviceType ?? 14,
-                identifier: body.deviceIdentifier,
-                creationDate: new Date().toISOString(),
-                revisionDate: new Date().toISOString(),
-            });
-        }
-    }
+    const loginDevice = await upsertLoginDevice(db, user.id, body);
 
     const expiresIn = parseInt(c.env.JWT_EXPIRATION || '3600');
     const accessToken = await signJwt({
@@ -1052,7 +1217,7 @@ async function handleWebAuthnGrant(c: any, db: any, body: TokenRequest, rawToken
         name: user.name || '',
         premium: user.premium || String(c.env.GLOBAL_PREMIUM).toLowerCase() === 'true',
         sstamp: user.securityStamp,
-        device: deviceId,
+        device: loginDevice.id,
         scope: ['api', 'offline_access'],
         amr: ['Application'],
     }, c.env.JWT_SECRET, expiresIn);
@@ -1064,7 +1229,7 @@ async function handleWebAuthnGrant(c: any, db: any, body: TokenRequest, rawToken
     await db.insert(refreshTokens).values({
         id: generateUuid(),
         userId: user.id,
-        deviceId,
+        deviceId: loginDevice.id,
         tokenHash: refreshTokenHash,
         expirationDate: new Date(Date.now() + refreshExpiresIn * 1000).toISOString(),
         creationDate: new Date().toISOString(),
@@ -1072,7 +1237,7 @@ async function handleWebAuthnGrant(c: any, db: any, body: TokenRequest, rawToken
 
     await logEvent(c.env.DB, 1000, {
         userId: user.id,
-        deviceType: body.deviceType,
+        deviceType: loginDevice.type,
         ipAddress: c.req.header('CF-Connecting-IP') || c.req.header('x-forwarded-for') || null,
     });
 

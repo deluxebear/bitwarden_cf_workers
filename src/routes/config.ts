@@ -9,6 +9,11 @@ import type { Bindings, Variables } from '../types';
 
 const config = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
+function isEmailVerificationEnabled(env: Bindings): boolean {
+    return String(env.EMAIL_MODE ?? 'disabled').toLowerCase() !== 'disabled' ||
+        String(env.EMAIL_RETURN_TOKENS ?? '').toLowerCase() === 'true';
+}
+
 /**
  * GET /api/config
  * 对应 ConfigController.Get
@@ -37,7 +42,7 @@ config.get('/', async (c) => {
             'pm-18021-force-update-kdf-settings': false, // Force KDF updates (keep off)
             'pm-20558-migrate-myvault-to-myitems': true, // My Vault -> My Items
             'pm-23995-no-logout-on-kdf-change': true,   // No logout on KDF change
-            'pm-19051-send-email-verification': false,   // Email verification (no email service)
+            'pm-19051-send-email-verification': isEmailVerificationEnabled(c.env),
         },
         // 新增字段 - 对应 ConfigResponseModel
         push: {

@@ -19,11 +19,48 @@ import {
     getRegisteredKeys,
 } from '../services/webauthn';
 import type {
-    Bindings, Variables, TwoFactorProviderType, TwoFactorProviderResponse,
+    Bindings, Variables, TwoFactorProviderResponse,
     TwoFactorAuthenticatorResponse, TwoFactorRecoverResponse, TwoFactorProvider
 } from '../types';
+import { TwoFactorProviderType } from '../types';
 
 const twoFactor = new Hono<{ Bindings: Bindings; Variables: Variables }>();
+
+/**
+ * POST /api/two-factor/send-email-login
+ * 登录过程发送 Email 2FA 验证码。此端点必须匿名可访问，但仍要求 secret
+ * 与主密钥哈希匹配；没有配置投递方式时明确失败，避免绕过 2FA。
+ */
+twoFactor.post('/send-email-login', async (c) => {
+    const db = drizzle(c.env.DB);
+    const body = await c.req.json<{
+        email?: string;
+        Email?: string;
+        secret?: string;
+        masterPasswordHash?: string;
+    }>();
+    const email = normalizeEmail(body.email ?? body.Email);
+    if (!email) throw new BadRequestError('Email is required.');
+
+    const user = await db.select().from(users).where(eq(users.email, email)).get();
+    if (!user) throw new BadRequestError('Cannot send two-factor email.');
+
+    const secret = body.secret ?? body.masterPasswordHash;
+    if (!secret || !await verifyPassword(secret, user.masterPassword || '')) {
+        throw new BadRequestError('Cannot send two-factor email.');
+    }
+
+    const providers = getProviders(user);
+    const emailProvider = providers[TwoFactorProviderType.Email];
+    if (!emailProvider?.enabled) {
+        throw new BadRequestError('Email two-factor provider is not enabled.');
+    }
+
+    const targetEmail = normalizeEmail(emailProvider.metaData?.Email ?? emailProvider.metaData?.email) ?? user.email.toLowerCase();
+    await storeAndDeliverEmailToken(c.env, db, user, providers, targetEmail);
+
+    return c.body(null, 200);
+});
 
 // 所有 2FA 配置端点都需要认证
 twoFactor.use('/*', authMiddleware);
@@ -54,6 +91,108 @@ function getProviders(user: any): Record<number, TwoFactorProvider> {
     }
 }
 
+function normalizeEmail(value: unknown): string | null {
+    if (typeof value !== 'string') return null;
+    const email = value.trim().toLowerCase();
+    if (!email || !email.includes('@') || email.length > 256) return null;
+    return email;
+}
+
+function generateEmailToken(): string {
+    const bytes = new Uint8Array(4);
+    crypto.getRandomValues(bytes);
+    const value = ((bytes[0] << 24) >>> 0) + (bytes[1] << 16) + (bytes[2] << 8) + bytes[3];
+    return String(value % 1000000).padStart(6, '0');
+}
+
+function maskSecret(secret: string | null | undefined): string | null {
+    if (!secret) return secret ?? null;
+    if (secret.length <= 6) return secret;
+    return `${secret.slice(0, 6)}${'*'.repeat(secret.length - 6)}`;
+}
+
+function toEmailResponse(providers: Record<number, TwoFactorProvider>) {
+    const provider = providers[TwoFactorProviderType.Email];
+    const email = normalizeEmail(provider?.metaData?.Email ?? provider?.metaData?.email);
+    return {
+        enabled: provider?.enabled ?? false,
+        email,
+        object: 'twoFactorEmail',
+    };
+}
+
+function toYubiKeyResponse(providers: Record<number, TwoFactorProvider>) {
+    const metadata = providers[TwoFactorProviderType.YubiKey]?.metaData ?? {};
+    return {
+        enabled: providers[TwoFactorProviderType.YubiKey]?.enabled ?? false,
+        key1: metadata.Key1 ?? null,
+        key2: metadata.Key2 ?? null,
+        key3: metadata.Key3 ?? null,
+        key4: metadata.Key4 ?? null,
+        key5: metadata.Key5 ?? null,
+        nfc: metadata.Nfc ?? false,
+        object: 'twoFactorYubiKey',
+    };
+}
+
+function toDuoResponse(providers: Record<number, TwoFactorProvider>) {
+    const metadata = providers[TwoFactorProviderType.Duo]?.metaData ?? {};
+    return {
+        enabled: providers[TwoFactorProviderType.Duo]?.enabled ?? false,
+        host: metadata.Host ?? null,
+        clientSecret: maskSecret(metadata.ClientSecret),
+        clientId: metadata.ClientId ?? null,
+        object: 'twoFactorDuo',
+    };
+}
+
+async function deliverEmailToken(env: Bindings, email: string, token: string): Promise<void> {
+    const delivery = env.TWO_FACTOR_EMAIL_DELIVERY?.toLowerCase();
+    const debugEnabled = env.TWO_FACTOR_EMAIL_DEBUG === 'true';
+    if (delivery === 'console' || debugEnabled) {
+        console.info(`[2FA_EMAIL] email=${email} token=${token}`);
+        return;
+    }
+
+    throw new BadRequestError('Email 2FA delivery is not configured. Set TWO_FACTOR_EMAIL_DELIVERY=console for development or wire a real email service before enabling Email 2FA.');
+}
+
+async function storeAndDeliverEmailToken(
+    env: Bindings,
+    db: ReturnType<typeof drizzle>,
+    user: any,
+    providers: Record<number, TwoFactorProvider>,
+    email: string,
+): Promise<void> {
+    const token = generateEmailToken();
+    const expires = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    const current = providers[TwoFactorProviderType.Email];
+    providers[TwoFactorProviderType.Email] = {
+        enabled: current?.enabled ?? false,
+        metaData: {
+            ...(current?.metaData ?? {}),
+            Email: email,
+            Token: token,
+            TokenExpirationDate: expires,
+        },
+    };
+
+    await deliverEmailToken(env, email, token);
+    await db.update(users).set({
+        twoFactorProviders: JSON.stringify(providers),
+        accountRevisionDate: new Date().toISOString(),
+    }).where(eq(users.id, user.id));
+}
+
+function verifyStoredEmailToken(provider: TwoFactorProvider | undefined, token: string | undefined): boolean {
+    if (!provider?.metaData || !token) return false;
+    const storedToken = String(provider.metaData.Token ?? provider.metaData.token ?? '');
+    const expiresRaw = provider.metaData.TokenExpirationDate ?? provider.metaData.tokenExpirationDate;
+    if (!storedToken || !expiresRaw) return false;
+    if (Date.now() > new Date(String(expiresRaw)).getTime()) return false;
+    return storedToken === token.trim();
+}
+
 /**
  * GET /api/two-factor
  * 获取所有已配置的 2FA 提供商
@@ -76,6 +215,140 @@ twoFactor.get('/', async (c) => {
         continuationToken: null,
     });
 });
+
+/**
+ * POST /api/two-factor/get-email
+ * 获取 Email 2FA 当前配置。
+ */
+twoFactor.post('/get-email', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const body = await c.req.json().catch(() => ({}));
+
+    const user = await verifySecret(db, userId, body);
+    return c.json(toEmailResponse(getProviders(user)));
+});
+
+/**
+ * POST /api/two-factor/send-email
+ * 发送 Email 2FA 设置验证码。验证码只写入 provider metadata，
+ * PUT/POST /email 校验通过后才会真正启用 Email provider。
+ */
+twoFactor.post('/send-email', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const body = await c.req.json<{
+        email?: string;
+        Email?: string;
+        secret?: string;
+        masterPasswordHash?: string;
+    }>();
+
+    const user = await verifySecret(db, userId, body);
+    const email = normalizeEmail(body.email ?? body.Email);
+    if (!email) throw new BadRequestError('Email is required.');
+
+    await storeAndDeliverEmailToken(c.env, db, user, getProviders(user), email);
+    return c.body(null, 200);
+});
+
+/**
+ * PUT/POST /api/two-factor/email
+ * 校验 Email 2FA 设置验证码并启用 provider。
+ */
+async function enableEmail(c: Context<{ Bindings: Bindings; Variables: Variables }>) {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const body = await c.req.json<{
+        email?: string;
+        Email?: string;
+        token?: string;
+        Token?: string;
+        secret?: string;
+        masterPasswordHash?: string;
+    }>();
+
+    const user = await verifySecret(db, userId, body);
+    const providers = getProviders(user);
+    const email = normalizeEmail(body.email ?? body.Email);
+    if (!email) throw new BadRequestError('Email is required.');
+
+    if (!verifyStoredEmailToken(providers[TwoFactorProviderType.Email], body.token ?? body.Token)) {
+        throw new BadRequestError('Invalid token.');
+    }
+
+    const now = new Date().toISOString();
+    let recoveryCode = user.twoFactorRecoveryCode;
+    if (!recoveryCode) {
+        recoveryCode = generateSecureRandomString(32);
+    }
+
+    providers[TwoFactorProviderType.Email] = {
+        enabled: true,
+        metaData: { Email: email },
+    };
+
+    await db.update(users).set({
+        twoFactorProviders: JSON.stringify(providers),
+        twoFactorRecoveryCode: recoveryCode,
+        accountRevisionDate: now,
+    }).where(eq(users.id, userId));
+
+    return c.json(toEmailResponse(providers));
+}
+
+twoFactor.put('/email', enableEmail);
+twoFactor.post('/email', enableEmail);
+
+/**
+ * GET /api/two-factor/get-device-verification-settings
+ * PUT /api/two-factor/device-verification-settings
+ *
+ * 官方已标记为旧客户端兼容端点；当前固定返回禁用状态。
+ */
+function deviceVerificationSettingsResponse() {
+    return {
+        isDeviceVerificationSectionEnabled: false,
+        unknownDeviceVerificationEnabled: false,
+        object: 'deviceVerificationSettings',
+    };
+}
+
+twoFactor.get('/get-device-verification-settings', (c) => c.json(deviceVerificationSettingsResponse()));
+twoFactor.put('/device-verification-settings', (c) => c.json(deviceVerificationSettingsResponse()));
+
+/**
+ * POST /api/two-factor/get-yubikey
+ */
+twoFactor.post('/get-yubikey', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const body = await c.req.json().catch(() => ({}));
+
+    const user = await verifySecret(db, userId, body);
+    return c.json(toYubiKeyResponse(getProviders(user)));
+});
+
+/**
+ * POST /api/two-factor/get-duo
+ */
+twoFactor.post('/get-duo', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const body = await c.req.json().catch(() => ({}));
+
+    const user = await verifySecret(db, userId, body);
+    return c.json(toDuoResponse(getProviders(user)));
+});
+
+async function unsupportedPremiumProvider() {
+    throw new BadRequestError('This two-factor provider is not implemented for this Workers deployment.');
+}
+
+twoFactor.put('/yubikey', unsupportedPremiumProvider);
+twoFactor.post('/yubikey', unsupportedPremiumProvider);
+twoFactor.put('/duo', unsupportedPremiumProvider);
+twoFactor.post('/duo', unsupportedPremiumProvider);
 
 /**
  * POST /api/two-factor/get-authenticator

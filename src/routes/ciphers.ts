@@ -7,7 +7,7 @@
 import { Hono } from 'hono';
 import { drizzle } from 'drizzle-orm/d1';
 import { eq, and, desc, isNull, isNotNull, inArray } from 'drizzle-orm';
-import { users, ciphers, folders, collectionCiphers, collections, collectionUsers, events, organizationUsers, organizations } from '../db/schema';
+import { users, ciphers, folders, collectionCiphers, collections, collectionUsers, collectionGroups, groupUsers, events, organizationUsers, organizations } from '../db/schema';
 import { getOrgUser, canCreateCollection, canAccessImportExport } from './organizations';
 import { authMiddleware } from '../middleware/auth';
 import { logEvent } from '../services/events';
@@ -15,6 +15,7 @@ import { toEventResponse } from './events';
 import { BadRequestError, NotFoundError } from '../middleware/error';
 import { batchedInArrayQuery } from '../services/db';
 import { generateUuid } from '../services/crypto';
+import { buildAttachmentDownloadUrl } from '../services/attachment-token';
 import type { Bindings, Variables, CipherRequest, CipherResponse, CipherType, CipherRepromptType } from '../types';
 import { pushSyncCipher, pushSyncUser } from '../services/push-notification';
 import { PushType } from '../types/push-notification';
@@ -23,6 +24,209 @@ const ciphersRoute = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
 // 所有端点都需要认证
 ciphersRoute.use('/*', authMiddleware);
+
+type CipherRow = typeof ciphers.$inferSelect;
+type OrganizationUserRow = typeof organizationUsers.$inferSelect;
+type OrganizationRow = typeof organizations.$inferSelect;
+
+type CollectionAccess = {
+    collectionId: string;
+    readOnly: boolean;
+    hidePasswords: boolean;
+    manage: boolean;
+};
+
+type CipherAccess = {
+    cipher: CipherRow;
+    collectionIds: string[];
+    edit: boolean;
+    viewPassword: boolean;
+    manage: boolean;
+};
+
+function buildCipherData(body: Partial<CipherRequest>): Record<string, unknown> {
+    const data: Record<string, unknown> = {
+        name: body.name ?? '',
+        notes: body.notes ?? null,
+        fields: body.fields ?? null,
+        passwordHistory: body.passwordHistory ?? null,
+    };
+    if (body.type === 1) data.login = body.login;
+    if (body.type === 2) data.secureNote = body.secureNote;
+    if (body.type === 3) data.card = body.card;
+    if (body.type === 4) data.identity = body.identity;
+    if (body.type === 5 && body.sshKey) {
+        data.privateKey = body.sshKey.privateKey;
+        data.publicKey = body.sshKey.publicKey;
+        data.keyFingerprint = body.sshKey.keyFingerprint;
+    }
+    return data;
+}
+
+function buildAttachmentsMap(attachments: any[] | null | undefined): string | null | undefined {
+    if (!Array.isArray(attachments)) return undefined;
+    const map: Record<string, { fileName: string | null; key: string | null; size: string; validated?: boolean }> = {};
+    for (const attachment of attachments) {
+        if (!attachment?.id) continue;
+        map[attachment.id] = {
+            fileName: attachment.fileName ?? null,
+            key: attachment.key ?? null,
+            size: String(attachment.size ?? '0'),
+            validated: attachment.validated ?? true,
+        };
+    }
+    return Object.keys(map).length > 0 ? JSON.stringify(map) : null;
+}
+
+function parseOrgPermissions(permissions: string | null): Record<string, unknown> {
+    if (!permissions) return {};
+    try {
+        return JSON.parse(permissions) as Record<string, unknown>;
+    } catch {
+        return {};
+    }
+}
+
+function canAccessAllOrgItems(orgUser: OrganizationUserRow, org: OrganizationRow | null | undefined): boolean {
+    if (orgUser.type === 0) return true;
+    if (orgUser.type === 1 && org?.allowAdminAccessToAllCollectionItems === true) return true;
+    const permissions = parseOrgPermissions(orgUser.permissions);
+    return permissions.editAnyCollection === true || permissions.deleteAnyCollection === true;
+}
+
+async function getCollectionAccessForOrgUser(
+    db: ReturnType<typeof drizzle>,
+    organizationUserId: string,
+): Promise<CollectionAccess[]> {
+    const directRows = await db.select().from(collectionUsers)
+        .where(eq(collectionUsers.organizationUserId, organizationUserId))
+        .all();
+
+    const groupRows = await db.select({ groupId: groupUsers.groupId }).from(groupUsers)
+        .where(eq(groupUsers.organizationUserId, organizationUserId))
+        .all();
+    const groupIds = groupRows.map((row) => row.groupId);
+    const groupAccess = groupIds.length > 0
+        ? await batchedInArrayQuery<typeof collectionGroups.$inferSelect>(
+            db, collectionGroups, collectionGroups.groupId, groupIds)
+        : [];
+
+    const byCollection = new Map<string, CollectionAccess>();
+    for (const row of directRows) {
+        byCollection.set(row.collectionId, {
+            collectionId: row.collectionId,
+            readOnly: row.readOnly ?? false,
+            hidePasswords: row.hidePasswords ?? false,
+            manage: row.manage ?? false,
+        });
+    }
+
+    for (const row of groupAccess) {
+        const existing = byCollection.get(row.collectionId);
+        if (!existing) {
+            byCollection.set(row.collectionId, {
+                collectionId: row.collectionId,
+                readOnly: row.readOnly ?? false,
+                hidePasswords: row.hidePasswords ?? false,
+                manage: row.manage ?? false,
+            });
+            continue;
+        }
+        existing.readOnly = existing.readOnly && (row.readOnly ?? false);
+        existing.hidePasswords = existing.hidePasswords && (row.hidePasswords ?? false);
+        existing.manage = existing.manage || (row.manage ?? false);
+    }
+
+    return [...byCollection.values()];
+}
+
+async function getCipherAccess(db: ReturnType<typeof drizzle>, cipherId: string, userId: string): Promise<CipherAccess> {
+    const cipher = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
+    if (!cipher) throw new NotFoundError('Cipher not found.');
+    if (!cipher.organizationId) {
+        if (cipher.userId !== userId) throw new NotFoundError('Cipher not found.');
+        return { cipher, collectionIds: [], edit: true, viewPassword: true, manage: true };
+    }
+
+    const orgUser = await db.select().from(organizationUsers)
+        .where(and(
+            eq(organizationUsers.organizationId, cipher.organizationId),
+            eq(organizationUsers.userId, userId),
+        )).get();
+    if (!orgUser || orgUser.status !== 2) throw new NotFoundError('Cipher not found.');
+
+    const org = await db.select().from(organizations).where(eq(organizations.id, cipher.organizationId)).get();
+    const cipherCollections = await db.select().from(collectionCiphers)
+        .where(eq(collectionCiphers.cipherId, cipher.id))
+        .all();
+    const collectionIds = cipherCollections.map((row) => row.collectionId);
+
+    if (canAccessAllOrgItems(orgUser, org)) {
+        return { cipher, collectionIds, edit: true, viewPassword: true, manage: true };
+    }
+
+    const collectionAccess = await getCollectionAccessForOrgUser(db, orgUser.id);
+    const accessByCollection = new Map(collectionAccess.map((entry) => [entry.collectionId, entry]));
+    const matchingAccess = collectionIds
+        .map((collectionId) => accessByCollection.get(collectionId))
+        .filter((entry): entry is CollectionAccess => !!entry);
+    if (matchingAccess.length === 0) throw new NotFoundError('Cipher not found.');
+
+    return {
+        cipher,
+        collectionIds,
+        edit: matchingAccess.some((entry) => !entry.readOnly || entry.manage),
+        viewPassword: matchingAccess.some((entry) => !entry.hidePasswords),
+        manage: matchingAccess.some((entry) => entry.manage),
+    };
+}
+
+async function getAccessibleCipher(db: ReturnType<typeof drizzle>, cipherId: string, userId: string): Promise<CipherRow> {
+    return (await getCipherAccess(db, cipherId, userId)).cipher;
+}
+
+async function getEditableCipher(db: ReturnType<typeof drizzle>, cipherId: string, userId: string): Promise<CipherRow> {
+    const access = await getCipherAccess(db, cipherId, userId);
+    if (!access.edit) throw new NotFoundError('Cipher not found.');
+    return access.cipher;
+}
+
+async function getAdminCipher(db: ReturnType<typeof drizzle>, cipherId: string, userId: string): Promise<CipherRow> {
+    const cipher = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
+    if (!cipher || !cipher.organizationId) throw new NotFoundError('Cipher not found.');
+    const orgUser = await getOrgUser(db, cipher.organizationId, userId);
+    if (!orgUser || orgUser.status !== 2) throw new NotFoundError('Cipher not found.');
+    const org = await db.select().from(organizations).where(eq(organizations.id, cipher.organizationId)).get();
+    if (!canAccessAllOrgItems(orgUser, org)) {
+        const access = await getCipherAccess(db, cipherId, userId);
+        if (!access.manage) throw new NotFoundError('Cipher not found.');
+    }
+    return cipher;
+}
+
+async function replaceCipherCollections(
+    db: ReturnType<typeof drizzle>,
+    cipher: CipherRow,
+    collectionIds: string[],
+): Promise<void> {
+    if (!cipher.organizationId) throw new NotFoundError('Cipher not found.');
+    const uniqueIds = [...new Set(collectionIds)];
+    if (uniqueIds.length > 0) {
+        const orgCollections = await db.select({ id: collections.id }).from(collections)
+            .where(and(eq(collections.organizationId, cipher.organizationId), inArray(collections.id, uniqueIds)))
+            .all();
+        const validIds = new Set(orgCollections.map((r) => r.id));
+        if (uniqueIds.some((id) => !validIds.has(id))) {
+            throw new BadRequestError('One or more collections not found or do not belong to this organization.');
+        }
+    }
+    await db.delete(collectionCiphers).where(eq(collectionCiphers.cipherId, cipher.id));
+    if (uniqueIds.length > 0) {
+        await db.insert(collectionCiphers).values(
+            uniqueIds.map((collectionId) => ({ collectionId, cipherId: cipher.id })),
+        ).onConflictDoNothing();
+    }
+}
 
 /** 从请求 URL 中提取 baseUrl（protocol + host），用于构建附件绝对下载 URL */
 function getBaseUrl(c: any): string {
@@ -70,12 +274,12 @@ async function extractFileFromRequest(c: any): Promise<{ file: File; formData: R
  * 将数据库记录转换为 Bitwarden API 响应格式
  * objectType: "cipher" 用于单个 CRUD 端点, "cipherDetails" 用于列表/sync, "cipherMiniDetails" 用于 GET .../admin
  */
-function toCipherResponse(cipher: any, userId: string, baseUrl: string, objectType: 'cipher' | 'cipherDetails' | 'cipherMiniDetails' = 'cipher'): CipherResponse {
+async function toCipherResponse(cipher: any, userId: string, baseUrl: string, secret: string, objectType: 'cipher' | 'cipherDetails' | 'cipherMiniDetails' = 'cipher'): Promise<CipherResponse> {
     const data = JSON.parse(cipher.data || '{}');
     const favorites = cipher.favorites ? JSON.parse(cipher.favorites) : {};
     const folders = cipher.folders ? JSON.parse(cipher.folders) : {};
     const attachmentsMap = cipher.attachments ? JSON.parse(cipher.attachments) : {};
-    const attachments = Object.keys(attachmentsMap).map(id => {
+    const attachments = await Promise.all(Object.keys(attachmentsMap).map(async (id) => {
         const a = attachmentsMap[id];
         const sizeBytes = parseInt(a.size || '0');
         const sizeName = sizeBytes >= 1048576 ? `${(sizeBytes / 1048576).toFixed(2)} MB` :
@@ -87,9 +291,9 @@ function toCipherResponse(cipher: any, userId: string, baseUrl: string, objectTy
             key: a.key,
             size: a.size || '0',
             sizeName: sizeName,
-            url: `${baseUrl}/attachments/${cipher.id}/${id}`
+            url: await buildAttachmentDownloadUrl(baseUrl, cipher.id, id, secret),
         };
-    });
+    }));
 
     // SSH key: 兼容旧的嵌套存储 (data.sshKey.xxx) 和新的扁平存储 (data.xxx)
     // 如果 keyFingerprint 缺失则不返回 sshKey（iOS 要求该字段为非空 String）
@@ -158,7 +362,8 @@ ciphersRoute.get('/', async (c) => {
         .where(and(eq(ciphers.userId, userId), isNull(ciphers.deletedDate))).all();
 
     const baseUrl = getBaseUrl(c);
-    const data = results.map((cipher) => toCipherResponse(cipher, userId, baseUrl, 'cipherDetails'));
+    const data = await Promise.all(results.map((cipher) =>
+        toCipherResponse(cipher, userId, baseUrl, c.env.JWT_SECRET, 'cipherDetails')));
 
     return c.json({
         data,
@@ -190,6 +395,10 @@ ciphersRoute.get('/organization-details', async (c) => {
     if (!orgUser || orgUser.status !== 2) {
         throw new NotFoundError('Organization not found.');
     }
+    const org = await db.select().from(organizations).where(eq(organizations.id, organizationId)).get();
+    if (!org || !canAccessAllOrgItems(orgUser, org)) {
+        throw new NotFoundError('Organization not found.');
+    }
 
     const orgCiphers = await db.select().from(ciphers)
         .where(eq(ciphers.organizationId, organizationId))
@@ -207,14 +416,14 @@ ciphersRoute.get('/organization-details', async (c) => {
     }
 
     const baseUrl = getBaseUrl(c);
-    const data = orgCiphers.map((cipher) => {
-        const resp = toCipherResponse(cipher, userId, baseUrl, 'cipherDetails');
+    const data = await Promise.all(orgCiphers.map(async (cipher) => {
+        const resp = await toCipherResponse(cipher, userId, baseUrl, c.env.JWT_SECRET, 'cipherDetails');
         return {
             ...resp,
             collectionIds: cipherCollectionMap[cipher.id] || [],
             object: 'cipherMiniDetails',
         };
-    });
+    }));
 
     return c.json({
         data,
@@ -246,6 +455,12 @@ ciphersRoute.get('/organization-details/assigned', async (c) => {
     if (!orgUser || orgUser.status !== 2) {
         throw new NotFoundError('Organization not found.');
     }
+    const org = await db.select().from(organizations).where(eq(organizations.id, organizationId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+    const canAccessAll = canAccessAllOrgItems(orgUser, org);
+    const allowedCollectionIds = canAccessAll
+        ? null
+        : new Set((await getCollectionAccessForOrgUser(db, orgUser.id)).map((entry) => entry.collectionId));
 
     const orgCiphers = await db.select().from(ciphers)
         .where(eq(ciphers.organizationId, organizationId))
@@ -263,13 +478,18 @@ ciphersRoute.get('/organization-details/assigned', async (c) => {
     }
 
     const baseUrl = getBaseUrl(c);
-    const data = orgCiphers.map((cipher) => {
-        const resp = toCipherResponse(cipher, userId, baseUrl, 'cipherDetails');
+    const assignedCiphers = canAccessAll
+        ? orgCiphers
+        : orgCiphers.filter((cipher) =>
+            (cipherCollectionMap[cipher.id] || []).some((collectionId) => allowedCollectionIds?.has(collectionId)));
+
+    const data = await Promise.all(assignedCiphers.map(async (cipher) => {
+        const resp = await toCipherResponse(cipher, userId, baseUrl, c.env.JWT_SECRET, 'cipherDetails');
         return {
             ...resp,
             collectionIds: cipherCollectionMap[cipher.id] || [],
         };
-    });
+    }));
 
     return c.json({
         data,
@@ -288,30 +508,19 @@ ciphersRoute.get('/:id/details', async (c) => {
     const userId = c.get('userId');
     const cipherId = c.req.param('id');
 
-    const cipher = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
-    if (!cipher) {
-        throw new NotFoundError('Cipher not found.');
-    }
+    const cipher = await getAccessibleCipher(db, cipherId, userId);
+    return c.json(await toCipherResponse(cipher, userId, getBaseUrl(c), c.env.JWT_SECRET, 'cipherDetails'));
+});
 
-    // 个人条目：必须是当前用户所有
-    if (!cipher.organizationId) {
-        if (cipher.userId !== userId) {
-            throw new NotFoundError('Cipher not found.');
-        }
-    } else {
-        // 组织条目：要求当前用户是该组织的已确认成员
-        const orgUser = await db.select().from(organizationUsers)
-            .where(and(
-                eq(organizationUsers.organizationId, cipher.organizationId),
-                eq(organizationUsers.userId, userId),
-            )).get();
-
-        if (!orgUser || orgUser.status !== 2) {
-            throw new NotFoundError('Cipher not found.');
-        }
-    }
-
-    return c.json(toCipherResponse(cipher, userId, getBaseUrl(c), 'cipherDetails'));
+/**
+ * GET /api/ciphers/:id/full-details
+ * 上游保留的 details 旧别名，官方旧客户端仍可能调用。
+ */
+ciphersRoute.get('/:id/full-details', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const cipher = await getAccessibleCipher(db, c.req.param('id'), userId);
+    return c.json(await toCipherResponse(cipher, userId, getBaseUrl(c), c.env.JWT_SECRET, 'cipherDetails'));
 });
 
 /**
@@ -324,37 +533,13 @@ ciphersRoute.get('/:id/admin', async (c) => {
     const userId = c.get('userId');
     const cipherId = c.req.param('id');
 
-    const cipher = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
-    if (!cipher || !cipher.organizationId) {
-        throw new NotFoundError('Cipher not found.');
-    }
-
-    const orgUser = await db.select().from(organizationUsers)
-        .where(and(
-            eq(organizationUsers.organizationId, cipher.organizationId),
-            eq(organizationUsers.userId, userId)
-        )).get();
-
-    if (!orgUser || orgUser.status !== 2) {
-        throw new NotFoundError('Cipher not found.');
-    }
-    // ViewAllCollections: Owner(0)/Admin(1) 或自定义权限 EditAnyCollection/DeleteAnyCollection
-    let canViewAll = orgUser.type === 0 || orgUser.type === 1;
-    if (!canViewAll && orgUser.permissions) {
-        try {
-            const perms = JSON.parse(orgUser.permissions);
-            if (perms.editAnyCollection || perms.deleteAnyCollection) canViewAll = true;
-        } catch (_) { /* ignore */ }
-    }
-    if (!canViewAll) {
-        throw new NotFoundError('Cipher not found.');
-    }
+    const cipher = await getAdminCipher(db, cipherId, userId);
 
     const cipherCollections = await db.select().from(collectionCiphers)
         .where(eq(collectionCiphers.cipherId, cipherId)).all();
     const collectionIds = cipherCollections.map(cc => cc.collectionId);
 
-    const resp = toCipherResponse(cipher, userId, getBaseUrl(c), 'cipherMiniDetails');
+    const resp = await toCipherResponse(cipher, userId, getBaseUrl(c), c.env.JWT_SECRET, 'cipherMiniDetails');
     resp.collectionIds = collectionIds;
     return c.json(resp);
 });
@@ -368,14 +553,8 @@ ciphersRoute.get('/:id', async (c) => {
     const userId = c.get('userId');
     const cipherId = c.req.param('id');
 
-    const cipher = await db.select().from(ciphers)
-        .where(and(eq(ciphers.id, cipherId), eq(ciphers.userId, userId))).get();
-
-    if (!cipher) {
-        throw new NotFoundError('Cipher not found.');
-    }
-
-    return c.json(toCipherResponse(cipher, userId, getBaseUrl(c)));
+    const cipher = await getAccessibleCipher(db, cipherId, userId);
+    return c.json(await toCipherResponse(cipher, userId, getBaseUrl(c), c.env.JWT_SECRET));
 });
 
 /**
@@ -387,11 +566,7 @@ ciphersRoute.get('/:id/events', async (c) => {
     const userId = c.get('userId');
     const cipherId = c.req.param('id');
 
-    const cipher = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
-    if (!cipher) throw new NotFoundError('Cipher not found');
-    if (cipher.userId !== userId && !cipher.organizationId) {
-        throw new NotFoundError('Cipher not found');
-    }
+    const cipher = await getEditableCipher(db, cipherId, userId);
 
     const cipherEvents = await db.select().from(events)
         .where(eq(events.cipherId, cipherId))
@@ -415,11 +590,7 @@ const uploadAttachmentHandler = async (c: any) => {
     const userId = c.get('userId');
     const cipherId = c.req.param('id');
 
-    const cipher = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
-    if (!cipher) throw new NotFoundError('Cipher not found');
-    if (cipher.userId !== userId && !cipher.organizationId) {
-        throw new NotFoundError('Cipher not found');
-    }
+    const cipher = await getEditableCipher(db, cipherId, userId);
 
     const { file, formData } = await extractFileFromRequest(c);
 
@@ -455,7 +626,7 @@ const uploadAttachmentHandler = async (c: any) => {
         null, now, contextId,
     ));
 
-    return c.json(toCipherResponse(updated!, userId, getBaseUrl(c)));
+    return c.json(await toCipherResponse(updated!, userId, getBaseUrl(c), c.env.JWT_SECRET));
 };
 
 ciphersRoute.post('/:id/attachment', uploadAttachmentHandler);
@@ -472,11 +643,7 @@ ciphersRoute.post('/:id/attachment/v2', async (c) => {
     const userId = c.get('userId');
     const cipherId = c.req.param('id');
 
-    const cipher = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
-    if (!cipher) throw new NotFoundError('Cipher not found');
-    if (cipher.userId !== userId && !cipher.organizationId) {
-        throw new NotFoundError('Cipher not found');
-    }
+    const cipher = await getEditableCipher(db, cipherId, userId);
 
     const body = await c.req.json<{
         key?: string;
@@ -507,7 +674,8 @@ ciphersRoute.post('/:id/attachment/v2', async (c) => {
     const updated = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
     const baseUrl = getBaseUrl(c);
     const isAdmin = !!body.adminRequest;
-    const cipherResp = toCipherResponse(updated!, userId, baseUrl, isAdmin ? 'cipherMiniDetails' : 'cipherDetails');
+    const cipherResp = await toCipherResponse(
+        updated!, userId, baseUrl, c.env.JWT_SECRET, isAdmin ? 'cipherMiniDetails' : 'cipherDetails');
 
     return c.json({
         attachmentId,
@@ -529,11 +697,7 @@ ciphersRoute.post('/:id/attachment/:attachmentId', async (c) => {
     const cipherId = c.req.param('id');
     const attachmentId = c.req.param('attachmentId');
 
-    const cipher = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
-    if (!cipher) throw new NotFoundError('Cipher not found');
-    if (cipher.userId !== userId && !cipher.organizationId) {
-        throw new NotFoundError('Cipher not found');
-    }
+    const cipher = await getEditableCipher(db, cipherId, userId);
 
     const attachmentsMap = cipher.attachments ? JSON.parse(cipher.attachments) : {};
     if (!attachmentsMap[attachmentId]) {
@@ -590,11 +754,7 @@ ciphersRoute.get('/:id/attachment/:attachmentId', async (c) => {
     const cipherId = c.req.param('id');
     const attachmentId = c.req.param('attachmentId');
 
-    const cipher = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
-    if (!cipher) throw new NotFoundError('Cipher not found');
-    if (cipher.userId !== userId && !cipher.organizationId) {
-        throw new NotFoundError('Cipher not found');
-    }
+    const cipher = await getAccessibleCipher(db, cipherId, userId);
 
     const attachmentsMap = cipher.attachments ? JSON.parse(cipher.attachments) : {};
     const meta = attachmentsMap[attachmentId];
@@ -602,8 +762,7 @@ ciphersRoute.get('/:id/attachment/:attachmentId', async (c) => {
         throw new NotFoundError('Attachment metadata not found.');
     }
 
-    // 使用 getBaseUrl 构建绝对下载 URL（已处理反向代理协议）
-    const downloadUrl = `${getBaseUrl(c)}/attachments/${cipherId}/${attachmentId}`;
+    const downloadUrl = await buildAttachmentDownloadUrl(getBaseUrl(c), cipherId, attachmentId, c.env.JWT_SECRET);
 
     const sizeBytes = parseInt(meta.size || '0');
     const sizeName = sizeBytes >= 1048576 ? `${(sizeBytes / 1048576).toFixed(2)} MB` :
@@ -631,11 +790,7 @@ const deleteAttachmentHandler = async (c: any) => {
     const cipherId = c.req.param('id');
     const attachmentId = c.req.param('attachmentId');
 
-    const cipher = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
-    if (!cipher) throw new NotFoundError('Cipher not found');
-    if (cipher.userId !== userId && !cipher.organizationId) {
-        throw new NotFoundError('Cipher not found');
-    }
+    const cipher = await getEditableCipher(db, cipherId, userId);
 
     const attachmentsMap = cipher.attachments ? JSON.parse(cipher.attachments) : {};
     if (!attachmentsMap[attachmentId]) {
@@ -660,13 +815,68 @@ const deleteAttachmentHandler = async (c: any) => {
     const updatedCipher = { ...cipher, attachments: updatedAttachments, revisionDate: now };
     const baseUrl = getBaseUrl(c);
     return c.json({
-        cipher: toCipherResponse(updatedCipher, userId, baseUrl, 'cipher'),
+        cipher: await toCipherResponse(updatedCipher, userId, baseUrl, c.env.JWT_SECRET, 'cipher'),
         object: 'deleteAttachment',
     }, 200);
 };
 
 ciphersRoute.delete('/:id/attachment/:attachmentId', deleteAttachmentHandler);
 ciphersRoute.delete('/:id/attachment/:attachmentId/admin', deleteAttachmentHandler);
+ciphersRoute.post('/:id/attachment/:attachmentId/delete', deleteAttachmentHandler);
+ciphersRoute.post('/:id/attachment/:attachmentId/delete-admin', deleteAttachmentHandler);
+
+/**
+ * GET /api/ciphers/attachment/download
+ * 兼容上游自托管附件下载入口。当前 Workers 的附件响应仍返回
+ * /attachments/:cipherId/:attachmentId 公共下载 URL；这里补充 query 入口。
+ */
+ciphersRoute.get('/attachment/download', async (c) => {
+    const cipherId = c.req.query('cipherId') || c.req.query('id');
+    const attachmentId = c.req.query('attachmentId');
+    if (!cipherId || !attachmentId) {
+        throw new NotFoundError('Attachment not found.');
+    }
+
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const cipher = await getAccessibleCipher(db, cipherId, userId);
+    const attachmentsMap = cipher.attachments ? JSON.parse(cipher.attachments) : {};
+    if (!attachmentsMap[attachmentId]) {
+        throw new NotFoundError('Attachment not found.');
+    }
+
+    const object = await c.env.ATTACHMENTS.get(`${cipherId}/${attachmentId}`);
+    if (!object) throw new NotFoundError('Attachment not found.');
+
+    const headers = new Headers();
+    headers.set('Content-Type', object.httpMetadata?.contentType || 'application/octet-stream');
+    headers.set('Content-Length', object.size.toString());
+    headers.set('Cache-Control', 'private, max-age=0, no-store');
+    return new Response(object.body, { headers });
+});
+
+/**
+ * POST /api/ciphers/attachment/validate/azure
+ * R2 直传不使用 Azure EventGrid；返回最小成功响应以兼容客户端回调。
+ */
+ciphersRoute.post('/attachment/validate/azure', (c) => c.json({ object: 'eventGridValidation' }));
+
+/**
+ * POST /api/ciphers/:id/attachment/:attachmentId/share
+ * 分享 cipher 时附件内容已经在原 R2 key 下；Workers 不需要复制对象。
+ */
+ciphersRoute.post('/:id/attachment/:attachmentId/share', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const cipherId = c.req.param('id');
+    const attachmentId = c.req.param('attachmentId');
+    const cipher = await getAccessibleCipher(db, cipherId, userId);
+    const attachmentsMap = cipher.attachments ? JSON.parse(cipher.attachments) : {};
+    if (!attachmentsMap[attachmentId]) {
+        throw new NotFoundError('Attachment not found.');
+    }
+    return c.body(null, 200);
+});
 
 /**
  * POST /api/ciphers
@@ -748,7 +958,7 @@ ciphersRoute.post('/', async (c) => {
         body.collectionIds || null, now, contextId,
     ));
 
-    return c.json(toCipherResponse(created!, userId, getBaseUrl(c)));
+    return c.json(await toCipherResponse(created!, userId, getBaseUrl(c), c.env.JWT_SECRET));
 });
 
 /**
@@ -809,7 +1019,57 @@ ciphersRoute.post('/create', async (c) => {
     await logEvent(c.env.DB, 1100, { userId, cipherId });
 
     const created = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
-    return c.json(toCipherResponse(created!, userId, getBaseUrl(c)));
+    return c.json(await toCipherResponse(created!, userId, getBaseUrl(c), c.env.JWT_SECRET));
+});
+
+/**
+ * POST /api/ciphers/admin
+ * 管理员创建组织 cipher。保持与普通创建相同的密文存储语义。
+ */
+ciphersRoute.post('/admin', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const body = await c.req.json<CipherRequest & { collectionIds?: string[] }>();
+
+    if (!body.organizationId) throw new BadRequestError('organizationId is required.');
+    const orgUser = await getOrgUser(db, body.organizationId, userId);
+    if (!orgUser || orgUser.status !== 2) throw new NotFoundError('Organization not found.');
+    if (!body.type || !body.name) throw new BadRequestError('Type and name are required.');
+
+    const now = new Date().toISOString();
+    const cipherId = generateUuid();
+    await db.insert(ciphers).values({
+        id: cipherId,
+        userId: null,
+        organizationId: body.organizationId,
+        type: body.type,
+        data: JSON.stringify(buildCipherData(body)),
+        favorites: JSON.stringify({}),
+        folders: JSON.stringify({}),
+        reprompt: body.reprompt ?? 0,
+        key: body.key || null,
+        creationDate: now,
+        revisionDate: now,
+    });
+
+    const collectionIds = Array.isArray(body.collectionIds) ? body.collectionIds : [];
+    const created = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
+    if (created && collectionIds.length > 0) {
+        await replaceCipherCollections(db, created, collectionIds);
+    }
+
+    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+    await logEvent(c.env.DB, 1100, { userId, cipherId, organizationId: body.organizationId });
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncCipher(
+        c.env, PushType.SyncCipherCreate, cipherId,
+        null, body.organizationId, collectionIds.length ? collectionIds : null, now, contextId,
+    ));
+
+    const response = await toCipherResponse(created!, userId, getBaseUrl(c), c.env.JWT_SECRET, 'cipherMiniDetails');
+    response.collectionIds = collectionIds;
+    return c.json(response);
 });
 
 /**
@@ -862,13 +1122,56 @@ ciphersRoute.put('/:id/collections-admin', async (c) => {
 
     const updated = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
     const baseUrl = getBaseUrl(c);
-    const resp = toCipherResponse(updated!, userId, baseUrl, 'cipherDetails');
+    const resp = await toCipherResponse(updated!, userId, baseUrl, c.env.JWT_SECRET, 'cipherDetails');
     return c.json({
         ...resp,
         collectionIds,
         object: 'cipherMiniDetails',
     });
 });
+
+const updateCipherCollectionsHandler = async (c: any, options: { admin: boolean; v2: boolean }) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const cipherId = c.req.param('id');
+    const body = await c.req.json() as { collectionIds?: string[] };
+    const collectionIds = Array.isArray(body.collectionIds) ? body.collectionIds : [];
+
+    const cipher = options.admin
+        ? await getAdminCipher(db, cipherId, userId)
+        : await getAccessibleCipher(db, cipherId, userId);
+    await replaceCipherCollections(db, cipher, collectionIds);
+
+    const now = new Date().toISOString();
+    await db.update(ciphers).set({ revisionDate: now }).where(eq(ciphers.id, cipherId));
+
+    const updated = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
+    const response = {
+        ...await toCipherResponse(
+            updated!, userId, getBaseUrl(c), c.env.JWT_SECRET,
+            options.admin ? 'cipherMiniDetails' : 'cipherDetails',
+        ),
+        collectionIds,
+    };
+
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncCipher(
+        c.env, PushType.SyncCipherUpdate, cipherId,
+        cipher.organizationId ? null : userId, cipher.organizationId || null,
+        collectionIds, now, contextId,
+    ));
+
+    if (options.v2) {
+        return c.json({ unavailable: false, cipher: response, object: 'optionalCipherDetails' });
+    }
+    return c.json(response);
+};
+
+ciphersRoute.put('/:id/collections', (c) => updateCipherCollectionsHandler(c, { admin: false, v2: false }));
+ciphersRoute.post('/:id/collections', (c) => updateCipherCollectionsHandler(c, { admin: false, v2: false }));
+ciphersRoute.put('/:id/collections_v2', (c) => updateCipherCollectionsHandler(c, { admin: false, v2: true }));
+ciphersRoute.post('/:id/collections_v2', (c) => updateCipherCollectionsHandler(c, { admin: false, v2: true }));
+ciphersRoute.post('/:id/collections-admin', (c) => updateCipherCollectionsHandler(c, { admin: true, v2: false }));
 
 /**
  * POST /api/ciphers/bulk-collections
@@ -1259,7 +1562,7 @@ ciphersRoute.put('/:id/restore', async (c) => {
         null, now, contextId,
     ));
 
-    return c.json(toCipherResponse(updated!, userId, getBaseUrl(c)));
+    return c.json(await toCipherResponse(updated!, userId, getBaseUrl(c), c.env.JWT_SECRET));
 });
 
 /**
@@ -1422,7 +1725,7 @@ ciphersRoute.put('/restore', async (c) => {
             .where(and(eq(ciphers.id, id), eq(ciphers.userId, userId)));
         await logEvent(c.env.DB, 1116, { userId, cipherId: id });
         const updated = await db.select().from(ciphers).where(eq(ciphers.id, id)).get();
-        if (updated) results.push(toCipherResponse(updated, userId, getBaseUrl(c)));
+        if (updated) results.push(await toCipherResponse(updated, userId, getBaseUrl(c), c.env.JWT_SECRET));
     }
 
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
@@ -1456,7 +1759,7 @@ ciphersRoute.put('/restore-admin', async (c) => {
             .where(and(eq(ciphers.id, id), eq(ciphers.organizationId, body.organizationId)));
         await logEvent(c.env.DB, 1116, { userId, cipherId: id, organizationId: body.organizationId });
         const updated = await db.select().from(ciphers).where(eq(ciphers.id, id)).get();
-        if (updated) results.push(toCipherResponse(updated, userId, getBaseUrl(c)));
+        if (updated) results.push(await toCipherResponse(updated, userId, getBaseUrl(c), c.env.JWT_SECRET));
     }
 
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
@@ -1468,46 +1771,62 @@ ciphersRoute.put('/restore-admin', async (c) => {
 });
 
 /**
- * PUT /api/ciphers/share
- * 对应 CiphersController.PutShareMany（批量分享到组织）
+ * PUT/POST /api/ciphers/share
+ * 对应 CiphersController PutShareMany/PostShareMany（批量分享到组织）
+ *
+ * 兼容两种客户端请求形态：
+ * - 旧形态：{ ciphers: [{ cipher, collectionIds }] }
+ * - 新 Web：{ ciphers: [cipher], collectionIds? }
  */
-ciphersRoute.put('/share', async (c) => {
+const shareManyCiphersHandler = async (c: any) => {
     const db = drizzle(c.env.DB);
     const userId = c.get('userId');
-    const body = await c.req.json<{ ciphers: Array<{ cipher: CipherRequest & { id: string; organizationId: string }; collectionIds: string[] }> }>();
+    const body = await c.req.json() as {
+        ciphers?: Array<
+            | (CipherRequest & { id?: string; organizationId?: string; collectionIds?: string[] })
+            | { cipher?: CipherRequest & { id?: string; organizationId?: string }; collectionIds?: string[] }
+        >;
+        collectionIds?: string[];
+    };
 
     const now = new Date().toISOString();
     for (const item of body.ciphers ?? []) {
-        const cipher = item.cipher;
+        const itemAny = item as any;
+        const cipher = (itemAny.cipher ?? itemAny) as CipherRequest & {
+            id?: string;
+            organizationId?: string;
+            collectionIds?: string[];
+        };
         if (!cipher.id || !cipher.organizationId) continue;
 
         const existing = await db.select().from(ciphers)
             .where(and(eq(ciphers.id, cipher.id), eq(ciphers.userId, userId))).get();
         if (!existing) continue;
 
-        const data: any = {
-            name: cipher.name,
-            notes: cipher.notes || null,
-            fields: cipher.fields || null,
-            passwordHistory: cipher.passwordHistory || null,
-        };
-        if (cipher.type === 1) data.login = cipher.login;
-        if (cipher.type === 2) data.secureNote = cipher.secureNote;
-        if (cipher.type === 3) data.card = cipher.card;
-        if (cipher.type === 4) data.identity = cipher.identity;
+        const orgUser = await getOrgUser(db, cipher.organizationId, userId);
+        if (!orgUser || orgUser.status !== 2) throw new NotFoundError('Organization not found.');
+
+        const collectionIds = Array.isArray(itemAny.collectionIds)
+            ? itemAny.collectionIds
+            : Array.isArray(cipher.collectionIds)
+                ? cipher.collectionIds
+                : Array.isArray(body.collectionIds)
+                    ? body.collectionIds
+                    : [];
+        const attachments = buildAttachmentsMap(cipher.attachments);
 
         await db.update(ciphers).set({
             organizationId: cipher.organizationId,
             userId: null,
-            data: JSON.stringify(data),
-            key: cipher.key ?? null,
+            data: JSON.stringify(buildCipherData(cipher)),
+            attachments: attachments === undefined ? existing.attachments : attachments,
+            key: cipher.key ?? existing.key,
             revisionDate: now,
         }).where(eq(ciphers.id, cipher.id));
 
-        // 添加 collection 关联
-        for (const colId of item.collectionIds ?? []) {
-            await db.insert(collectionCiphers).values({ collectionId: colId, cipherId: cipher.id }).onConflictDoNothing();
-        }
+        const updated = await db.select().from(ciphers).where(eq(ciphers.id, cipher.id)).get();
+        if (updated) await replaceCipherCollections(db, updated, collectionIds);
+        await logEvent(c.env.DB, 1101, { userId, cipherId: cipher.id, organizationId: cipher.organizationId });
     }
 
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
@@ -1516,58 +1835,10 @@ ciphersRoute.put('/share', async (c) => {
     c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncCiphers, userId, contextId));
 
     return c.json({});
-});
+};
 
-/**
- * POST /api/ciphers/share
- * 对应 CiphersController.PostShareMany（POST alias）
- */
-ciphersRoute.post('/share', async (c) => {
-    // 转发到 PUT 逻辑
-    const db = drizzle(c.env.DB);
-    const userId = c.get('userId');
-    const body = await c.req.json<{ ciphers: Array<{ cipher: CipherRequest & { id: string; organizationId: string }; collectionIds: string[] }> }>();
-
-    const now = new Date().toISOString();
-    for (const item of body.ciphers ?? []) {
-        const cipher = item.cipher;
-        if (!cipher.id || !cipher.organizationId) continue;
-
-        const existing = await db.select().from(ciphers)
-            .where(and(eq(ciphers.id, cipher.id), eq(ciphers.userId, userId))).get();
-        if (!existing) continue;
-
-        const data: any = {
-            name: cipher.name,
-            notes: cipher.notes || null,
-            fields: cipher.fields || null,
-            passwordHistory: cipher.passwordHistory || null,
-        };
-        if (cipher.type === 1) data.login = cipher.login;
-        if (cipher.type === 2) data.secureNote = cipher.secureNote;
-        if (cipher.type === 3) data.card = cipher.card;
-        if (cipher.type === 4) data.identity = cipher.identity;
-
-        await db.update(ciphers).set({
-            organizationId: cipher.organizationId,
-            userId: null,
-            data: JSON.stringify(data),
-            key: cipher.key ?? null,
-            revisionDate: now,
-        }).where(eq(ciphers.id, cipher.id));
-
-        for (const colId of item.collectionIds ?? []) {
-            await db.insert(collectionCiphers).values({ collectionId: colId, cipherId: cipher.id }).onConflictDoNothing();
-        }
-    }
-
-    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
-
-    const contextId = c.get('jwtPayload')?.device || null;
-    c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncCiphers, userId, contextId));
-
-    return c.json({});
-});
+ciphersRoute.put('/share', shareManyCiphersHandler);
+ciphersRoute.post('/share', shareManyCiphersHandler);
 
 /**
  * PUT /api/ciphers/move
@@ -1631,6 +1902,218 @@ ciphersRoute.post('/purge', async (c) => {
     c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncVault, userId, contextId));
 
     return c.body(null, 204);
+});
+
+const partialCipherHandler = async (c: any) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const cipherId = c.req.param('id');
+    const body = await c.req.json() as { folderId?: string | null; favorite?: boolean };
+
+    const existing = await getAccessibleCipher(db, cipherId, userId);
+    const now = new Date().toISOString();
+    const favorites = existing.favorites ? JSON.parse(existing.favorites) : {};
+    const folderMap = existing.folders ? JSON.parse(existing.folders) : {};
+
+    if (body.favorite !== undefined) {
+        if (body.favorite) favorites[userId] = true;
+        else delete favorites[userId];
+    }
+    if (body.folderId !== undefined) {
+        if (body.folderId) folderMap[userId] = body.folderId;
+        else delete folderMap[userId];
+    }
+
+    await db.update(ciphers).set({
+        favorites: JSON.stringify(favorites),
+        folders: JSON.stringify(folderMap),
+        revisionDate: now,
+    }).where(eq(ciphers.id, cipherId));
+    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+
+    const updated = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncCipher(
+        c.env, PushType.SyncCipherUpdate, cipherId,
+        existing.organizationId ? null : userId, existing.organizationId || null,
+        null, now, contextId,
+    ));
+    return c.json(await toCipherResponse(updated!, userId, getBaseUrl(c), c.env.JWT_SECRET));
+};
+
+ciphersRoute.put('/:id/partial', partialCipherHandler);
+ciphersRoute.post('/:id/partial', partialCipherHandler);
+
+const adminUpdateCipherHandler = async (c: any) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const cipherId = c.req.param('id');
+    const body = await c.req.json() as CipherRequest & { collectionIds?: string[] };
+
+    const existing = await getAdminCipher(db, cipherId, userId);
+    const now = new Date().toISOString();
+    await db.update(ciphers).set({
+        type: body.type ?? existing.type,
+        data: JSON.stringify(buildCipherData(body)),
+        reprompt: body.reprompt ?? existing.reprompt,
+        key: body.key !== undefined ? body.key : existing.key,
+        revisionDate: now,
+    }).where(eq(ciphers.id, cipherId));
+
+    const collectionIds = Array.isArray(body.collectionIds) ? body.collectionIds : null;
+    if (collectionIds) {
+        await replaceCipherCollections(db, existing, collectionIds);
+    }
+
+    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+    await logEvent(c.env.DB, 1101, { userId, cipherId, organizationId: existing.organizationId ?? undefined });
+
+    const updated = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncCipher(
+        c.env, PushType.SyncCipherUpdate, cipherId,
+        null, existing.organizationId, collectionIds, now, contextId,
+    ));
+    return c.json(await toCipherResponse(updated!, userId, getBaseUrl(c), c.env.JWT_SECRET, 'cipherMiniDetails'));
+};
+
+ciphersRoute.put('/:id/admin', adminUpdateCipherHandler);
+ciphersRoute.post('/:id/admin', adminUpdateCipherHandler);
+
+const shareCipherHandler = async (c: any) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const cipherId = c.req.param('id');
+    const body = await c.req.json() as { cipher?: CipherRequest & { id?: string; organizationId?: string }; collectionIds?: string[] };
+    const cipherBody = body.cipher ?? (body as any);
+    if (!cipherBody.organizationId) throw new BadRequestError('organizationId is required.');
+
+    const existing = await db.select().from(ciphers)
+        .where(and(eq(ciphers.id, cipherId), eq(ciphers.userId, userId))).get();
+    if (!existing) throw new NotFoundError('Cipher not found.');
+    const orgUser = await getOrgUser(db, cipherBody.organizationId, userId);
+    if (!orgUser || orgUser.status !== 2) throw new NotFoundError('Organization not found.');
+
+    const now = new Date().toISOString();
+    await db.update(ciphers).set({
+        organizationId: cipherBody.organizationId,
+        userId: null,
+        data: JSON.stringify(buildCipherData(cipherBody)),
+        key: cipherBody.key ?? existing.key,
+        revisionDate: now,
+    }).where(eq(ciphers.id, cipherId));
+
+    const updated = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
+    const collectionIds = Array.isArray(body.collectionIds) ? body.collectionIds : [];
+    if (updated) await replaceCipherCollections(db, updated, collectionIds);
+
+    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncCipher(
+        c.env, PushType.SyncCipherUpdate, cipherId,
+        null, cipherBody.organizationId, collectionIds, now, contextId,
+    ));
+
+    return c.json(await toCipherResponse(updated!, userId, getBaseUrl(c), c.env.JWT_SECRET));
+};
+
+ciphersRoute.put('/:id/share', shareCipherHandler);
+ciphersRoute.post('/:id/share', shareCipherHandler);
+
+ciphersRoute.post('/move', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const body = await c.req.json<{ ids: string[]; folderId: string | null }>();
+
+    const now = new Date().toISOString();
+    for (const id of body.ids ?? []) {
+        const cipher = await db.select().from(ciphers)
+            .where(and(eq(ciphers.id, id), eq(ciphers.userId, userId))).get();
+        if (!cipher) continue;
+        const folderMap = cipher.folders ? JSON.parse(cipher.folders) : {};
+        if (body.folderId) folderMap[userId] = body.folderId;
+        else delete folderMap[userId];
+        await db.update(ciphers).set({ folders: JSON.stringify(folderMap), revisionDate: now })
+            .where(eq(ciphers.id, id));
+    }
+
+    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncCiphers, userId, contextId));
+    return c.json(null, 200);
+});
+
+ciphersRoute.post('/:id/delete', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const cipherId = c.req.param('id');
+    const existing = await db.select().from(ciphers)
+        .where(and(eq(ciphers.id, cipherId), eq(ciphers.userId, userId))).get();
+    if (!existing) throw new NotFoundError('Cipher not found.');
+    if (existing.attachments) {
+        const attachmentsMap = JSON.parse(existing.attachments);
+        for (const attachmentId of Object.keys(attachmentsMap)) {
+            await c.env.ATTACHMENTS.delete(`${cipherId}/${attachmentId}`);
+        }
+    }
+    await db.delete(collectionCiphers).where(eq(collectionCiphers.cipherId, cipherId));
+    await db.delete(ciphers).where(eq(ciphers.id, cipherId));
+    const now = new Date().toISOString();
+    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+    await logEvent(c.env.DB, 1102, { userId, cipherId });
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncCipher(c.env, PushType.SyncCipherDelete, cipherId, userId, null, null, now, contextId));
+    return c.body(null, 204);
+});
+
+ciphersRoute.post('/:id/delete-admin', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const cipherId = c.req.param('id');
+    const existing = await getAdminCipher(db, cipherId, userId);
+    if (existing.attachments) {
+        const attachmentsMap = JSON.parse(existing.attachments);
+        for (const attachmentId of Object.keys(attachmentsMap)) {
+            await c.env.ATTACHMENTS.delete(`${cipherId}/${attachmentId}`);
+        }
+    }
+    await db.delete(collectionCiphers).where(eq(collectionCiphers.cipherId, cipherId));
+    await db.delete(ciphers).where(eq(ciphers.id, cipherId));
+    const now = new Date().toISOString();
+    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+    await logEvent(c.env.DB, 1102, { userId, cipherId, organizationId: existing.organizationId ?? undefined });
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncCipher(c.env, PushType.SyncCipherDelete, cipherId, null, existing.organizationId, null, now, contextId));
+    return c.body(null, 204);
+});
+
+ciphersRoute.put('/:id/delete-admin', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const cipherId = c.req.param('id');
+    const existing = await getAdminCipher(db, cipherId, userId);
+    const now = new Date().toISOString();
+    await db.update(ciphers).set({ deletedDate: now, revisionDate: now }).where(eq(ciphers.id, cipherId));
+    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+    await logEvent(c.env.DB, 1115, { userId, cipherId, organizationId: existing.organizationId ?? undefined });
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncCipher(c.env, PushType.SyncCipherDelete, cipherId, null, existing.organizationId, null, now, contextId));
+    return c.body(null, 204);
+});
+
+ciphersRoute.put('/:id/restore-admin', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const cipherId = c.req.param('id');
+    const existing = await getAdminCipher(db, cipherId, userId);
+    const now = new Date().toISOString();
+    await db.update(ciphers).set({ deletedDate: null, revisionDate: now }).where(eq(ciphers.id, cipherId));
+    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+    await logEvent(c.env.DB, 1116, { userId, cipherId, organizationId: existing.organizationId ?? undefined });
+    const updated = await db.select().from(ciphers).where(eq(ciphers.id, cipherId)).get();
+    const contextId = c.get('jwtPayload')?.device || null;
+    c.executionCtx.waitUntil(pushSyncCipher(c.env, PushType.SyncCipherUpdate, cipherId, null, existing.organizationId, null, now, contextId));
+    return c.json(await toCipherResponse(updated!, userId, getBaseUrl(c), c.env.JWT_SECRET, 'cipherMiniDetails'));
 });
 
 // ==================== 通配符 /:id 路由（必须在所有静态路由之后注册） ====================
@@ -1698,7 +2181,7 @@ ciphersRoute.post('/:id', async (c) => {
         null, now, contextId,
     ));
 
-    return c.json(toCipherResponse(updated!, userId, getBaseUrl(c)));
+    return c.json(await toCipherResponse(updated!, userId, getBaseUrl(c), c.env.JWT_SECRET));
 });
 
 /**
@@ -1891,7 +2374,7 @@ ciphersRoute.put('/:id', async (c) => {
         null, now, contextId,
     ));
 
-    return c.json(toCipherResponse(updated!, userId, getBaseUrl(c)));
+    return c.json(await toCipherResponse(updated!, userId, getBaseUrl(c), c.env.JWT_SECRET));
 });
 
 /**
@@ -1920,7 +2403,7 @@ ciphersRoute.put('/:id/archive', async (c) => {
         null, now, contextId,
     ));
 
-    return c.json(toCipherResponse(updated!, userId, getBaseUrl(c)));
+    return c.json(await toCipherResponse(updated!, userId, getBaseUrl(c), c.env.JWT_SECRET));
 });
 
 /**
@@ -1961,7 +2444,7 @@ ciphersRoute.put('/archive', async (c) => {
 
     const baseUrl = getBaseUrl(c);
     return c.json({
-        data: results.map(r => toCipherResponse(r, userId, baseUrl)),
+        data: await Promise.all(results.map(r => toCipherResponse(r, userId, baseUrl, c.env.JWT_SECRET))),
         object: 'list',
         continuationToken: null,
     });
@@ -1993,7 +2476,7 @@ ciphersRoute.put('/:id/unarchive', async (c) => {
         null, now, contextId,
     ));
 
-    return c.json(toCipherResponse(updated!, userId, getBaseUrl(c)));
+    return c.json(await toCipherResponse(updated!, userId, getBaseUrl(c), c.env.JWT_SECRET));
 });
 
 /**
@@ -2034,7 +2517,7 @@ ciphersRoute.put('/unarchive', async (c) => {
 
     const baseUrl = getBaseUrl(c);
     return c.json({
-        data: results.map(r => toCipherResponse(r, userId, baseUrl)),
+        data: await Promise.all(results.map(r => toCipherResponse(r, userId, baseUrl, c.env.JWT_SECRET))),
         object: 'list',
         continuationToken: null,
     });

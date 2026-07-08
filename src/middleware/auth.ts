@@ -4,6 +4,9 @@
  */
 
 import { Context, MiddlewareHandler } from 'hono';
+import { drizzle } from 'drizzle-orm/d1';
+import { eq } from 'drizzle-orm';
+import { users } from '../db/schema';
 import type { Bindings, Variables, JwtPayload } from '../types';
 
 type AppContext = Context<{ Bindings: Bindings; Variables: Variables }>;
@@ -16,8 +19,19 @@ export async function signJwt(
     secret: string,
     expiresInSeconds: number
 ): Promise<string> {
+    return signJwtClaims({ ...payload }, secret, expiresInSeconds);
+}
+
+/**
+ * JWT 签发 - 用于非用户 token（例如 Send access token）。
+ */
+export async function signJwtClaims(
+    payload: Record<string, unknown>,
+    secret: string,
+    expiresInSeconds: number
+): Promise<string> {
     const now = Math.floor(Date.now() / 1000);
-    const fullPayload: JwtPayload = {
+    const fullPayload = {
         ...payload,
         iss: 'bitwarden-workers',
         iat: now,
@@ -90,8 +104,20 @@ export const authMiddleware: MiddlewareHandler<{
         return c.json({ message: 'Unauthorized' }, 401);
     }
 
+    const db = drizzle(c.env.DB);
+    const user = await db.select({
+        id: users.id,
+        email: users.email,
+        securityStamp: users.securityStamp,
+    }).from(users).where(eq(users.id, payload.sub)).get();
+    if (!user || user.securityStamp !== payload.sstamp) {
+        const requestId = c.get('requestId') || 'unknown';
+        console.log(`[AUTH ${requestId}] Security stamp mismatch or missing user`);
+        return c.json({ message: 'Unauthorized' }, 401);
+    }
+
     c.set('userId', payload.sub);
-    c.set('email', payload.email);
+    c.set('email', user.email);
     c.set('jwtPayload', payload);
 
     const requestId = c.get('requestId') || 'unknown';

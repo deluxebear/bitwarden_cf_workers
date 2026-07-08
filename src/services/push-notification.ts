@@ -109,6 +109,32 @@ async function pushToAnonymousToken(
 type HubEnv = { NOTIFICATION_HUB: DurableObjectNamespace };
 
 /**
+ * 通用推送通知。
+ * 用于 Push relay 与 Notification Center 这类动态 payload 的端点。
+ */
+export async function pushNotification(
+    env: HubEnv,
+    target: 'user' | 'organization',
+    targetId: string,
+    type: PushType,
+    payload: unknown,
+    contextId: string | null,
+): Promise<void> {
+    const data: PushNotificationData<unknown> = {
+        Type: type,
+        Payload: payload,
+        ContextId: contextId,
+    };
+
+    if (target === 'user') {
+        await pushToUser(env, targetId, data, contextId);
+        return;
+    }
+
+    await pushToOrganization(env, targetId, data, contextId);
+}
+
+/**
  * Cipher 同步通知
  * 对应 PushSyncCipherCreateAsync / PushSyncCipherUpdateAsync / PushSyncCipherDeleteAsync
  */

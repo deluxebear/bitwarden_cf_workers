@@ -39,6 +39,22 @@ export type Bindings = {
      */
     SIGNUPS_ALLOWED?: string;
     /**
+     * 邮件投递模式：
+     * "disabled" - 禁用邮件；除非 EMAIL_RETURN_TOKENS=true，否则相关接口返回明确错误
+     * "log"      - 本地开发默认，token 写入日志并在响应中回显
+     * "provider" - POST 到 EMAIL_PROVIDER_ENDPOINT
+     */
+    EMAIL_MODE?: string;
+    /**
+     * 本地/测试兼容：为 true 时在响应中回显邮件 token。
+     */
+    EMAIL_RETURN_TOKENS?: string;
+    /**
+     * EMAIL_MODE=provider 时的通用邮件 provider webhook。
+     */
+    EMAIL_PROVIDER_ENDPOINT?: string;
+    EMAIL_PROVIDER_TOKEN?: string;
+    /**
      * Icons 成功缓存 TTL（秒），默认 1209600（14天）
      */
     ICONS_CACHE_SUCCESS_TTL_SECONDS?: string;
@@ -50,6 +66,20 @@ export type Bindings = {
      * 最大可缓存 icon 大小（字节），默认 51200（50KB）
      */
     ICONS_MAX_IMAGE_BYTES?: string;
+    /**
+     * Email 2FA 投递方式。当前 Workers 内置实现仅支持 "console"：
+     * 生成验证码后写入日志，供自托管管理员接入真实邮件服务前调试。
+     */
+    TWO_FACTOR_EMAIL_DELIVERY?: string;
+    /**
+     * 兼容开关：设为 "true" 时等价于 TWO_FACTOR_EMAIL_DELIVERY=console。
+     */
+    TWO_FACTOR_EMAIL_DEBUG?: string;
+    /**
+     * Notification Center 内部 /send 入口的 Bearer token。
+     * 未配置时 /send 返回 404，避免公开暴露通知投递入口。
+     */
+    NOTIFICATIONS_SEND_TOKEN?: string;
 };
 
 // Hono 应用变量
@@ -135,6 +165,7 @@ export enum GrantType {
     RefreshToken = 'refresh_token',
     ClientCredentials = 'client_credentials',
     WebAuthn = 'webauthn',
+    SendAccess = 'send_access',
 }
 
 // ------------- API 请求/响应模型 -------------
@@ -274,6 +305,7 @@ export interface CipherRequest {
     sshKey?: any;
     fields?: any[];
     passwordHistory?: any[];
+    attachments?: any[] | null;
     key?: string;
     collectionIds?: string[];
 }
@@ -397,7 +429,7 @@ export interface SendResponse {
     name: string | null;
     notes: string | null;
     text?: { text: string; hidden: boolean } | null;
-    file?: { id: string | null; fileName: string | null; size: number | null; sizeName: string | null } | null;
+    file?: { id: string | null; fileName: string | null; size: string | null; sizeName: string | null } | null;
     key: string | null;
     maxAccessCount: number | null;
     accessCount: number;
@@ -415,7 +447,7 @@ export interface SendAccessResponse {
     type: SendType;
     name: string | null;
     text?: { text: string; hidden: boolean } | null;
-    file?: { id: string | null; fileName: string | null; size: number | null; sizeName: string | null } | null;
+    file?: { id: string | null; fileName: string | null; size: string | null; sizeName: string | null } | null;
     key: string | null;
     expirationDate: string | null;
     creatorIdentifier?: string;

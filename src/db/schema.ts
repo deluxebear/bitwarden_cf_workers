@@ -95,12 +95,37 @@ export const devices = sqliteTable('devices', {
     encryptedUserKey: text('encrypted_user_key'),
     encryptedPublicKey: text('encrypted_public_key'),
     encryptedPrivateKey: text('encrypted_private_key'),
+    webPushAuth: text('web_push_auth'), // JSON: { endpoint, p256dh, auth, organizationIds }
     active: integer('active', { mode: 'boolean' }).notNull().default(true),
     creationDate: text('creation_date').notNull(),
     revisionDate: text('revision_date').notNull(),
 }, (table) => [
     index('idx_devices_user_id').on(table.userId),
     index('idx_devices_identifier').on(table.identifier),
+]);
+
+// ==================== Notifications ====================
+// 对应 Core/NotificationCenter 的 Notification + NotificationStatus。
+// Workers 版本按用户展开存储，便于 D1 上直接维护每个用户的 read/delete 状态。
+export const notifications = sqliteTable('notifications', {
+    id: text('id').primaryKey(),
+    userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+    organizationId: text('organization_id'),
+    priority: integer('priority').notNull().default(0),
+    global: integer('global', { mode: 'boolean' }).notNull().default(false),
+    clientType: integer('client_type').notNull().default(0),
+    title: text('title'),
+    body: text('body'),
+    taskId: text('task_id'),
+    data: text('data'),
+    readDate: text('read_date'),
+    deletedDate: text('deleted_date'),
+    creationDate: text('creation_date').notNull(),
+    revisionDate: text('revision_date').notNull(),
+}, (table) => [
+    index('idx_notifications_user_id').on(table.userId),
+    index('idx_notifications_org_id').on(table.organizationId),
+    index('idx_notifications_revision_date').on(table.revisionDate),
 ]);
 
 // ==================== Refresh Tokens ====================
@@ -115,6 +140,22 @@ export const refreshTokens = sqliteTable('refresh_tokens', {
 }, (table) => [
     index('idx_refresh_tokens_user_id').on(table.userId),
     index('idx_refresh_tokens_token_hash').on(table.tokenHash),
+]);
+
+// ==================== Verification Tokens ====================
+// 一次性邮件/设备验证 token。明文只通过邮件或本地开发日志输出，数据库只保存 hash。
+export const verificationTokens = sqliteTable('verification_tokens', {
+    id: text('id').primaryKey(),
+    userId: text('user_id').references(() => users.id, { onDelete: 'cascade' }),
+    email: text('email').notNull(),
+    type: text('type').notNull(),
+    tokenHash: text('token_hash').notNull(),
+    expiresAt: text('expires_at').notNull(),
+    usedAt: text('used_at'),
+    creationDate: text('creation_date').notNull(),
+}, (table) => [
+    index('idx_verification_tokens_email_type').on(table.email, table.type),
+    uniqueIndex('idx_verification_tokens_hash').on(table.tokenHash),
 ]);
 
 // ==================== Sends ====================
@@ -180,6 +221,7 @@ export const organizations = sqliteTable('organizations', {
     useOrganizationDomains: integer('use_organization_domains', { mode: 'boolean' }).default(false),
     useAdminSponsoredFamilies: integer('use_admin_sponsored_families', { mode: 'boolean' }).default(false),
     useAutomaticUserConfirmation: integer('use_automatic_user_confirmation', { mode: 'boolean' }).default(false),
+    useInviteLinks: integer('use_invite_links', { mode: 'boolean' }).default(false),
     useDisableSmAdsForUsers: integer('use_disable_sm_ads_for_users', { mode: 'boolean' }).default(false),
     usePhishingBlocker: integer('use_phishing_blocker', { mode: 'boolean' }).default(false),
     useMyItems: integer('use_my_items', { mode: 'boolean' }).default(true),
@@ -204,6 +246,52 @@ export const organizations = sqliteTable('organizations', {
     creationDate: text('creation_date').notNull(),
     revisionDate: text('revision_date').notNull(),
 });
+
+// ==================== Organization Invite Links ====================
+// 对应 Core/AdminConsole/Entities/OrganizationInviteLink.cs
+export const organizationInviteLinks = sqliteTable('organization_invite_links', {
+    id: text('id').primaryKey(),
+    code: text('code').notNull(),
+    organizationId: text('organization_id').notNull().references(() => organizations.id, { onDelete: 'cascade' }),
+    allowedDomains: text('allowed_domains').notNull(),
+    invite: text('invite').notNull(),
+    supportsConfirmation: integer('supports_confirmation', { mode: 'boolean' }).notNull().default(false),
+    creationDate: text('creation_date').notNull(),
+    revisionDate: text('revision_date').notNull(),
+}, (table) => [
+    uniqueIndex('idx_org_invite_links_code').on(table.code),
+    uniqueIndex('idx_org_invite_links_org_id').on(table.organizationId),
+]);
+
+// ==================== Organization Domains ====================
+// 对应 Core/Entities/OrganizationDomain.cs
+export const organizationDomains = sqliteTable('organization_domains', {
+    id: text('id').primaryKey(),
+    organizationId: text('organization_id').notNull().references(() => organizations.id, { onDelete: 'cascade' }),
+    txt: text('txt').notNull(),
+    domainName: text('domain_name').notNull(),
+    creationDate: text('creation_date').notNull(),
+    nextRunDate: text('next_run_date').notNull(),
+    jobRunCount: integer('job_run_count').notNull().default(0),
+    verifiedDate: text('verified_date'),
+    lastCheckedDate: text('last_checked_date'),
+}, (table) => [
+    index('idx_org_domains_org_id').on(table.organizationId),
+    uniqueIndex('idx_org_domains_org_domain').on(table.organizationId, table.domainName),
+]);
+
+// ==================== SSO Configs ====================
+// 对应 Core/Auth/Entities/SsoConfig.cs
+export const ssoConfigs = sqliteTable('sso_configs', {
+    id: text('id').primaryKey(),
+    organizationId: text('organization_id').notNull().references(() => organizations.id, { onDelete: 'cascade' }),
+    enabled: integer('enabled', { mode: 'boolean' }).notNull().default(false),
+    data: text('data').notNull(),
+    creationDate: text('creation_date').notNull(),
+    revisionDate: text('revision_date').notNull(),
+}, (table) => [
+    uniqueIndex('idx_sso_configs_org_id').on(table.organizationId),
+]);
 
 // ==================== Organization Licenses ====================
 // 用于持久化自建组织 license，保持与官方 OrganizationLicense 行为一致
@@ -340,6 +428,7 @@ export const collectionGroups = sqliteTable('collection_groups', {
 export const authRequests = sqliteTable('auth_requests', {
     id: text('id').primaryKey(), // UUID
     userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+    organizationId: text('organization_id').references(() => organizations.id, { onDelete: 'cascade' }),
     type: integer('type').notNull().default(0), // 0=AuthenticateAndUnlock, 1=Unlock, 2=AdminApproval
     requestDeviceIdentifier: text('request_device_identifier').notNull(),
     requestDeviceType: integer('request_device_type').notNull(),
@@ -355,6 +444,7 @@ export const authRequests = sqliteTable('auth_requests', {
     authenticationDate: text('authentication_date'),
 }, (table) => [
     index('idx_auth_requests_user_id').on(table.userId),
+    index('idx_auth_requests_organization_id').on(table.organizationId),
 ]);
 
 // ==================== WebAuthn Credentials ====================
@@ -403,6 +493,7 @@ export const organizationReports = sqliteTable('organization_reports', {
     contentEncryptionKey: text('content_encryption_key').notNull().default(''),
     summaryData: text('summary_data'),
     applicationData: text('application_data'),
+    reportFile: text('report_file'),
     applicationCount: integer('application_count'),
     applicationAtRiskCount: integer('application_at_risk_count'),
     criticalApplicationCount: integer('critical_application_count'),
@@ -421,9 +512,25 @@ export const organizationReports = sqliteTable('organization_reports', {
     index('idx_org_reports_org_id').on(table.organizationId),
 ]);
 
+// ==================== Password Health Report Applications ====================
+// 对应 Core/Dirt/Entities/PasswordHealthReportApplication.cs
+export const passwordHealthReportApplications = sqliteTable('password_health_report_applications', {
+    id: text('id').primaryKey(),
+    organizationId: text('organization_id').notNull().references(() => organizations.id, { onDelete: 'cascade' }),
+    uri: text('uri'),
+    creationDate: text('creation_date').notNull(),
+    revisionDate: text('revision_date').notNull(),
+}, (table) => [
+    index('idx_pwd_health_apps_org_id').on(table.organizationId),
+]);
+
 // ==================== 推断类型（供路由等使用，避免 any） ====================
 export type OrganizationUserRow = typeof organizationUsers.$inferSelect;
 export type OrganizationRow = typeof organizations.$inferSelect;
 export type UserRow = typeof users.$inferSelect;
 export type PolicyRow = typeof policies.$inferSelect;
 export type OrganizationReportRow = typeof organizationReports.$inferSelect;
+export type PasswordHealthReportApplicationRow = typeof passwordHealthReportApplications.$inferSelect;
+export type OrganizationInviteLinkRow = typeof organizationInviteLinks.$inferSelect;
+export type OrganizationDomainRow = typeof organizationDomains.$inferSelect;
+export type SsoConfigRow = typeof ssoConfigs.$inferSelect;

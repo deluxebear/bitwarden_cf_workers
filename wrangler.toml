@@ -16,7 +16,11 @@ ICONS_MAX_IMAGE_BYTES = "51200"
 # 设为 "true" 时，邀请链接一律进入「注册」页，被邀请人需设置主密钥（适合自建、该邮箱尚未注册或希望走注册流程）
 # FORCE_INVITE_REGISTER = "true"
 # 控制开放注册行为: "true" 始终允许 | "false" 始终禁止 | "auto" 无用户时允许，有用户后关闭（默认）
-# SIGNUPS_ALLOWED = "auto"
+SIGNUPS_ALLOWED = "true"
+# 本地开发默认：邮件 token 写入 wrangler 日志，并在响应中回显，便于 Web 注册/邮箱变更手测。
+# 生产应改为 EMAIL_MODE="provider" 并移除 EMAIL_RETURN_TOKENS。
+EMAIL_MODE = "log"
+EMAIL_RETURN_TOKENS = "true"
 
 [[d1_databases]]
 binding = "DB"
