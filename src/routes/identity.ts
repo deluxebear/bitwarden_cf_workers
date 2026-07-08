@@ -27,10 +27,12 @@ import {
 } from '../services/email';
 import { AuthRequestType } from '../types';
 import type { Bindings, Variables, KdfType, PreloginRequest, PreloginResponse, RegisterRequest, TokenRequest, TokenResponse } from '../types';
+import type { OrganizationUserRow } from '../db/schema';
 import {
     assertEmailNotBlockedByClaimedDomain,
     getMasterPasswordPolicyForUser,
 } from '../services/policy-requirements';
+import { getDeviceTypeFromRequest } from './events';
 
 const identity = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 const SEND_ACCESS_TOKEN_LIFETIME_SECONDS = 15 * 60;
@@ -89,6 +91,30 @@ async function getValidRegisterFinishInvite(
     }
 
     return orgUser;
+}
+
+async function acceptRegisterFinishInvite(
+    db: D1Db,
+    c: any,
+    invite: OrganizationUserRow,
+    userId: string,
+    now: string,
+) {
+    await db.update(organizationUsers).set({
+        userId,
+        status: 1, // Accepted
+        revisionDate: now,
+    }).where(and(
+        eq(organizationUsers.id, invite.id),
+        eq(organizationUsers.status, 0),
+    ));
+
+    await logEvent(c.env.DB, 1501, {
+        userId,
+        organizationId: invite.organizationId,
+        organizationUserId: invite.id,
+        deviceType: getDeviceTypeFromRequest(c),
+    });
 }
 
 async function attachMasterPasswordPolicy(db: D1Db, userId: string, response: Record<string, any>): Promise<void> {
@@ -374,11 +400,8 @@ identity.post('/accounts/register/finish', async (c) => {
     const existingUser = await db.select().from(users).where(eq(users.email, email)).get();
 
     if (existingUser) {
-        // 该邮箱已存在：仅当存在待接受的组织邀请时允许「完成注册」（用新密码/密钥更新）
-        const pendingInvite = registerInvite ?? await db.select().from(organizationUsers)
-            .where(and(eq(organizationUsers.email, email), eq(organizationUsers.status, 0)))
-            .get();
-        if (!pendingInvite) {
+        // 该邮箱已存在：仅当请求携带有效组织邀请 token 时允许「完成注册」（用新密码/密钥更新）。
+        if (!registerInvite) {
             throw new BadRequestError('Email is already registered.');
         }
         if (registerInvite?.userId && registerInvite.userId !== existingUser.id) {
@@ -399,6 +422,8 @@ identity.post('/accounts/register/finish', async (c) => {
             emailVerified: true,
             name: registration.name ?? existingUser.name,
         }).where(eq(users.id, existingUser.id));
+
+        await acceptRegisterFinishInvite(db, c, registerInvite, existingUser.id, now);
         return c.json(null, 200);
     }
 
@@ -437,6 +462,10 @@ identity.post('/accounts/register/finish', async (c) => {
         creationDate: now,
         revisionDate: now,
     });
+
+    if (registerInvite) {
+        await acceptRegisterFinishInvite(db, c, registerInvite, userId, now);
+    }
 
     return c.json(null, 200);
 });
