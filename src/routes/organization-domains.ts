@@ -27,6 +27,16 @@ import { getDeviceTypeFromRequest } from './events';
 const organizationDomainsRoutes = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 type D1Db = ReturnType<typeof drizzle>;
 type OrgDomainContext = Context<{ Bindings: Bindings; Variables: Variables }>;
+type Fetcher = typeof fetch;
+
+interface DnsJsonAnswer {
+    type?: number;
+    data?: string;
+}
+
+interface DnsJsonResponse {
+    Answer?: DnsJsonAnswer[];
+}
 
 interface OrganizationUserPermissions {
     manageSso?: boolean;
@@ -99,6 +109,67 @@ function toOrganizationDomainResponse(domain: OrganizationDomainRow) {
         lastCheckedDate: domain.lastCheckedDate ?? null,
         object: 'organizationDomain',
     };
+}
+
+function normalizeDnsTxtData(data: string): string {
+    const chunks = data.match(/"((?:\\.|[^"\\])*)"/g);
+    if (!chunks) return data.trim();
+
+    return chunks
+        .map((chunk) => chunk.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, '\\'))
+        .join('')
+        .trim();
+}
+
+export function extractDnsTxtRecords(response: unknown): string[] {
+    if (!response || typeof response !== 'object') return [];
+
+    const answers = (response as DnsJsonResponse).Answer;
+    if (!Array.isArray(answers)) return [];
+
+    return answers
+        .filter((answer) => answer.type === 16 && typeof answer.data === 'string')
+        .map((answer) => normalizeDnsTxtData(answer.data as string))
+        .filter((txt) => txt.length > 0);
+}
+
+export async function resolveDnsTxtRecords(
+    domainName: string,
+    fetcher: Fetcher = fetch,
+    resolverUrl = 'https://cloudflare-dns.com/dns-query',
+): Promise<string[]> {
+    const url = new URL(resolverUrl);
+    url.searchParams.set('name', domainName);
+    url.searchParams.set('type', 'TXT');
+
+    let response: Response;
+    try {
+        response = await fetcher(url.toString(), {
+            headers: { accept: 'application/dns-json' },
+        });
+    } catch {
+        throw new BadRequestError('Unable to check DNS TXT records.');
+    }
+
+    if (!response.ok) {
+        throw new BadRequestError('Unable to check DNS TXT records.');
+    }
+
+    try {
+        return extractDnsTxtRecords(await response.json());
+    } catch {
+        throw new BadRequestError('Unable to check DNS TXT records.');
+    }
+}
+
+export function dnsTxtRecordsContainToken(records: string[], expectedTxt: string): boolean {
+    return records.some((record) => record === expectedTxt);
+}
+
+async function verifyDnsTxtRecord(c: OrgDomainContext, domain: OrganizationDomainRow): Promise<boolean> {
+    const resolverUrl = (c.env as { DNS_RESOLVER_URL?: string }).DNS_RESOLVER_URL?.trim();
+    const records = await resolveDnsTxtRecords(domain.domainName, fetch, resolverUrl || undefined);
+    return dnsTxtRecordsContainToken(records, domain.txt);
 }
 
 function getRequestString(body: Record<string, unknown>, ...keys: string[]): string | null {
@@ -402,21 +473,27 @@ organizationDomainsRoutes.post('/:id/domain/:domainId/verify', async (c) => {
         .get();
     if (!domain) throw new NotFoundError('Organization domain not found.');
 
+    const domainVerified = await verifyDnsTxtRecord(c, domain);
     const now = new Date().toISOString();
-    await db.update(organizationDomains).set({
-        verifiedDate: domain.verifiedDate ?? now,
-        lastCheckedDate: now,
-        jobRunCount: Math.min((domain.jobRunCount ?? 0) + 1, 3),
-    }).where(eq(organizationDomains.id, domain.id));
+    await db
+        .update(organizationDomains)
+        .set({
+            verifiedDate: domainVerified ? (domain.verifiedDate ?? now) : domain.verifiedDate,
+            lastCheckedDate: now,
+            jobRunCount: Math.min((domain.jobRunCount ?? 0) + 1, 3),
+        })
+        .where(eq(organizationDomains.id, domain.id));
 
     const verified = await db.select().from(organizationDomains).where(eq(organizationDomains.id, domain.id)).get();
     if (!verified) throw new NotFoundError('Organization domain not found after verification.');
 
-    await logEvent(c.env.DB, 2002, {
-        organizationId: orgId,
-        actingUserId: userId,
-        deviceType: getDeviceTypeFromRequest(c),
-    });
+    if (domainVerified) {
+        await logEvent(c.env.DB, 2002, {
+            organizationId: orgId,
+            actingUserId: userId,
+            deviceType: getDeviceTypeFromRequest(c),
+        });
+    }
 
     return c.json(toOrganizationDomainResponse(verified));
 });
