@@ -4207,6 +4207,11 @@ function toPolicyResponse(p: PolicyRow) {
     };
 }
 
+function parsePolicyData(data: string | null | undefined): Record<string, unknown> {
+    if (!data) return {};
+    try { return JSON.parse(data); } catch { return {}; }
+}
+
 /**
  * 对应 PolicyStatusResponseModel（含 canToggleState，不含 id/revisionDate）
  * 用于 GET /:id/policies/:type 端点
@@ -4214,14 +4219,12 @@ function toPolicyResponse(p: PolicyRow) {
 function toPolicyStatusResponse(
     orgId: string,
     policyType: number,
-    policy: PolicyRow | undefined,
+    policy: PolicyRecord | undefined,
     allPolicies: PolicyRecord[],
 ) {
-    let data: Record<string, unknown> = {};
-    if (policy?.data) {
-        try { data = JSON.parse(policy.data); } catch { /* ignore */ }
-    }
+    const data = parsePolicyData(policy?.data);
     const enabled = policy?.enabled ?? false;
+    const canToggleState = canTogglePolicyState(policyType, enabled, allPolicies);
     return {
         organizationId: orgId,
         OrganizationId: orgId,
@@ -4231,10 +4234,35 @@ function toPolicyStatusResponse(
         Data: data,
         enabled,
         Enabled: enabled,
-        canToggleState: canTogglePolicyState(policyType, enabled, allPolicies),
-        CanToggleState: canTogglePolicyState(policyType, enabled, allPolicies),
+        canToggleState,
+        CanToggleState: canToggleState,
         object: 'policy',
     };
+}
+
+function synthesizeSendControlsPolicy(orgId: string, policyList: PolicyRecord[]): PolicyRecord {
+    const disableSendPolicy = policyList.find(p => p.type === PolicyType.DisableSend);
+    const sendOptionsPolicy = policyList.find(p => p.type === PolicyType.SendOptions);
+    const sendOptionsData = parsePolicyData(sendOptionsPolicy?.data);
+    const disableHideEmail = Boolean(sendOptionsData.disableHideEmail ?? sendOptionsData.DisableHideEmail ?? false);
+
+    return {
+        type: PolicyType.SendControls,
+        enabled: Boolean(disableSendPolicy?.enabled || sendOptionsPolicy?.enabled),
+        data: JSON.stringify({
+            disableSend: disableSendPolicy?.enabled ?? false,
+            disableHideEmail,
+        }),
+    };
+}
+
+function getPolicyStatusList(orgId: string, policyList: PolicyRecord[]) {
+    const statusPolicies = [...policyList];
+    if (!statusPolicies.some(p => p.type === PolicyType.SendControls)) {
+        statusPolicies.push(synthesizeSendControlsPolicy(orgId, statusPolicies));
+    }
+
+    return statusPolicies.map(policy => toPolicyStatusResponse(orgId, policy.type, policy, statusPolicies));
 }
 
 /**
@@ -4385,7 +4413,7 @@ orgs.get('/:id/policies', async (c) => {
     const policyList = await getOrgPolicies(db, orgId);
 
     return c.json({
-        data: policyList.map(toPolicyResponse),
+        data: getPolicyStatusList(orgId, policyList),
         object: 'list',
         continuationToken: null,
     });

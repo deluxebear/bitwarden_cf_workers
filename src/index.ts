@@ -159,6 +159,7 @@ app.route('/organizations', organizationInviteLinksRoutes);
 app.route('/organizations', organizationDomainsRoutes);
 app.route('/organizations', organizationTwoFactorRoutes);
 app.route('/organizations', organizationAuthRequestsRoutes);
+app.route('/organizations', organizationsRoutes);
 
 // 附件文件下载（公开端点，必须携带短期签名 token）
 app.get('/attachments/:cipherId/:attachmentId', async (c) => {
