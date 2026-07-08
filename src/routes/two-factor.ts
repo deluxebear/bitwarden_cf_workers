@@ -304,18 +304,24 @@ twoFactor.post('/email', enableEmail);
  * GET /api/two-factor/get-device-verification-settings
  * PUT /api/two-factor/device-verification-settings
  *
- * 官方已标记为旧客户端兼容端点；当前固定返回禁用状态。
+ * 官方已标记为旧客户端兼容端点；返回值与当前邮件投递能力保持一致。
  */
-function deviceVerificationSettingsResponse() {
+function isUnknownDeviceVerificationEnabled(env: Bindings): boolean {
+    return String(env.EMAIL_MODE ?? 'disabled').toLowerCase() !== 'disabled' ||
+        String(env.EMAIL_RETURN_TOKENS ?? '').toLowerCase() === 'true';
+}
+
+function deviceVerificationSettingsResponse(env: Bindings) {
+    const enabled = isUnknownDeviceVerificationEnabled(env);
     return {
-        isDeviceVerificationSectionEnabled: false,
-        unknownDeviceVerificationEnabled: false,
+        isDeviceVerificationSectionEnabled: enabled,
+        unknownDeviceVerificationEnabled: enabled,
         object: 'deviceVerificationSettings',
     };
 }
 
-twoFactor.get('/get-device-verification-settings', (c) => c.json(deviceVerificationSettingsResponse()));
-twoFactor.put('/device-verification-settings', (c) => c.json(deviceVerificationSettingsResponse()));
+twoFactor.get('/get-device-verification-settings', (c) => c.json(deviceVerificationSettingsResponse(c.env)));
+twoFactor.put('/device-verification-settings', (c) => c.json(deviceVerificationSettingsResponse(c.env)));
 
 /**
  * POST /api/two-factor/get-yubikey

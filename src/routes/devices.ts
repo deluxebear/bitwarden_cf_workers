@@ -71,6 +71,7 @@ function toProtectedDeviceResponse(device: DeviceRow) {
         creationDate: device.creationDate,
         encryptedUserKey: device.encryptedUserKey,
         encryptedPublicKey: device.encryptedPublicKey,
+        encryptedPrivateKey: device.encryptedPrivateKey,
         object: 'protectedDevice',
     };
 }
@@ -289,17 +290,25 @@ devicesRoute.post('/update-trust', async (c) => {
 
     const now = new Date().toISOString();
     const currentIdentifier = c.req.header('Device-Identifier') ||
-        c.req.header('X-Device-Identifier') ||
-        c.get('jwtPayload')?.device;
+        c.req.header('X-Device-Identifier');
+    const currentDeviceId = c.get('jwtPayload')?.device;
 
-    if (body.currentDevice && currentIdentifier) {
-        const current = await db.select().from(devices)
-            .where(and(eq(devices.userId, userId), eq(devices.identifier, currentIdentifier)))
-            .get();
+    if (body.currentDevice && (currentIdentifier || currentDeviceId)) {
+        let current = currentIdentifier
+            ? await db.select().from(devices)
+                .where(and(eq(devices.userId, userId), eq(devices.identifier, currentIdentifier)))
+                .get()
+            : null;
+        if (!current && currentDeviceId) {
+            current = await db.select().from(devices)
+                .where(and(eq(devices.userId, userId), eq(devices.id, currentDeviceId)))
+                .get();
+        }
         if (current) {
             await db.update(devices).set({
                 encryptedUserKey: body.currentDevice.encryptedUserKey ?? current.encryptedUserKey,
                 encryptedPublicKey: body.currentDevice.encryptedPublicKey ?? current.encryptedPublicKey,
+                encryptedPrivateKey: body.currentDevice.encryptedPrivateKey ?? current.encryptedPrivateKey,
                 revisionDate: now,
             }).where(eq(devices.id, current.id));
         }
@@ -310,6 +319,7 @@ devicesRoute.post('/update-trust', async (c) => {
         await db.update(devices).set({
             encryptedUserKey: other.encryptedUserKey ?? null,
             encryptedPublicKey: other.encryptedPublicKey ?? null,
+            encryptedPrivateKey: other.encryptedPrivateKey ?? null,
             revisionDate: now,
         }).where(and(eq(devices.id, other.deviceId), eq(devices.userId, userId)));
     }

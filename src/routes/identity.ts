@@ -20,6 +20,7 @@ import { normalizeRegistrationRequest } from '../services/registration';
 import {
     buildDevTokenResponse,
     consumeVerificationToken,
+    sendNewDeviceVerification,
     sendRegistrationVerification,
     verifyVerificationToken,
 } from '../services/email';
@@ -338,6 +339,12 @@ type SendAccessTokenRequest = {
     otp?: string;
 };
 
+type NewDeviceTokenRequest = TokenRequest & {
+    newDeviceOtp?: string;
+    NewDeviceOtp?: string;
+    new_device_otp?: string;
+};
+
 type LoginDeviceInfo = {
     id: string;
     type: number;
@@ -403,6 +410,35 @@ async function upsertLoginDevice(db: any, userId: string, body: object): Promise
     return { id: deviceId, type };
 }
 
+async function isKnownActiveLoginDevice(db: any, userId: string, body: object): Promise<boolean> {
+    const identifier = readStringField(body, 'deviceIdentifier', 'DeviceIdentifier', 'device_identifier');
+    if (!identifier) return false;
+    const existingDevice = await db.select({
+        id: devices.id,
+        active: devices.active,
+    }).from(devices)
+        .where(and(eq(devices.userId, userId), eq(devices.identifier, identifier)))
+        .get();
+    return !!existingDevice?.active;
+}
+
+function getNewDeviceOtp(body: object): string | undefined {
+    return readStringField(body, 'newDeviceOtp', 'NewDeviceOtp', 'new_device_otp');
+}
+
+function newDeviceVerificationRequired(c: any, devResponse: Record<string, unknown>) {
+    return c.json({
+        error: 'invalid_grant',
+        error_description: 'New device verification required.',
+        ErrorModel: {
+            Message: 'new device verification required',
+            Object: 'error',
+        },
+        DeviceVerified: false,
+        ...devResponse,
+    }, 400);
+}
+
 function uuidFromSendAccessId(accessId: string): string {
     if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(accessId)) {
         return accessId.toLowerCase();
@@ -453,7 +489,7 @@ function sendCanBeAccessed(send: typeof sends.$inferSelect): boolean {
 identity.post('/connect/token', async (c) => {
     // Bitwarden 客户端发送 application/x-www-form-urlencoded
     const contentType = c.req.header('content-type') || '';
-    let body: TokenRequest;
+    let body: NewDeviceTokenRequest;
 
     // WebAuthn grant 特有字段
     let webAuthnToken: string | undefined;
@@ -480,15 +516,16 @@ identity.post('/connect/token', async (c) => {
             password_hash_b64: formData['password_hash_b64'] as string,
             email: formData['email'] as string,
             otp: formData['otp'] as string,
+            newDeviceOtp: (formData['newDeviceOtp'] || formData['NewDeviceOtp'] || formData['new_device_otp']) as string,
             TwoFactorProvider: formData['TwoFactorProvider'] ? Number(formData['TwoFactorProvider']) : (formData['twoFactorProvider'] ? Number(formData['twoFactorProvider']) : undefined),
             TwoFactorToken: (formData['TwoFactorToken'] || formData['twoFactorToken']) as string,
-        } as TokenRequest & SendAccessTokenRequest;
+        } as NewDeviceTokenRequest & SendAccessTokenRequest;
         webAuthnToken = formData['token'] as string;
         webAuthnDeviceResponse = formData['deviceResponse'] as string;
     } else {
         const rawBody = await c.req.json<any>();
         console.log(`[TOKEN] JSON body keys: ${Object.keys(rawBody).join(', ')}`);
-        body = rawBody as TokenRequest & SendAccessTokenRequest;
+        body = rawBody as NewDeviceTokenRequest & SendAccessTokenRequest;
         webAuthnToken = rawBody.token;
         webAuthnDeviceResponse = rawBody.deviceResponse;
     }
@@ -627,7 +664,7 @@ async function buildTwoFactorParams(
 /**
  * Password grant - 用户名密码登录
  */
-async function handlePasswordGrant(c: any, db: any, body: TokenRequest) {
+async function handlePasswordGrant(c: any, db: any, body: NewDeviceTokenRequest) {
     if (!body.username || !body.password) {
         throw new BadRequestError('Username and password are required.');
     }
@@ -860,6 +897,19 @@ async function handlePasswordGrant(c: any, db: any, body: TokenRequest) {
     }
     // ================= 2FA 检查完毕 =================
     console.log(`[TOKEN] 2FA check passed, proceeding to device/token generation`);
+
+    const requiresNewDeviceVerification = !validatedAuthRequest &&
+        enabledProviders.length === 0 &&
+        !await isKnownActiveLoginDevice(db, user.id, body);
+    if (requiresNewDeviceVerification) {
+        const newDeviceOtp = getNewDeviceOtp(body);
+        if (!newDeviceOtp) {
+            const token = await sendNewDeviceVerification(db, c.env, user.id, user.email);
+            return newDeviceVerificationRequired(c, buildDevTokenResponse(c.env, token));
+        }
+
+        await consumeVerificationToken(db, user.email, 'new_device', newDeviceOtp, user.id);
+    }
 
     // 处理设备。revisionDate 同时作为 devices 响应中的 lastActivityDate。
     const loginDevice = await upsertLoginDevice(db, user.id, body);
