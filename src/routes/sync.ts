@@ -348,16 +348,12 @@ sync.get('/', async (c) => {
             }
         }
 
-        const responseData = cipher.type === 5 && sshKeyData
-            ? { ...data, ...sshKeyData, sshKey: undefined }
-            : data;
-
         return {
             id: cipher.id,
             organizationId: cipher.organizationId,
             folderId: foldersMap[userId] || null,
             type: cipher.type as CipherType,
-            data: responseData,
+            data: cipher.data,
             name: data.name || '',
             notes: data.notes || null,
             favorite: !!favorites[userId],

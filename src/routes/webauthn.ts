@@ -95,6 +95,21 @@ async function verifyUserSecret(
     return user;
 }
 
+export function getUserVerificationSecret(body: {
+    masterPasswordHash?: string;
+    secret?: string;
+} | null | undefined): string | undefined {
+    return body?.masterPasswordHash ?? body?.secret;
+}
+
+function encodeUtf8Base64Url(value: string): string {
+    return bytesToBase64Url(new TextEncoder().encode(value));
+}
+
+function decodeUtf8Base64Url(value: string): string {
+    return new TextDecoder().decode(base64UrlToBytes(value));
+}
+
 /**
  * 生成通行密钥注册/更新 token（HMAC 签名的 JSON）
  * 结构与 identity.ts 中 WebAuthnLoginAssertionOptionsToken 保持一致：
@@ -105,7 +120,7 @@ async function verifyUserSecret(
  *   exp: unixSeconds
  * }
  */
-async function signWebAuthnToken(
+export async function signWebAuthnToken(
     env: Bindings,
     identifier: string,
     scope: number,
@@ -128,11 +143,11 @@ async function signWebAuthnToken(
     );
     const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(tokenJson));
     const sigB64 = bytesToBase64Url(new Uint8Array(signature));
-    const token = `BWWebAuthn_${btoa(tokenJson)}.${sigB64}`;
+    const token = `BWWebAuthn_${encodeUtf8Base64Url(tokenJson)}.${sigB64}`;
     return token;
 }
 
-async function verifyWebAuthnToken(env: Bindings, rawToken: string, expectedIdentifier: string, expectedScope: number) {
+export async function verifyWebAuthnToken(env: Bindings, rawToken: string, expectedIdentifier: string, expectedScope: number) {
     const encoder = new TextEncoder();
     const tokenParts = rawToken.replace('BWWebAuthn_', '');
     const [tokenB64, sigB64] = tokenParts.split('.');
@@ -140,7 +155,7 @@ async function verifyWebAuthnToken(env: Bindings, rawToken: string, expectedIden
         throw new BadRequestError('Invalid token format.');
     }
 
-    const tokenJson = atob(tokenB64);
+    const tokenJson = decodeUtf8Base64Url(tokenB64);
     const key = await crypto.subtle.importKey(
         'raw',
         encoder.encode(env.JWT_SECRET),
@@ -175,9 +190,9 @@ async function verifyWebAuthnToken(env: Bindings, rawToken: string, expectedIden
 webauthn.post('/attestation-options', async (c) => {
     const db = drizzle(c.env.DB);
     const userId = c.get('userId');
-    const body = await c.req.json().catch(() => ({})) as { masterPasswordHash?: string };
+    const body = await c.req.json().catch(() => ({})) as { masterPasswordHash?: string; secret?: string };
 
-    const user = await verifyUserSecret(db, userId, body.masterPasswordHash);
+    const user = await verifyUserSecret(db, userId, getUserVerificationSecret(body));
 
     // 计算 rpId
     const origin = c.req.header('origin') || c.req.header('referer')?.replace(/\/$/, '') || `https://${c.req.header('host') || 'localhost'}`;
@@ -407,9 +422,9 @@ webauthn.post('/', async (c) => {
 webauthn.post('/assertion-options', async (c) => {
     const db = drizzle(c.env.DB);
     const userId = c.get('userId');
-    const body = await c.req.json().catch(() => ({})) as { masterPasswordHash?: string };
+    const body = await c.req.json().catch(() => ({})) as { masterPasswordHash?: string; secret?: string };
 
-    await verifyUserSecret(db, userId, body.masterPasswordHash);
+    await verifyUserSecret(db, userId, getUserVerificationSecret(body));
 
     const origin = c.req.header('origin') || c.req.header('referer')?.replace(/\/$/, '') || `https://${c.req.header('host') || 'localhost'}`;
     let rpId: string;
@@ -576,9 +591,9 @@ webauthn.post('/:id/delete', async (c) => {
     const db = drizzle(c.env.DB);
     const userId = c.get('userId');
     const id = c.req.param('id');
-    const body = await c.req.json().catch(() => ({})) as { masterPasswordHash?: string };
+    const body = await c.req.json().catch(() => ({})) as { masterPasswordHash?: string; secret?: string };
 
-    await verifyUserSecret(db, userId, body.masterPasswordHash);
+    await verifyUserSecret(db, userId, getUserVerificationSecret(body));
 
     const credential = await db.select().from(webAuthnCredentials)
         .where(and(
@@ -611,4 +626,3 @@ function uuidToBytes(uuid: string): Uint8Array {
 }
 
 export default webauthn;
-

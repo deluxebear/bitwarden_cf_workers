@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "render:wrangler": "node scripts/render-wrangler-config.mjs",
     "db:generate": "drizzle-kit generate",
     "db:migrate:local": "wrangler d1 migrations apply bitwarden-db --local",
     "db:migrate:remote": "wrangler d1 migrations apply bitwarden-db --remote",

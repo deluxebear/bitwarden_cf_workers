@@ -4,10 +4,20 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      clients_ref:
+        description: "Branch, tag, or commit SHA to build from deluxebear/bitwarden_clients"
+        required: false
+        default: "main"
 
 concurrency:
   group: deploy-production
   cancel-in-progress: false
+
+env:
+  WORKERS_DIR: workers
+  CLIENTS_DIR: clients
 
 jobs:
   deploy:
@@ -16,27 +26,73 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Checkout
+      - name: Checkout Workers
         uses: actions/checkout@v4
+        with:
+          path: ${{ env.WORKERS_DIR }}
+
+      - name: Checkout Clients
+        uses: actions/checkout@v4
+        with:
+          repository: deluxebear/bitwarden_clients
+          ref: ${{ github.event.inputs.clients_ref || 'main' }}
+          path: ${{ env.CLIENTS_DIR }}
+          token: ${{ secrets.CLIENTS_REPO_TOKEN || github.token }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: "npm"
+          cache-dependency-path: |
+            ${{ env.WORKERS_DIR }}/package-lock.json
+            ${{ env.CLIENTS_DIR }}/package-lock.json
 
-      - name: Install dependencies
+      - name: Install Workers dependencies
+        working-directory: ${{ env.WORKERS_DIR }}
         run: npm ci
 
-      - name: Type check
+      - name: Install Clients dependencies
+        working-directory: ${{ env.CLIENTS_DIR }}
+        run: npm ci
+
+      - name: Type check Workers
+        working-directory: ${{ env.WORKERS_DIR }}
         run: npm run typecheck
+
+      - name: Test Workers
+        working-directory: ${{ env.WORKERS_DIR }}
+        run: npm run test
+
+      - name: Build Web Vault static assets
+        working-directory: ${{ env.CLIENTS_DIR }}/apps/web
+        run: npm run dist:oss:selfhost
+
+      - name: Validate Web Vault static assets
+        run: |
+          set -euo pipefail
+          test -f "${CLIENTS_DIR}/apps/web/build/index.html"
+          find "${CLIENTS_DIR}/apps/web/build" -type f -name "*.map" -delete
+          du -sh "${CLIENTS_DIR}/apps/web/build"
 
       - name: Validate required deployment secrets
         run: |
           set -euo pipefail
           missing=0
+          if [ -z "${WORKER_NAME:-}" ]; then
+            echo "::error::Missing required secret: WORKER_NAME"
+            missing=1
+          fi
+          if [ -z "${D1_DATABASE_NAME:-}" ]; then
+            echo "::error::Missing required secret: D1_DATABASE_NAME"
+            missing=1
+          fi
           if [ -z "${D1_DATABASE_ID:-}" ]; then
             echo "::error::Missing required secret: D1_DATABASE_ID"
+            missing=1
+          fi
+          if [ -z "${ATTACHMENTS_BUCKET_NAME:-}" ]; then
+            echo "::error::Missing required secret: ATTACHMENTS_BUCKET_NAME"
             missing=1
           fi
           if [ -z "${ICONS_CACHE_ID:-}" ]; then
@@ -47,28 +103,62 @@ jobs:
             echo "::error::Missing required secret: ICONS_CACHE_PREVIEW_ID"
             missing=1
           fi
+          if [ "${EMAIL_MODE:-cloudflare}" = "cloudflare" ]; then
+            if [ -z "${EMAIL_FROM:-}" ]; then
+              echo "::error::Missing required secret: EMAIL_FROM"
+              missing=1
+            fi
+            if [ -z "${EMAIL_SENDER_ADDRESS:-}" ]; then
+              echo "::error::Missing required secret: EMAIL_SENDER_ADDRESS"
+              missing=1
+            fi
+          fi
           if [ "$missing" -ne 0 ]; then
             exit 1
           fi
         env:
+          WORKER_NAME: ${{ secrets.WORKER_NAME }}
+          D1_DATABASE_NAME: ${{ secrets.D1_DATABASE_NAME }}
           D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+          ATTACHMENTS_BUCKET_NAME: ${{ secrets.ATTACHMENTS_BUCKET_NAME }}
           ICONS_CACHE_ID: ${{ secrets.ICONS_CACHE_ID }}
           ICONS_CACHE_PREVIEW_ID: ${{ secrets.ICONS_CACHE_PREVIEW_ID }}
+          EMAIL_MODE: ${{ secrets.EMAIL_MODE }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_SENDER_ADDRESS: ${{ secrets.EMAIL_SENDER_ADDRESS }}
 
-      - name: Set production bindings in wrangler.toml
-        run: |
-          sed -i 's/database_id = "local"/database_id = "${{ secrets.D1_DATABASE_ID }}"/' wrangler.toml
-          sed -i 's/id = "local-icons-cache"/id = "${{ secrets.ICONS_CACHE_ID }}"/' wrangler.toml
-          sed -i 's/preview_id = "local-icons-cache"/preview_id = "${{ secrets.ICONS_CACHE_PREVIEW_ID }}"/' wrangler.toml
+      - name: Render production Wrangler config
+        working-directory: ${{ env.WORKERS_DIR }}
+        run: npm run render:wrangler -- --strict
+        env:
+          WRANGLER_CONFIG_OUT: wrangler.deploy.toml
+          WORKER_NAME: ${{ secrets.WORKER_NAME }}
+          D1_DATABASE_NAME: ${{ secrets.D1_DATABASE_NAME }}
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+          ATTACHMENTS_BUCKET_NAME: ${{ secrets.ATTACHMENTS_BUCKET_NAME }}
+          ICONS_CACHE_ID: ${{ secrets.ICONS_CACHE_ID }}
+          ICONS_CACHE_PREVIEW_ID: ${{ secrets.ICONS_CACHE_PREVIEW_ID }}
+          EMAIL_MODE: ${{ secrets.EMAIL_MODE || 'cloudflare' }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_FROM_NAME: ${{ secrets.EMAIL_FROM_NAME }}
+          EMAIL_REPLY_TO: ${{ secrets.EMAIL_REPLY_TO }}
+          EMAIL_SENDER_ADDRESS: ${{ secrets.EMAIL_SENDER_ADDRESS }}
+          EMAIL_PROVIDER_ENDPOINT: ${{ secrets.EMAIL_PROVIDER_ENDPOINT }}
+          SIGNUPS_ALLOWED: ${{ secrets.SIGNUPS_ALLOWED }}
+          VAULT_BASE_URL: ${{ secrets.VAULT_BASE_URL }}
+          FORCE_INVITE_REGISTER: ${{ secrets.FORCE_INVITE_REGISTER }}
 
       - name: Apply D1 migrations
-        run: npx wrangler d1 migrations apply bitwarden-db --remote
+        working-directory: ${{ env.WORKERS_DIR }}
+        run: npx wrangler d1 migrations apply "$D1_DATABASE_NAME" --remote --config wrangler.deploy.toml
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          D1_DATABASE_NAME: ${{ secrets.D1_DATABASE_NAME }}
 
       - name: Deploy
-        run: npx wrangler deploy
+        working-directory: ${{ env.WORKERS_DIR }}
+        run: npx wrangler deploy --config wrangler.deploy.toml
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

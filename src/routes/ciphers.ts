@@ -307,17 +307,12 @@ async function toCipherResponse(cipher: any, userId: string, baseUrl: string, se
         }
     }
 
-    // 官方服务端 data 字段是扁平结构，SSH key 字段直接在根级别
-    const responseData = cipher.type === 5 && sshKeyData
-        ? { ...data, ...sshKeyData, sshKey: undefined }
-        : data;
-
     return {
         id: cipher.id,
         organizationId: cipher.organizationId,
         folderId: folders[userId] || null,
         type: cipher.type as CipherType,
-        data: responseData,
+        data: cipher.data,
         name: data.name || '',
         notes: data.notes || null,
         favorite: !!favorites[userId],
@@ -2116,6 +2111,98 @@ ciphersRoute.put('/:id/restore-admin', async (c) => {
     return c.json(await toCipherResponse(updated!, userId, getBaseUrl(c), c.env.JWT_SECRET, 'cipherMiniDetails'));
 });
 
+/**
+ * PUT /api/ciphers/archive
+ * 对应 CiphersController.PutArchiveMany（批量归档）
+ *
+ * 必须注册在 PUT /:id 之前，否则 Hono 会把 /archive 当作 id=archive。
+ */
+ciphersRoute.put('/archive', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const body = await c.req.json<{ ids: string[] }>();
+
+    if (!body.ids || body.ids.length === 0) throw new BadRequestError('No IDs provided.');
+    if (body.ids.length > 500) throw new BadRequestError('You can only archive up to 500 items at a time.');
+
+    const now = new Date().toISOString();
+    const results: any[] = [];
+
+    for (const id of body.ids) {
+        const existing = await db.select().from(ciphers)
+            .where(and(eq(ciphers.id, id), eq(ciphers.userId, userId))).get();
+        if (!existing) continue;
+
+        await db.update(ciphers).set({ archivedDate: now, revisionDate: now })
+            .where(and(eq(ciphers.id, id), eq(ciphers.userId, userId)));
+
+        const updated = await db.select().from(ciphers).where(eq(ciphers.id, id)).get();
+        if (updated) results.push(updated);
+
+        const contextId = c.get('jwtPayload')?.device || null;
+        c.executionCtx.waitUntil(pushSyncCipher(
+            c.env, PushType.SyncCipherUpdate, id,
+            existing.organizationId ? null : userId, existing.organizationId || null,
+            null, now, contextId,
+        ));
+    }
+
+    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+
+    const baseUrl = getBaseUrl(c);
+    return c.json({
+        data: await Promise.all(results.map(r => toCipherResponse(r, userId, baseUrl, c.env.JWT_SECRET))),
+        object: 'list',
+        continuationToken: null,
+    });
+});
+
+/**
+ * PUT /api/ciphers/unarchive
+ * 对应 CiphersController.PutUnarchiveMany（批量取消归档）
+ *
+ * 必须注册在 PUT /:id 之前，否则 Hono 会把 /unarchive 当作 id=unarchive。
+ */
+ciphersRoute.put('/unarchive', async (c) => {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const body = await c.req.json<{ ids: string[] }>();
+
+    if (!body.ids || body.ids.length === 0) throw new BadRequestError('No IDs provided.');
+    if (body.ids.length > 500) throw new BadRequestError('You can only unarchive up to 500 items at a time.');
+
+    const now = new Date().toISOString();
+    const results: any[] = [];
+
+    for (const id of body.ids) {
+        const existing = await db.select().from(ciphers)
+            .where(and(eq(ciphers.id, id), eq(ciphers.userId, userId))).get();
+        if (!existing) continue;
+
+        await db.update(ciphers).set({ archivedDate: null, revisionDate: now })
+            .where(and(eq(ciphers.id, id), eq(ciphers.userId, userId)));
+
+        const updated = await db.select().from(ciphers).where(eq(ciphers.id, id)).get();
+        if (updated) results.push(updated);
+
+        const contextId = c.get('jwtPayload')?.device || null;
+        c.executionCtx.waitUntil(pushSyncCipher(
+            c.env, PushType.SyncCipherUpdate, id,
+            existing.organizationId ? null : userId, existing.organizationId || null,
+            null, now, contextId,
+        ));
+    }
+
+    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
+
+    const baseUrl = getBaseUrl(c);
+    return c.json({
+        data: await Promise.all(results.map(r => toCipherResponse(r, userId, baseUrl, c.env.JWT_SECRET))),
+        object: 'list',
+        continuationToken: null,
+    });
+});
+
 // ==================== 通配符 /:id 路由（必须在所有静态路由之后注册） ====================
 
 /**
@@ -2407,50 +2494,6 @@ ciphersRoute.put('/:id/archive', async (c) => {
 });
 
 /**
- * PUT /api/ciphers/archive
- * 对应 CiphersController.PutArchiveMany（批量归档）
- */
-ciphersRoute.put('/archive', async (c) => {
-    const db = drizzle(c.env.DB);
-    const userId = c.get('userId');
-    const body = await c.req.json<{ ids: string[] }>();
-
-    if (!body.ids || body.ids.length === 0) throw new BadRequestError('No IDs provided.');
-    if (body.ids.length > 500) throw new BadRequestError('You can only archive up to 500 items at a time.');
-
-    const now = new Date().toISOString();
-    const results: any[] = [];
-
-    for (const id of body.ids) {
-        const existing = await db.select().from(ciphers)
-            .where(and(eq(ciphers.id, id), eq(ciphers.userId, userId))).get();
-        if (!existing) continue;
-
-        await db.update(ciphers).set({ archivedDate: now, revisionDate: now })
-            .where(and(eq(ciphers.id, id), eq(ciphers.userId, userId)));
-
-        const updated = await db.select().from(ciphers).where(eq(ciphers.id, id)).get();
-        if (updated) results.push(updated);
-
-        const contextId = c.get('jwtPayload')?.device || null;
-        c.executionCtx.waitUntil(pushSyncCipher(
-            c.env, PushType.SyncCipherUpdate, id,
-            existing.organizationId ? null : userId, existing.organizationId || null,
-            null, now, contextId,
-        ));
-    }
-
-    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
-
-    const baseUrl = getBaseUrl(c);
-    return c.json({
-        data: await Promise.all(results.map(r => toCipherResponse(r, userId, baseUrl, c.env.JWT_SECRET))),
-        object: 'list',
-        continuationToken: null,
-    });
-});
-
-/**
  * PUT /api/ciphers/:id/unarchive
  * 对应 CiphersController.PutUnarchive（取消归档单个）
  */
@@ -2477,50 +2520,6 @@ ciphersRoute.put('/:id/unarchive', async (c) => {
     ));
 
     return c.json(await toCipherResponse(updated!, userId, getBaseUrl(c), c.env.JWT_SECRET));
-});
-
-/**
- * PUT /api/ciphers/unarchive
- * 对应 CiphersController.PutUnarchiveMany（批量取消归档）
- */
-ciphersRoute.put('/unarchive', async (c) => {
-    const db = drizzle(c.env.DB);
-    const userId = c.get('userId');
-    const body = await c.req.json<{ ids: string[] }>();
-
-    if (!body.ids || body.ids.length === 0) throw new BadRequestError('No IDs provided.');
-    if (body.ids.length > 500) throw new BadRequestError('You can only unarchive up to 500 items at a time.');
-
-    const now = new Date().toISOString();
-    const results: any[] = [];
-
-    for (const id of body.ids) {
-        const existing = await db.select().from(ciphers)
-            .where(and(eq(ciphers.id, id), eq(ciphers.userId, userId))).get();
-        if (!existing) continue;
-
-        await db.update(ciphers).set({ archivedDate: null, revisionDate: now })
-            .where(and(eq(ciphers.id, id), eq(ciphers.userId, userId)));
-
-        const updated = await db.select().from(ciphers).where(eq(ciphers.id, id)).get();
-        if (updated) results.push(updated);
-
-        const contextId = c.get('jwtPayload')?.device || null;
-        c.executionCtx.waitUntil(pushSyncCipher(
-            c.env, PushType.SyncCipherUpdate, id,
-            existing.organizationId ? null : userId, existing.organizationId || null,
-            null, now, contextId,
-        ));
-    }
-
-    await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
-
-    const baseUrl = getBaseUrl(c);
-    return c.json({
-        data: await Promise.all(results.map(r => toCipherResponse(r, userId, baseUrl, c.env.JWT_SECRET))),
-        object: 'list',
-        continuationToken: null,
-    });
 });
 
 export default ciphersRoute;

@@ -3,6 +3,8 @@ dist/
 .wrangler/
 .dev.vars
 *.log
+wrangler.local*.toml
+wrangler.deploy*.toml
 
 .DS_Store
 

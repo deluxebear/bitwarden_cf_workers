@@ -75,85 +75,186 @@ npm run dev
 
 ## 部署
 
-提供两种方式：**手动部署** 和 **Fork 后 GitHub Actions 自动部署**。
+提供两种方式：**手动部署** 和 **GitHub Actions 自动部署**。推荐长期使用 GitHub Actions，因为它会同时构建 `clients` Web Vault 静态文件、运行 Workers 检查、执行 D1 迁移并部署到 Cloudflare Workers。
 
-### 方式一：手动部署
+### 配置安全原则
 
-#### 1. 创建 Cloudflare 资源
+`wrangler.toml` 是可提交的公开模板，不应写入任何真实生产资源信息。以下内容都不要提交到仓库：
+
+- Cloudflare Account ID、API Token、D1 database ID、KV namespace ID。
+- 真实 Worker 名称、D1 数据库名、R2 bucket 名。
+- 真实发件域名、发件邮箱、Reply-To。
+- `JWT_SECRET`、邮件 provider token、通知投递 token 等密钥。
+
+部署时使用 `scripts/render-wrangler-config.mjs` 从环境变量或 GitHub Secrets 生成临时配置：
+
+```bash
+npm run render:wrangler -- --strict
+```
+
+生成文件默认位于：
+
+```text
+workers/wrangler.deploy.toml
+```
+
+该文件已被 `.gitignore` 忽略。部署和迁移都应使用这个临时文件：
+
+```bash
+npx wrangler d1 migrations apply "$D1_DATABASE_NAME" --remote --config wrangler.deploy.toml
+npx wrangler deploy --config wrangler.deploy.toml
+```
+
+### Cloudflare 资源
+
+首次部署前需要创建这些资源：
 
 ```bash
 npx wrangler login
 
 # D1 数据库
-npx wrangler d1 create bitwarden-db
+npx wrangler d1 create <your-d1-database-name>
 
-# R2 存储桶（附件）
-npx wrangler r2 bucket create bitwarden-attachments
+# R2 存储桶，用于附件
+npx wrangler r2 bucket create <your-attachments-bucket-name>
 
-# KV（Icons 缓存）
+# KV namespace，用于 Icons 缓存
 npx wrangler kv namespace create ICONS_CACHE
 npx wrangler kv namespace create ICONS_CACHE --preview
 ```
 
-#### 2. 更新 `wrangler.toml`
+记录以下值，但不要写入 `wrangler.toml`：
 
-将上一步输出的 ID 填入对应位置：
+| 值 | 用途 |
+|----|------|
+| Worker 名称 | `WORKER_NAME` |
+| D1 数据库名 | `D1_DATABASE_NAME` |
+| D1 database ID | `D1_DATABASE_ID` |
+| R2 bucket 名 | `ATTACHMENTS_BUCKET_NAME` |
+| KV production ID | `ICONS_CACHE_ID` |
+| KV preview ID | `ICONS_CACHE_PREVIEW_ID` |
 
-```toml
-[[d1_databases]]
-database_id = "<your-d1-database-id>"
+### 生产密钥
 
-[[kv_namespaces]]
-binding = "ICONS_CACHE"
-id = "<your-kv-production-id>"
-preview_id = "<your-kv-preview-id>"
-```
-
-#### 3. 迁移数据库并部署
-
-```bash
-npm run db:migrate:remote
-npx wrangler secret put JWT_SECRET    # 输入一个强随机字符串
-npm run deploy
-```
-
-#### 4. 验证
+`JWT_SECRET` 是 Worker secret，不进入 `wrangler.toml`，也不进入 `wrangler.deploy.toml`：
 
 ```bash
-curl https://<your-worker-domain>/alive
-curl -I https://<your-worker-domain>/github.com/icon.png
+npx wrangler secret put JWT_SECRET --config wrangler.deploy.toml
 ```
 
----
-
-### 方式二：Fork + GitHub Actions 自动部署
-
-推荐用于长期维护，代码推送到 `main` 分支时自动完成类型检查、数据库迁移和部署。
-
-#### 1. Fork 并启用 Actions
-
-- 在 GitHub 上 Fork 本仓库。
-- 进入 Fork 后仓库的 **Actions** 页面，点击启用工作流。
-
-#### 2. 本地创建 Cloudflare 资源
+如使用 webhook 邮件 provider，`EMAIL_PROVIDER_TOKEN` 也应使用 secret：
 
 ```bash
-git clone <your-fork-url>
+npx wrangler secret put EMAIL_PROVIDER_TOKEN --config wrangler.deploy.toml
+```
+
+### 手动部署
+
+在 `workers` 目录中导出生产配置环境变量：
+
+```bash
+export WORKER_NAME="<your-worker-name>"
+export D1_DATABASE_NAME="<your-d1-database-name>"
+export D1_DATABASE_ID="<your-d1-database-id>"
+export ATTACHMENTS_BUCKET_NAME="<your-r2-bucket-name>"
+export ICONS_CACHE_ID="<your-kv-production-id>"
+export ICONS_CACHE_PREVIEW_ID="<your-kv-preview-id>"
+
+# 注册策略：auto / true / false
+export SIGNUPS_ALLOWED="auto"
+
+# 用于组织邀请链接，建议设置为正式访问地址
+export VAULT_BASE_URL="https://<your-worker-domain>"
+```
+
+如果使用 Cloudflare Email Service 发信，需要先在 Cloudflare Dashboard 完成 Email Sending 发件域名 onboarding，然后导出：
+
+```bash
+export EMAIL_MODE="cloudflare"
+export EMAIL_FROM="Bitwarden <no-reply@example.com>"
+export EMAIL_SENDER_ADDRESS="no-reply@example.com"
+# 可选
+export EMAIL_REPLY_TO="support@example.com"
+```
+
+如果暂时不发邮件：
+
+```bash
+export EMAIL_MODE="disabled"
+```
+
+构建 Web Vault、检查 Workers、渲染临时配置并部署：
+
+```bash
+cd ..
+./scripts/deploy-workers.sh
+```
+
+该脚本会执行：
+
+1. `workers` TypeScript 类型检查。
+2. `workers` 测试。
+3. 构建 `clients/apps/web` 的 self-hosted production 静态文件。
+4. 删除 sourcemap，避免 Cloudflare assets 超限。
+5. 生成 `workers/wrangler.deploy.toml`。
+6. 使用临时配置执行 `wrangler deploy`。
+
+如果只想手动执行核心步骤：
+
+```bash
 cd workers
 npm ci
-npx wrangler login
-
-npx wrangler d1 create bitwarden-db
-npx wrangler r2 bucket create bitwarden-attachments
-npx wrangler kv namespace create ICONS_CACHE
-npx wrangler kv namespace create ICONS_CACHE --preview
+npm run typecheck
+npm run test
+npm run render:wrangler -- --strict
+npx wrangler d1 migrations apply "$D1_DATABASE_NAME" --remote --config wrangler.deploy.toml
+npx wrangler deploy --config wrangler.deploy.toml
 ```
 
-记录输出中的 D1 `database_id`、KV `id` 和 `preview_id`。
+### GitHub Actions 自动部署
 
-#### 3. 创建 Cloudflare API Token
+`workers/.github/workflows/deploy.yml` 会在 `workers` 仓库 `main` 分支推送时自动运行，也支持手动触发并指定 `clients_ref`。
 
-前往 [Cloudflare Dashboard > API Tokens](https://dash.cloudflare.com/profile/api-tokens)，选择 **Create Custom Token**，配置以下权限：
+工作流会：
+
+1. Checkout `deluxebear/bitwarden_cf_workers` 到 `workers/`。
+2. Checkout `deluxebear/bitwarden_clients` 到 `clients/`。
+3. 安装两个仓库的 npm 依赖。
+4. 执行 Workers `typecheck` 和 `test`。
+5. 在 `clients/apps/web` 执行 `npm run dist:oss:selfhost`。
+6. 校验 `clients/apps/web/build/index.html` 存在并删除 `.map` 文件。
+7. 从 GitHub Secrets 生成 `workers/wrangler.deploy.toml`。
+8. 使用临时配置执行 D1 迁移。
+9. 使用临时配置部署 Workers + Web Vault assets。
+
+如果你修改了 `clients`，需要先把对应提交 push 到 `deluxebear/bitwarden_clients`。自动部署默认构建 `main`，手动运行 workflow 时可以在 `clients_ref` 填入 branch、tag 或 commit SHA。
+
+#### GitHub Secrets
+
+在 `bitwarden_cf_workers` 仓库的 **Settings > Secrets and variables > Actions** 中添加：
+
+| Secret 名称 | 是否必需 | 说明 |
+|-------------|----------|------|
+| `CLOUDFLARE_API_TOKEN` | 必需 | Cloudflare API Token |
+| `CLOUDFLARE_ACCOUNT_ID` | 必需 | Cloudflare Account ID |
+| `WORKER_NAME` | 必需 | 生产 Worker 名称 |
+| `D1_DATABASE_NAME` | 必需 | 生产 D1 数据库名 |
+| `D1_DATABASE_ID` | 必需 | 生产 D1 database ID |
+| `ATTACHMENTS_BUCKET_NAME` | 必需 | 生产 R2 bucket 名 |
+| `ICONS_CACHE_ID` | 必需 | KV production namespace ID |
+| `ICONS_CACHE_PREVIEW_ID` | 必需 | KV preview namespace ID |
+| `EMAIL_MODE` | 建议 | `cloudflare`、`provider`、`disabled` 或 `log`；未设置时按 `cloudflare` 校验 |
+| `EMAIL_FROM` | `EMAIL_MODE=cloudflare` 时必需 | 例如 `Bitwarden <no-reply@example.com>` |
+| `EMAIL_SENDER_ADDRESS` | `EMAIL_MODE=cloudflare` 时必需 | Cloudflare Email Sending 已验证的发件地址 |
+| `EMAIL_FROM_NAME` | 可选 | Cloudflare Email Service 显示名称 |
+| `EMAIL_REPLY_TO` | 可选 | 回复地址 |
+| `EMAIL_PROVIDER_ENDPOINT` | `EMAIL_MODE=provider` 时使用 | webhook 邮件服务地址 |
+| `SIGNUPS_ALLOWED` | 可选 | `auto`、`true` 或 `false` |
+| `VAULT_BASE_URL` | 建议 | Web Vault 正式访问地址，用于邀请链接 |
+| `FORCE_INVITE_REGISTER` | 可选 | `true` 时邀请链接强制进入注册流程 |
+| `CLIENTS_REPO_TOKEN` | 私有 clients 仓库时必需 | 读取 `deluxebear/bitwarden_clients` 的 token |
+
+Cloudflare API Token 至少需要这些权限：
 
 | 范围 | 资源 | 级别 |
 |------|------|------|
@@ -165,41 +266,14 @@ npx wrangler kv namespace create ICONS_CACHE --preview
 | 用户 | 成员资格 | 读取 |
 | 用户 | 用户详细信息 | 读取 |
 
-#### 4. 配置 GitHub Secrets
-
-在 Fork 仓库的 **Settings > Secrets and variables > Actions** 中添加：
-
-| Secret 名称 | 来源 |
-|---|---|
-| `CLOUDFLARE_API_TOKEN` | 第 3 步创建的 API Token |
-| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare Dashboard 首页右侧 Account ID |
-| `D1_DATABASE_ID` | 第 2 步创建 D1 的输出 |
-| `ICONS_CACHE_ID` | 第 2 步创建 KV 的 production ID |
-| `ICONS_CACHE_PREVIEW_ID` | 第 2 步创建 KV 的 preview ID |
-
-> CI 会在部署前自动将 `wrangler.toml` 的本地占位符替换为 Secrets 中的生产值。  
-> 如果有 Secret 缺失，workflow 会立即报错并指出缺少哪个。
-
-#### 5. 配置生产密钥
+### 部署验证
 
 ```bash
-npx wrangler secret put JWT_SECRET
+curl https://<your-worker-domain>/alive
+curl -I https://<your-worker-domain>/github.com/icon.png
 ```
 
-> `JWT_SECRET` 是敏感值，不要写入仓库或 `wrangler.toml`。
-
-#### 6. 触发首次部署
-
-```bash
-git commit --allow-empty -m "chore: trigger first deployment"
-git push origin main
-```
-
-#### 7. 验证
-
-- 在 GitHub **Actions** 确认 `Deploy to Cloudflare Workers` 成功。
-- 访问 `https://<your-worker-domain>/alive`，应返回当前时间戳。
-- 访问 `https://<your-worker-domain>/github.com/icon.png`，应返回图标图片。
+Web Vault 和 API 由同一个 Worker 提供。自托管 Web Vault 构建由 `ENV=selfhosted` 生成，因此 Admin Console 的订阅和许可证上传界面会走 self-hosted 版本。
 
 ---
 
@@ -217,7 +291,7 @@ git push origin main
 
 ## 环境变量
 
-在 `wrangler.toml` 的 `[vars]` 中配置，敏感值通过 `npx wrangler secret put` 设置。
+公开默认值保存在 `wrangler.toml` 的 `[vars]` 中；生产私有值通过 GitHub Secrets 或本地 shell 环境变量渲染到 `wrangler.deploy.toml`。真正的密钥仍然使用 `npx wrangler secret put` 设置，不能进入任何 TOML 文件。
 
 ### 核心配置
 
@@ -330,7 +404,7 @@ workers/
 │   └── types/                    # TypeScript 类型定义
 ├── drizzle/                      # SQL 迁移文件
 ├── .github/workflows/deploy.yml  # CI/CD 自动部署
-├── wrangler.toml                 # Workers 部署配置
+├── wrangler.toml                 # 可提交的公开 Workers 配置模板
 ├── tsconfig.json
 └── package.json
 ```

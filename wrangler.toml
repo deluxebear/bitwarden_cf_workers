@@ -1,4 +1,4 @@
-name = "bitwarden-workers"
+name = "bitwarden-workers-dev"
 main = "src/index.ts"
 compatibility_date = "2025-12-01"
 compatibility_flags = ["nodejs_compat"]
@@ -22,40 +22,33 @@ run_worker_first = [
 ]
 
 [vars]
-JWT_SECRET = "change-me-in-production"
 JWT_EXPIRATION = "3600"
 JWT_REFRESH_EXPIRATION = "2592000"
 GLOBAL_PREMIUM = "true"
 ICONS_CACHE_SUCCESS_TTL_SECONDS = "1209600"
 ICONS_CACHE_NEGATIVE_TTL_SECONDS = "43200"
 ICONS_MAX_IMAGE_BYTES = "51200"
+# 生产部署的私有资源名、ID、域名和邮箱不要写在此文件中。
+# 使用 scripts/render-wrangler-config.mjs 从环境变量或 GitHub Secrets 生成 .wrangler/deploy.toml。
+#
 # 邀请链接中的 Web Vault 地址，例如 https://vault.example.com 或 http://localhost:8080（本地开发）
 # VAULT_BASE_URL = "http://localhost:8080"
 # 设为 "true" 时，邀请链接一律进入「注册」页，被邀请人需设置主密钥（适合自建、该邮箱尚未注册或希望走注册流程）
 # FORCE_INVITE_REGISTER = "true"
 # 控制开放注册行为: "true" 始终允许 | "false" 始终禁止 | "auto" 无用户时允许，有用户后关闭（默认）
-SIGNUPS_ALLOWED = "false"
-# 生产邮件投递使用 Cloudflare Email Service。
-# 部署前需在 Cloudflare Dashboard > Compute > Email Service > Email Sending 中
-# 完成 ifn.app 发件域名 onboarding。
-EMAIL_MODE = "cloudflare"
-EMAIL_FROM = "Bitwarden <no-reply@ifn.app>"
-# EMAIL_REPLY_TO = "support@ifn.app"
+SIGNUPS_ALLOWED = "auto"
+# 公开默认值禁用邮件投递，生产环境由临时部署配置注入 EMAIL_MODE/EMAIL_FROM。
+EMAIL_MODE = "disabled"
 #
 # 通用 HTTP webhook provider 仍可用：
 # EMAIL_MODE = "provider"
 # EMAIL_PROVIDER_ENDPOINT = "https://mail.example.com/bitwarden-email"
 # 本地调试如需回显 token，可临时改为 EMAIL_MODE="log" 并设置 EMAIL_RETURN_TOKENS="true"。
 
-# Cloudflare Email Service Workers binding。
-[[send_email]]
-name = "EMAIL"
-allowed_sender_addresses = ["no-reply@ifn.app"]
-
 [[d1_databases]]
 binding = "DB"
-database_name = "bitwarden-db"
-database_id = "b8f0bb27-981f-4089-8eb3-6f9f967c8baa"
+database_name = "bitwarden-db-dev"
+database_id = "local"
 migrations_dir = "drizzle"
 
 [dev]
@@ -63,12 +56,12 @@ port = 8787
 
 [[r2_buckets]]
 binding = "ATTACHMENTS"
-bucket_name = "bitwarden-attachments"
+bucket_name = "bitwarden-attachments-dev"
 
 [[kv_namespaces]]
 binding = "ICONS_CACHE"
-id = "07bd0124330848eebed4b01a044d40d6"
-preview_id = "524817ad20d944ca9bd763b4b1235800"
+id = "local-icons-cache"
+preview_id = "local-icons-cache"
 
 # Durable Objects - 实时通知 (SignalR 兼容 WebSocket Hub)
 # 对应官方 Notifications/NotificationsHub.cs

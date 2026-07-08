@@ -334,7 +334,7 @@ export interface CipherResponse {
     organizationId: string | null;
     folderId: string | null;
     type: CipherType;
-    data: any; // 原始加密 JSON 数据
+    data: string; // 原始加密 JSON 数据字符串
     name: string;
     notes: string | null;
     favorite: boolean;
