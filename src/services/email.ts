@@ -10,7 +10,8 @@ export type VerificationTokenType =
     | 'password_hint'
     | 'email_change'
     | 'new_device'
-    | 'two_factor';
+    | 'two_factor'
+    | 'organization_invite';
 
 type EmailEnv = {
     EMAIL?: SendEmail;
@@ -71,6 +72,8 @@ function getEmailMessage(type: VerificationTokenType, data: Record<string, unkno
     const expiresAt = String(data.expiresAt ?? '');
     const vaultUrl = typeof data.vaultUrl === 'string' && data.vaultUrl ? data.vaultUrl : null;
     const hint = String(data.hint ?? '');
+    const organizationName = String(data.organizationName ?? 'your organization');
+    const inviteUrl = String(data.inviteUrl ?? '');
 
     switch (type) {
         case 'registration':
@@ -102,6 +105,12 @@ function getEmailMessage(type: VerificationTokenType, data: Record<string, unkno
                 subject: 'Your Bitwarden two-step login code',
                 text: `Use this code to finish signing in to Bitwarden:\n\n${token}${expiresAt ? `\n\nThis code expires at ${expiresAt}.` : ''}`,
                 html: `<p>Use this code to finish signing in to Bitwarden:</p><p><code>${escapeHtml(token)}</code></p>${expiresAt ? `<p>This code expires at ${escapeHtml(expiresAt)}.</p>` : ''}`,
+            };
+        case 'organization_invite':
+            return {
+                subject: `You have been invited to join ${organizationName} on Bitwarden`,
+                text: `You have been invited to join ${organizationName} on Bitwarden.\n\nAccept the invitation:\n${inviteUrl}`,
+                html: `<p>You have been invited to join ${escapeHtml(organizationName)} on Bitwarden.</p><p><a href="${escapeHtml(inviteUrl)}">Accept invitation</a></p>`,
             };
     }
 }
@@ -324,6 +333,18 @@ export async function sendNewDeviceVerification(
         expiresAt: result.expiresAt,
     });
     return result;
+}
+
+export async function sendOrganizationInvite(
+    env: EmailEnv,
+    email: string,
+    organizationName: string,
+    inviteUrl: string,
+): Promise<void> {
+    await deliverEmail(env, 'organization_invite', email, {
+        organizationName,
+        inviteUrl,
+    });
 }
 
 export function buildDevTokenResponse(env: EmailEnv, result: VerificationTokenResult): Record<string, unknown> {

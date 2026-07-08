@@ -27,6 +27,7 @@ import { logEvent } from '../services/events';
 import { toEventResponse, getDateRange, getDeviceTypeFromRequest } from './events';
 import { BadRequestError, NotFoundError } from '../middleware/error';
 import { generateUuid, generateSecureRandomString, createInviteToken, verifyInviteToken, verifyPassword } from '../services/crypto';
+import { sendOrganizationInvite } from '../services/email';
 import { toOrganizationResponse, toOrganizationSubscriptionResponse, toOrganizationUserResponse } from '../models/organization-responses';
 import type { Bindings, Variables } from '../types';
 import { batchedInArrayQuery, D1_BATCH_SIZE } from '../services/db';
@@ -320,7 +321,7 @@ async function assertAccountRecoveryEnabled(db: D1Db, orgId: string): Promise<Or
 async function buildInviteLinkForOrgUser(c: OrgContext, db: D1Db, orgId: string, orgUser: OrganizationUserRow): Promise<string> {
     const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
     const orgName = org?.name || 'Organization';
-    const vaultBase = ((c.env as { VAULT_BASE_URL?: string }).VAULT_BASE_URL || 'https://vault.example.com').replace(/#\/?$/, '').replace(/\/$/, '');
+    const vaultBase = getVaultBaseUrl(c);
     const forceRegister = (c.env as { FORCE_INVITE_REGISTER?: string }).FORCE_INVITE_REGISTER === 'true';
     const existingUser = await db.select().from(users).where(eq(users.email, orgUser.email)).get();
     const token = await createInviteToken(orgUser.id, orgUser.email, orgId, c.env.JWT_SECRET);
@@ -345,19 +346,14 @@ function sanitizeInviteDomains(domains: unknown): string[] {
     return Array.from(new Set(normalized));
 }
 
-function getVaultBaseUrl(env: Bindings): string | null {
-    const raw = (env as { VAULT_BASE_URL?: string }).VAULT_BASE_URL?.trim();
-    if (!raw) return null;
-    return raw.replace(/#\/?$/, '').replace(/\/$/, '');
+function getVaultBaseUrl(c: OrgContext): string {
+    const raw = (c.env as { VAULT_BASE_URL?: string }).VAULT_BASE_URL?.trim();
+    const base = raw || new URL(c.req.url).origin;
+    return base.replace(/#\/?$/, '').replace(/\/$/, '');
 }
 
-function buildOrganizationInviteLinkUrl(c: OrgContext, link: OrganizationInviteLinkRow): string | null {
-    const vaultBase = getVaultBaseUrl(c.env);
-    if (!vaultBase) {
-        console.warn('[invite-link] VAULT_BASE_URL is not configured; returning code without URL.');
-        return null;
-    }
-
+function buildOrganizationInviteLinkUrl(c: OrgContext, link: OrganizationInviteLinkRow): string {
+    const vaultBase = getVaultBaseUrl(c);
     const params = new URLSearchParams({ code: link.code });
     return `${vaultBase}#/accept-organization-invite?${params.toString()}`;
 }
@@ -1624,7 +1620,7 @@ orgs.get('/:id/users/mini-details', async (c) => {
 
 /**
  * POST /api/organizations/:id/users/reinvite
- * 批量重新发送邀请。Workers 当前未接邮件服务，生成邀请链接并写入日志。
+ * 批量重新发送邀请邮件。
  */
 orgs.post('/:id/users/reinvite', async (c) => {
     const db = drizzle(c.env.DB);
@@ -1636,6 +1632,10 @@ orgs.post('/:id/users/reinvite', async (c) => {
 
     const inviter = await getOrgUser(db, orgId, userId);
     requireManageUsers(inviter);
+
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+    const orgName = org.name || 'Organization';
 
     const results: Array<{ id: string; error?: string | null }> = [];
     for (const orgUserId of ids) {
@@ -1651,9 +1651,15 @@ orgs.post('/:id/users/reinvite', async (c) => {
             continue;
         }
 
-        const link = await buildInviteLinkForOrgUser(c, db, orgId, target);
-        console.log(`[REINVITE] ${target.email} -> ${link}`);
-        results.push({ id: orgUserId, error: null });
+        try {
+            const link = await buildInviteLinkForOrgUser(c, db, orgId, target);
+            await sendOrganizationInvite(c.env, target.email, orgName, link);
+            console.log(`[REINVITE] ${target.email} -> ${link}`);
+            results.push({ id: orgUserId, error: null });
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Failed to send invitation email.';
+            results.push({ id: orgUserId, error: message });
+        }
     }
 
     return c.json(toBulkResponseList(results));
@@ -2163,7 +2169,7 @@ orgs.get('/:id/users/:orgUserId', async (c) => {
 
 /**
  * POST /api/organizations/:id/users/invite
- * 邀请组织成员；返回邀请链接并在控制台打印，便于管理员手动发给被邀请人（后续可接邮件）
+ * 邀请组织成员并发送邀请邮件；返回邀请链接便于排查。
  */
 orgs.post('/:id/users/invite', async (c) => {
     const db = drizzle(c.env.DB);
@@ -2190,7 +2196,7 @@ orgs.post('/:id/users/invite', async (c) => {
         throw new BadRequestError('Emails are required.');
     }
 
-    const vaultBase = ((c.env as { VAULT_BASE_URL?: string }).VAULT_BASE_URL || 'https://vault.example.com').replace(/#\/?$/, '').replace(/\/$/, '');
+    const vaultBase = getVaultBaseUrl(c);
     const now = new Date().toISOString();
     const inviteLinks: { email: string; link: string }[] = [];
 
@@ -2249,6 +2255,7 @@ orgs.post('/:id/users/invite', async (c) => {
         });
         const link = `${vaultBase}#/accept-organization?${params.toString()}`;
         inviteLinks.push({ email: targetEmail, link });
+        await sendOrganizationInvite(c.env, targetEmail, orgName, link);
         console.log(`[INVITE] ${targetEmail} -> ${link}`);
     }
 
@@ -2782,7 +2789,7 @@ orgs.put('/:id/users/:orgUserId', async (c) => {
 
 /**
  * POST /api/organizations/:orgId/users/:orgUserId/reinvite
- * 重新发送邀请；生成新 token 与邀请链接，在控制台打印并返回（与 invite 一致，后续可接邮件）
+ * 重新发送邀请邮件；生成新 token 与邀请链接并返回（便于排查）
  */
 orgs.post('/:id/users/:orgUserId/reinvite', async (c) => {
     const db = drizzle(c.env.DB);
@@ -2802,6 +2809,8 @@ orgs.post('/:id/users/:orgUserId/reinvite', async (c) => {
     }
 
     const link = await buildInviteLinkForOrgUser(c, db, orgId, targetOrgUser);
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    await sendOrganizationInvite(c.env, targetOrgUser.email, org?.name || 'Organization', link);
     console.log(`[REINVITE] ${targetOrgUser.email} -> ${link}`);
     return c.json({ email: targetOrgUser.email, link }, 200);
 });
