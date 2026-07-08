@@ -13,7 +13,7 @@ import { BadRequestError, NotFoundError } from '../middleware/error';
 import { generateSecureRandomString, verifyPassword } from '../services/crypto';
 import { isSignupAllowed } from '../services/signup-guard';
 import { normalizeRegistrationRequest } from '../services/registration';
-import { buildDevTokenResponse, consumeVerificationToken, sendEmailChangeToken, sendPasswordHint } from '../services/email';
+import { buildDevTokenResponse, consumeVerificationToken, sendEmailChangeToken, sendNewDeviceVerification, sendPasswordHint } from '../services/email';
 import { assertEmailNotBlockedByClaimedDomain, getMasterPasswordPolicyForUser } from '../services/policy-requirements';
 import { touchUser } from '../services/revisions';
 import type { Bindings, Variables, ProfileResponse, AccountKeysResponse } from '../types';
@@ -102,6 +102,32 @@ accounts.post('/password-hint', async (c) => {
     }
 
     return c.json(null, 200);
+});
+
+/**
+ * POST /api/accounts/resend-new-device-otp
+ * 匿名端点。新设备验证发生在登录完成前，前端只能携带邮箱和主密码 hash 重新请求验证码。
+ */
+accounts.post('/resend-new-device-otp', async (c) => {
+    const body = await c.req.json<{ email?: string; masterPasswordHash?: string }>()
+        .catch(() => ({} as { email?: string; masterPasswordHash?: string }));
+    if (!body.email || !body.masterPasswordHash) {
+        return c.body(null, 204);
+    }
+
+    const db = drizzle(c.env.DB);
+    const email = body.email.toLowerCase().trim();
+    const user = await db.select().from(users).where(eq(users.email, email)).get();
+    if (!user || !await verifyPassword(body.masterPasswordHash, user.masterPassword || '')) {
+        return c.body(null, 204);
+    }
+
+    const token = await sendNewDeviceVerification(db, c.env, user.id, user.email);
+    const devResponse = buildDevTokenResponse(c.env, token);
+    if (Object.keys(devResponse).length > 0) {
+        return c.json(devResponse, 200);
+    }
+    return c.body(null, 204);
 });
 
 // 其他端点都需要认证
