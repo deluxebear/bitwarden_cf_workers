@@ -168,6 +168,7 @@ export const sends = sqliteTable('sends', {
     data: text('data'), // JSON - 加密的数据
     key: text('key'), // 加密 key
     password: text('password'), // PBKDF2 hashed
+    emails: text('emails'), // 逗号分隔的邮箱验证收件人
     maxAccessCount: integer('max_access_count'),
     accessCount: integer('access_count').notNull().default(0),
     expirationDate: text('expiration_date'),

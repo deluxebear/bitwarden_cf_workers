@@ -22,10 +22,15 @@ import {
     consumeVerificationToken,
     sendNewDeviceVerification,
     sendRegistrationVerification,
+    sendSendAccessOtp,
     verifyVerificationToken,
 } from '../services/email';
 import { AuthRequestType } from '../types';
 import type { Bindings, Variables, KdfType, PreloginRequest, PreloginResponse, RegisterRequest, TokenRequest, TokenResponse } from '../types';
+import {
+    assertEmailNotBlockedByClaimedDomain,
+    getMasterPasswordPolicyForUser,
+} from '../services/policy-requirements';
 
 const identity = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 const SEND_ACCESS_TOKEN_LIFETIME_SECONDS = 15 * 60;
@@ -84,6 +89,11 @@ async function getValidRegisterFinishInvite(
     }
 
     return orgUser;
+}
+
+async function attachMasterPasswordPolicy(db: D1Db, userId: string, response: Record<string, any>): Promise<void> {
+    const policy = await getMasterPasswordPolicyForUser(db, userId);
+    response.MasterPasswordPolicy = policy;
 }
 
 function unsupportedSsoResponse(c: any) {
@@ -235,6 +245,7 @@ identity.post('/accounts/register', async (c) => {
     if (!await isSignupAllowed(c.env, db, email)) {
         throw new BadRequestError('Registration is disabled. Please contact the administrator for an invitation.');
     }
+    await assertEmailNotBlockedByClaimedDomain(db, email, true);
 
     const { generateSecureRandomString } = await import('../services/crypto');
     const { users } = await import('../db/schema');
@@ -287,6 +298,7 @@ identity.post('/accounts/register/send-verification-email', async (c) => {
     if (!await isSignupAllowed(c.env, db, email)) {
         throw new BadRequestError('Registration is disabled. Please contact the administrator for an invitation.');
     }
+    await assertEmailNotBlockedByClaimedDomain(db, email, true);
 
     const existing = await db.select({ id: users.id }).from(users).where(eq(users.email, email)).get();
     if (existing) throw new BadRequestError('Email is already registered.');
@@ -395,6 +407,7 @@ identity.post('/accounts/register/finish', async (c) => {
         if (!await isSignupAllowed(c.env, db, email)) {
             throw new BadRequestError('Registration is disabled. Please contact the administrator for an invitation.');
         }
+        await assertEmailNotBlockedByClaimedDomain(db, email, true);
         if (!body.emailVerificationToken) {
             throw new BadRequestError('Email verification token is required.');
         }
@@ -666,7 +679,26 @@ async function handleSendAccessGrant(
         return sendAccessError(c, 'invalid_grant', 'send_id is invalid.', 'send_id_invalid');
     }
 
-    if (send.password) {
+    const sendEmails = (send as any).emails as string | null | undefined;
+    if (sendEmails) {
+        const requestedEmail = body.email?.trim().toLowerCase();
+        if (!requestedEmail) {
+            return sendAccessError(c, 'invalid_request', 'email is required.', 'email_required');
+        }
+        const allowedEmails = sendEmails.split(',').map((email) => email.trim().toLowerCase()).filter(Boolean);
+        if (!allowedEmails.includes(requestedEmail)) {
+            return sendAccessError(c, 'invalid_request', 'email and otp are required.', 'email_and_otp_required');
+        }
+        if (!body.otp) {
+            await sendSendAccessOtp(db, c.env, requestedEmail, sendId);
+            return sendAccessError(c, 'invalid_request', 'email and otp are required.', 'email_and_otp_required');
+        }
+        try {
+            await consumeVerificationToken(db, requestedEmail, `send_access:${sendId}`, body.otp);
+        } catch {
+            return sendAccessError(c, 'invalid_request', 'email and otp are required.', 'email_and_otp_required');
+        }
+    } else if (send.password) {
         const passwordHash = body.password_hash_b64;
         if (!passwordHash) {
             return sendAccessError(c, 'invalid_request', 'password_hash_b64 is required.', 'password_hash_b64_required');
@@ -688,6 +720,7 @@ async function handleSendAccessGrant(
     const accessToken = await signJwtClaims({
         sub: sendId,
         send_id: sendId,
+        email: sendEmails ? body.email?.trim().toLowerCase() : undefined,
         type: 'Send',
         scope: ['api.send.access'],
         amr: ['send_access'],
@@ -1097,6 +1130,7 @@ async function handlePasswordGrant(c: any, db: any, body: NewDeviceTokenRequest)
 
     console.log(`[TOKEN] Response for user ${user.email}: Kdf=${user.kdf}, KdfIterations=${user.kdfIterations}, HasKey=${!!user.key}, HasMasterPasswordUnlock=${!!response.UserDecryptionOptions.MasterPasswordUnlock}`);
 
+    await attachMasterPasswordPolicy(db, user.id, response);
     return c.json(response);
 }
 
@@ -1206,6 +1240,7 @@ async function handleRefreshTokenGrant(c: any, db: any, body: TokenRequest) {
         };
     }
 
+    await attachMasterPasswordPolicy(db, user.id, response);
     return c.json(response);
 }
 
@@ -1437,6 +1472,7 @@ async function handleWebAuthnGrant(c: any, db: any, body: TokenRequest, rawToken
         };
     }
 
+    await attachMasterPasswordPolicy(db, user.id, response);
     return c.json(response);
 }
 

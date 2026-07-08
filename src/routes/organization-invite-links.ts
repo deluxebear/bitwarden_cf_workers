@@ -20,7 +20,8 @@ import { BadRequestError, NotFoundError } from '../middleware/error';
 import { generateUuid } from '../services/crypto';
 import { logEvent } from '../services/events';
 import { PolicyType } from '../services/policy-validators';
-import { pushSyncUser } from '../services/push-notification';
+import { pushNotification, pushSyncUser } from '../services/push-notification';
+import { getAutoConfirmRecipientUserIds, validateUserCanJoinOrganization } from '../services/policy-requirements';
 import type { Bindings, Variables } from '../types';
 import { PushType } from '../types/push-notification';
 import { getDeviceTypeFromRequest } from './events';
@@ -113,6 +114,20 @@ async function getEnabledPolicies(db: D1Db, organizationId: string): Promise<Pol
         if (isNoSuchTablePolicies(e)) return [];
         throw e;
     }
+}
+
+async function pushAutoConfirmToManagers(c: any, db: D1Db, organizationId: string, targetUserId: string, organizationUserId: string): Promise<void> {
+    const recipientIds = await getAutoConfirmRecipientUserIds(db, organizationId);
+    if (recipientIds.length === 0) return;
+
+    c.executionCtx.waitUntil(Promise.all(recipientIds.map((recipientId) => (
+        pushNotification(c.env, 'user', recipientId, PushType.AutoConfirm, {
+            UserId: recipientId,
+            OrganizationId: organizationId,
+            TargetUserId: targetUserId,
+            TargetOrganizationUserId: organizationUserId,
+        }, null)
+    ))).then(() => undefined));
 }
 
 function toPolicyResponse(policy: PolicyRow) {
@@ -248,6 +263,10 @@ inviteLinks.post('/users/invite-link/accept', authMiddleware, async (c) => {
         throw new BadRequestError('Organization has no seats available.');
     }
 
+    const joinValidation = await validateUserCanJoinOrganization(db, currentUser, organization.id);
+    if (joinValidation.resetPasswordAutoEnroll && !resetPasswordKey) {
+        throw new BadRequestError('Reset password key is required.');
+    }
     const now = new Date().toISOString();
     let organizationUserId: string;
     if (existing) {
@@ -282,6 +301,9 @@ inviteLinks.post('/users/invite-link/accept', authMiddleware, async (c) => {
         deviceType: getDeviceTypeFromRequest(c),
     });
     c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncOrganizations, userId, null));
+    if (joinValidation.autoConfirm) {
+        await pushAutoConfirmToManagers(c, db, organization.id, userId, organizationUserId);
+    }
 
     return c.body(null, 200);
 });

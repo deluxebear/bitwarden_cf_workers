@@ -11,6 +11,8 @@ export type VerificationTokenType =
     | 'email_change'
     | 'new_device'
     | 'two_factor'
+    | 'send_access'
+    | `send_access:${string}`
     | 'organization_invite';
 
 type EmailEnv = {
@@ -68,6 +70,7 @@ function parseFromAddress(env: EmailEnv): string | EmailAddress {
 }
 
 function getEmailMessage(type: VerificationTokenType, data: Record<string, unknown>) {
+    const messageType = type.startsWith('send_access:') ? 'send_access' : type;
     const token = String(data.token ?? '');
     const expiresAt = String(data.expiresAt ?? '');
     const vaultUrl = typeof data.vaultUrl === 'string' && data.vaultUrl ? data.vaultUrl : null;
@@ -75,7 +78,7 @@ function getEmailMessage(type: VerificationTokenType, data: Record<string, unkno
     const organizationName = String(data.organizationName ?? 'your organization');
     const inviteUrl = String(data.inviteUrl ?? '');
 
-    switch (type) {
+    switch (messageType) {
         case 'registration':
             return {
                 subject: 'Verify your Bitwarden account',
@@ -106,12 +109,20 @@ function getEmailMessage(type: VerificationTokenType, data: Record<string, unkno
                 text: `Use this code to finish signing in to Bitwarden:\n\n${token}${expiresAt ? `\n\nThis code expires at ${expiresAt}.` : ''}`,
                 html: `<p>Use this code to finish signing in to Bitwarden:</p><p><code>${escapeHtml(token)}</code></p>${expiresAt ? `<p>This code expires at ${escapeHtml(expiresAt)}.</p>` : ''}`,
             };
+        case 'send_access':
+            return {
+                subject: `Your Bitwarden Send verification code is ${token}`,
+                text: `Use this code to access the Bitwarden Send:\n\n${token}\n\nThis code expires at ${expiresAt}.`,
+                html: `<p>Use this code to access the Bitwarden Send:</p><p><code>${escapeHtml(token)}</code></p><p>This code expires at ${escapeHtml(expiresAt)}.</p>`,
+            };
         case 'organization_invite':
             return {
                 subject: `You have been invited to join ${organizationName} on Bitwarden`,
                 text: `You have been invited to join ${organizationName} on Bitwarden.\n\nAccept the invitation:\n${inviteUrl}`,
                 html: `<p>You have been invited to join ${escapeHtml(organizationName)} on Bitwarden.</p><p><a href="${escapeHtml(inviteUrl)}">Accept invitation</a></p>`,
             };
+        default:
+            throw new BadRequestError('Unsupported email type.');
     }
 }
 
@@ -305,6 +316,20 @@ export async function sendPasswordHint(env: EmailEnv, email: string, hint: strin
 
 export async function sendTwoFactorEmail(env: EmailEnv, email: string, token: string, expiresAt?: string): Promise<void> {
     await deliverEmail(env, 'two_factor', email, { token, expiresAt: expiresAt ?? '' });
+}
+
+export async function sendSendAccessOtp(
+    db: D1Db,
+    env: EmailEnv,
+    email: string,
+    sendId: string,
+): Promise<VerificationTokenResult> {
+    const result = await createVerificationToken(db, email, `send_access:${sendId}`, null, 15 * 60);
+    await deliverEmail(env, 'send_access', email, {
+        token: result.token,
+        expiresAt: result.expiresAt,
+    });
+    return result;
 }
 
 export async function sendEmailChangeToken(

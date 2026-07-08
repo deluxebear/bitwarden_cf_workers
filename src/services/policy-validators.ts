@@ -30,6 +30,8 @@ export const PolicyType = {
     AutotypeDefaultSetting: 17,
     AutomaticUserConfirmation: 18,
     BlockClaimedDomainAccountCreation: 19,
+    OrganizationUserNotification: 20,
+    SendControls: 21,
 } as const;
 
 export type PolicyTypeValue = (typeof PolicyType)[keyof typeof PolicyType];
@@ -56,6 +58,8 @@ export const POLICY_NAMES: Record<number, string> = {
     [PolicyType.AutotypeDefaultSetting]: 'Autotype default setting',
     [PolicyType.AutomaticUserConfirmation]: 'Automatically confirm invited users',
     [PolicyType.BlockClaimedDomainAccountCreation]: 'Block account creation for claimed domains',
+    [PolicyType.OrganizationUserNotification]: 'Organization user notifications',
+    [PolicyType.SendControls]: 'Send controls',
 };
 
 /**
@@ -71,6 +75,12 @@ export const POLICY_REQUIRED: Record<number, number[]> = {
     [PolicyType.ResetPassword]: [PolicyType.SingleOrg],
     // MaximumVaultTimeoutPolicyValidator: RequiredPolicies => [SingleOrg]
     [PolicyType.MaximumVaultTimeout]: [PolicyType.SingleOrg],
+    // UriMatchDefaultPolicyValidator: RequiredPolicies => [SingleOrg]
+    [PolicyType.UriMatchDefaults]: [PolicyType.SingleOrg],
+    // AutomaticUserConfirmationPolicyValidator: RequiredPolicies => [SingleOrg]
+    [PolicyType.AutomaticUserConfirmation]: [PolicyType.SingleOrg],
+    // OrganizationUserNotificationPolicyValidator: RequiredPolicies => [SingleOrg]
+    [PolicyType.OrganizationUserNotification]: [PolicyType.SingleOrg],
     // OrganizationDataOwnershipPolicyValidator (implicit via SingleOrg requirement)
     [PolicyType.OrganizationDataOwnership]: [PolicyType.SingleOrg],
 };
@@ -102,6 +112,68 @@ function validateMasterPasswordData(data: Record<string, unknown>): void {
             );
         }
     }
+
+    for (const key of ['requireLower', 'requireUpper', 'requireNumbers', 'requireSpecial', 'enforceOnLogin']) {
+        if (data[key] != null && typeof data[key] !== 'boolean') {
+            throw new BadRequestError(`Invalid data for MasterPassword policy: ${key} must be a boolean.`);
+        }
+    }
+}
+
+function validateSendOptionsData(data: Record<string, unknown>): void {
+    if (data.disableHideEmail != null && typeof data.disableHideEmail !== 'boolean') {
+        throw new BadRequestError('Invalid data for SendOptions policy: disableHideEmail must be a boolean.');
+    }
+    if (data.DisableHideEmail != null && typeof data.DisableHideEmail !== 'boolean') {
+        throw new BadRequestError('Invalid data for SendOptions policy: DisableHideEmail must be a boolean.');
+    }
+}
+
+function validateResetPasswordData(data: Record<string, unknown>): void {
+    const value = data.autoEnrollEnabled ?? data.AutoEnrollEnabled;
+    if (value != null && typeof value !== 'boolean') {
+        throw new BadRequestError('Invalid data for ResetPassword policy: autoEnrollEnabled must be a boolean.');
+    }
+}
+
+function validateSendControlsData(data: Record<string, unknown>): void {
+    for (const key of ['disableSend', 'DisableSend', 'disableHideEmail', 'DisableHideEmail']) {
+        if (data[key] != null && typeof data[key] !== 'boolean') {
+            throw new BadRequestError(`Invalid data for SendControls policy: ${key} must be a boolean.`);
+        }
+    }
+
+    const whoCanAccess = data.whoCanAccess ?? data.WhoCanAccess;
+    if (whoCanAccess != null) {
+        const v = Number(whoCanAccess);
+        if (!Number.isInteger(v) || v < 0 || v > 2) {
+            throw new BadRequestError('Invalid data for SendControls policy: whoCanAccess must be Any, PasswordProtected, or SpecificPeople.');
+        }
+    }
+
+    const allowedDomains = data.allowedDomains ?? data.AllowedDomains;
+    if (allowedDomains != null) {
+        if (typeof allowedDomains !== 'string') {
+            throw new BadRequestError('Invalid data for SendControls policy: allowedDomains must be a comma-separated string.');
+        }
+        const access = whoCanAccess == null ? null : Number(whoCanAccess);
+        if (access !== 2) {
+            throw new BadRequestError('Allowed domains can only be set when the required access type is set to specific people.');
+        }
+    }
+
+    const allowedSendTypes = data.allowedSendTypes ?? data.AllowedSendTypes;
+    if (allowedSendTypes != null) {
+        if (!Array.isArray(allowedSendTypes)) {
+            throw new BadRequestError('Invalid data for SendControls policy: allowedSendTypes must be an array.');
+        }
+        for (const value of allowedSendTypes) {
+            const v = Number(value);
+            if (!Number.isInteger(v) || v < 0 || v > 1) {
+                throw new BadRequestError('Invalid data for SendControls policy: allowedSendTypes can only contain Text or File.');
+            }
+        }
+    }
 }
 
 /**
@@ -116,7 +188,14 @@ export function validatePolicyData(type: number, data: Record<string, unknown> |
             validateMasterPasswordData(data);
             break;
         case PolicyType.SendOptions:
+            validateSendOptionsData(data);
+            break;
         case PolicyType.ResetPassword:
+            validateResetPasswordData(data);
+            break;
+        case PolicyType.SendControls:
+            validateSendControlsData(data);
+            break;
         case PolicyType.PasswordGenerator:
         case PolicyType.MaximumVaultTimeout:
         case PolicyType.UriMatchDefaults:
@@ -212,5 +291,5 @@ export function canTogglePolicyState(
  * 判断策略类型是否合法
  */
 export function isValidPolicyType(type: number): boolean {
-    return Number.isInteger(type) && type >= 0 && type <= 19;
+    return Number.isInteger(type) && type >= 0 && type <= 21;
 }

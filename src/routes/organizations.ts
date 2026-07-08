@@ -31,7 +31,7 @@ import { sendOrganizationInvite } from '../services/email';
 import { toOrganizationResponse, toOrganizationSubscriptionResponse, toOrganizationUserResponse } from '../models/organization-responses';
 import type { Bindings, Variables } from '../types';
 import { batchedInArrayQuery, D1_BATCH_SIZE } from '../services/db';
-import { pushLogOut, pushSyncUser, pushSyncOrganizationStatus } from '../services/push-notification';
+import { pushLogOut, pushNotification, pushSyncUser, pushSyncOrganizationStatus } from '../services/push-notification';
 import { PushType } from '../types/push-notification';
 import {
     PolicyType,
@@ -39,6 +39,14 @@ import {
     canTogglePolicyState, isValidPolicyType,
     type PolicyRecord,
 } from '../services/policy-validators';
+import {
+    applySendPolicySideEffects,
+    assertCanCreateOrganization,
+    assertAutomaticUserConfirmationCanBeEnabled,
+    assertClaimedDomainPolicyCanBeEnabled,
+    getAutoConfirmRecipientUserIds,
+    validateUserCanJoinOrganization,
+} from '../services/policy-requirements';
 
 const orgs = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 orgs.use('/*', authMiddleware);
@@ -58,6 +66,29 @@ async function pushSyncVaultToOrgMembers(env: HubEnv, db: D1DbType, orgId: strin
             .filter(m => m.userId)
             .map(m => pushSyncUser(env as any, PushType.SyncVault, m.userId!, null))
     );
+}
+
+async function pushAutoConfirmToManagers(c: OrgContext, db: D1DbType, orgId: string, target: OrganizationUserRow): Promise<void> {
+    if (!target.userId || target.type !== 2) return;
+
+    const org = await db.select({
+        useAutomaticUserConfirmation: organizations.useAutomaticUserConfirmation,
+    }).from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org?.useAutomaticUserConfirmation || !await isPolicyEnabled(db, orgId, PolicyType.AutomaticUserConfirmation)) {
+        return;
+    }
+
+    const recipientIds = await getAutoConfirmRecipientUserIds(db, orgId);
+    if (recipientIds.length === 0) return;
+
+    c.executionCtx.waitUntil(Promise.all(recipientIds.map((recipientId) => (
+        pushNotification(c.env, 'user', recipientId, PushType.AutoConfirm, {
+            UserId: recipientId,
+            OrganizationId: orgId,
+            TargetUserId: target.userId,
+            TargetOrganizationUserId: target.id,
+        }, null)
+    ))).then(() => undefined));
 }
 
 // ==================== 类型定义 ====================
@@ -803,6 +834,7 @@ orgs.post('/', async (c) => {
     if (!body.name || !body.billingEmail || !body.key) {
         throw new BadRequestError('Name, billingEmail, and key are required.');
     }
+    await assertCanCreateOrganization(db, userId);
 
     const orgId = generateUuid();
     const now = new Date().toISOString();
@@ -1987,6 +2019,9 @@ orgs.post('/:id/users/:orgUserId/auto-confirm', async (c) => {
         .get();
     if (!target?.userId) throw new NotFoundError('Organization user not found.');
     if (target.status !== 1) throw new BadRequestError('User is not in an accepted state.');
+    const targetUser = await db.select().from(users).where(eq(users.id, target.userId)).get();
+    if (!targetUser) throw new NotFoundError('User not found.');
+    await validateUserCanJoinOrganization(db, targetUser, orgId);
 
     const now = new Date().toISOString();
     await db.update(organizationUsers).set({
@@ -2048,6 +2083,17 @@ orgs.post('/:id/users/bulk-auto-confirm', async (c) => {
         }
         if (!entry.key) {
             results.push({ id: entry.id, error: 'Key is required.' });
+            continue;
+        }
+        const targetUser = await db.select().from(users).where(eq(users.id, target.userId)).get();
+        if (!targetUser) {
+            results.push({ id: entry.id, error: 'User not found.' });
+            continue;
+        }
+        try {
+            await validateUserCanJoinOrganization(db, targetUser, orgId);
+        } catch (error) {
+            results.push({ id: entry.id, error: error instanceof Error ? error.message : 'User cannot be confirmed.' });
             continue;
         }
 
@@ -2281,8 +2327,8 @@ orgs.post('/:id/users/:orgUserId/accept', async (c) => {
     if (!currentUser) throw new NotFoundError('User not found.');
 
     let tokenValid = false;
+    const body = await c.req.json<{ token?: string; resetPasswordKey?: string }>().catch((): { token?: string; resetPasswordKey?: string } => ({}));
     try {
-        const body = await c.req.json<{ token?: string; resetPasswordKey?: string }>().catch((): { token?: string; resetPasswordKey?: string } => ({}));
         if (body?.token) {
             const payload = await verifyInviteToken(body.token, c.env.JWT_SECRET);
             tokenValid = !!payload &&
@@ -2306,11 +2352,16 @@ orgs.post('/:id/users/:orgUserId/accept', async (c) => {
     if (targetOrgUser.status !== 0) {
         throw new BadRequestError('User is not in an invited state.');
     }
+    const joinValidation = await validateUserCanJoinOrganization(db, currentUser, orgId);
+    if (joinValidation.resetPasswordAutoEnroll && !body.resetPasswordKey) {
+        throw new BadRequestError('Reset password key is required.');
+    }
 
     const now = new Date().toISOString();
     await db.update(organizationUsers).set({
         userId: userId,
         status: 1, // Accepted
+        resetPasswordKey: body.resetPasswordKey ?? targetOrgUser.resetPasswordKey,
         revisionDate: now,
     }).where(eq(organizationUsers.id, orgUserId));
 
@@ -2320,6 +2371,14 @@ orgs.post('/:id/users/:orgUserId/accept', async (c) => {
         organizationUserId: orgUserId,
         deviceType: getDeviceTypeFromRequest(c),
     });
+    if (joinValidation.autoConfirm) {
+        await pushAutoConfirmToManagers(c, db, orgId, {
+            ...targetOrgUser,
+            userId,
+            status: 1,
+            resetPasswordKey: body.resetPasswordKey ?? targetOrgUser.resetPasswordKey,
+        });
+    }
 
     return c.body(null, 200);
 });
@@ -2616,6 +2675,11 @@ const restoreHandler = async (c: any) => {
     if (target.status !== -1) {
         throw new BadRequestError('User is not in a revoked state.');
     }
+    if (target.userId) {
+        const targetUser = await db.select().from(users).where(eq(users.id, target.userId)).get();
+        if (!targetUser) throw new NotFoundError('User not found.');
+        await validateUserCanJoinOrganization(db, targetUser, orgId);
+    }
 
     // 根据官方逻辑确定恢复后的状态
     let restoreStatus = 0; // Invited
@@ -2680,6 +2744,17 @@ const bulkRestoreHandler = async (c: any) => {
 
         let restoreStatus = 0;
         if (target.userId) {
+            const targetUser = await db.select().from(users).where(eq(users.id, target.userId)).get();
+            if (!targetUser) {
+                results.push({ id: ouId, error: 'User not found.' });
+                continue;
+            }
+            try {
+                await validateUserCanJoinOrganization(db, targetUser, orgId);
+            } catch (error) {
+                results.push({ id: ouId, error: error instanceof Error ? error.message : 'User cannot be restored.' });
+                continue;
+            }
             restoreStatus = 1;
             if (target.key) restoreStatus = 2;
         }
@@ -4264,7 +4339,13 @@ async function runPolicySideEffects(
     wasEnabled: boolean,
     orgId: string,
     actingUserId: string,
+    policy: PolicyRow,
+    now: string,
 ): Promise<void> {
+    if (policyType === PolicyType.DisableSend || policyType === PolicyType.SendOptions || policyType === PolicyType.SendControls) {
+        await applySendPolicySideEffects(db, orgId, policyType, policy, now);
+    }
+
     if (wasEnabled || !enabled) return;
 
     switch (policyType) {
@@ -4439,6 +4520,12 @@ orgs.put('/:id/policies/:type', async (c) => {
     const dataStr = runPolicyValidation(
         policyType, newEnabled, body.data ?? null, currentEnabled, allPolicies,
     );
+    if (newEnabled && policyType === PolicyType.BlockClaimedDomainAccountCreation) {
+        await assertClaimedDomainPolicyCanBeEnabled(db, orgId);
+    }
+    if (!currentEnabled && newEnabled && policyType === PolicyType.AutomaticUserConfirmation) {
+        await assertAutomaticUserConfirmationCanBeEnabled(db, orgId);
+    }
 
     const now = new Date().toISOString();
     let policy: PolicyRow;
@@ -4475,7 +4562,7 @@ orgs.put('/:id/policies/:type', async (c) => {
         deviceType: getDeviceTypeFromRequest(c),
     });
 
-    await runPolicySideEffects(db, policyType, newEnabled, currentEnabled, orgId, userId);
+    await runPolicySideEffects(db, policyType, newEnabled, currentEnabled, orgId, userId, policy, now);
 
     await bumpAccountRevisionDateByOrganizationId(db, orgId, now);
     c.executionCtx.waitUntil(pushSyncVaultToOrgMembers(c.env, db, orgId));
@@ -4520,6 +4607,12 @@ orgs.put('/:id/policies/:type/vnext', async (c) => {
     const dataStr = runPolicyValidation(
         policyType, newEnabled, policyBody.data ?? null, currentEnabled, allPolicies,
     );
+    if (newEnabled && policyType === PolicyType.BlockClaimedDomainAccountCreation) {
+        await assertClaimedDomainPolicyCanBeEnabled(db, orgId);
+    }
+    if (!currentEnabled && newEnabled && policyType === PolicyType.AutomaticUserConfirmation) {
+        await assertAutomaticUserConfirmationCanBeEnabled(db, orgId);
+    }
 
     const now = new Date().toISOString();
     let policy: PolicyRow;
@@ -4555,7 +4648,7 @@ orgs.put('/:id/policies/:type/vnext', async (c) => {
         deviceType: getDeviceTypeFromRequest(c),
     });
 
-    await runPolicySideEffects(db, policyType, newEnabled, currentEnabled, orgId, userId);
+    await runPolicySideEffects(db, policyType, newEnabled, currentEnabled, orgId, userId, policy, now);
 
     await bumpAccountRevisionDateByOrganizationId(db, orgId, now);
     c.executionCtx.waitUntil(pushSyncVaultToOrgMembers(c.env, db, orgId));

@@ -19,6 +19,7 @@ import { buildAttachmentDownloadUrl } from '../services/attachment-token';
 import type { Bindings, Variables, CipherRequest, CipherResponse, CipherType, CipherRepromptType } from '../types';
 import { pushSyncCipher, pushSyncUser } from '../services/push-notification';
 import { PushType } from '../types/push-notification';
+import { assertPersonalVaultWriteAllowed } from '../services/policy-requirements';
 
 const ciphersRoute = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
@@ -885,6 +886,9 @@ ciphersRoute.post('/', async (c) => {
     if (!body.type || !body.name) {
         throw new BadRequestError('Type and name are required.');
     }
+    if (!body.organizationId) {
+        await assertPersonalVaultWriteAllowed(db, userId);
+    }
 
     const now = new Date().toISOString();
     const cipherId = generateUuid();
@@ -969,6 +973,9 @@ ciphersRoute.post('/create', async (c) => {
 
     if (!cipherBody.type || !cipherBody.name) {
         throw new BadRequestError('Type and name are required.');
+    }
+    if (!cipherBody.organizationId) {
+        await assertPersonalVaultWriteAllowed(db, userId);
     }
 
     const now = new Date().toISOString();
@@ -1419,6 +1426,7 @@ ciphersRoute.post('/import', async (c) => {
     const foldersList = body.folders ?? [];
     const ciphersList = body.ciphers ?? [];
     const folderRelationships = body.folderRelationships ?? [];
+    await assertPersonalVaultWriteAllowed(db, userId);
 
     const userFolderIds = new Set(
         (await db.select({ id: folders.id }).from(folders).where(eq(folders.userId, userId))).map((r) => r.id)

@@ -14,6 +14,7 @@ import { generateSecureRandomString, verifyPassword } from '../services/crypto';
 import { isSignupAllowed } from '../services/signup-guard';
 import { normalizeRegistrationRequest } from '../services/registration';
 import { buildDevTokenResponse, consumeVerificationToken, sendEmailChangeToken, sendPasswordHint } from '../services/email';
+import { assertEmailNotBlockedByClaimedDomain, getMasterPasswordPolicyForUser } from '../services/policy-requirements';
 import { touchUser } from '../services/revisions';
 import type { Bindings, Variables, ProfileResponse, AccountKeysResponse } from '../types';
 import { pushLogOut, pushSyncUser } from '../services/push-notification';
@@ -39,6 +40,7 @@ accounts.post('/register', async (c) => {
     if (!await isSignupAllowed(c.env, db, email)) {
         throw new BadRequestError('Registration is disabled. Please contact the administrator for an invitation.');
     }
+    await assertEmailNotBlockedByClaimedDomain(db, email, true);
 
     const existing = await db.select({ id: users.id }).from(users).where(eq(users.email, email)).get();
     if (existing) {
@@ -522,7 +524,7 @@ accounts.post('/verify-password', async (c) => {
     const valid = await verifyPassword(body.masterPasswordHash, user.masterPassword || '');
     if (!valid) throw new BadRequestError('Invalid master password.');
 
-    return c.json({ masterPasswordPolicy: null });
+    return c.json({ masterPasswordPolicy: await getMasterPasswordPolicyForUser(db, userId) });
 });
 
 /**

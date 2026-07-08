@@ -82,3 +82,10 @@ export interface OrganizationStatusPushNotification {
     OrganizationId: string;
     Enabled: boolean;
 }
+
+export interface AutoConfirmPushNotification {
+    UserId: string;
+    OrganizationId: string;
+    TargetUserId: string;
+    TargetOrganizationUserId: string;
+}

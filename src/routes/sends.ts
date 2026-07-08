@@ -14,6 +14,7 @@ import { generateUuid, hashSendPassword, verifySendPassword } from '../services/
 import type { Bindings, Variables, SendRequest, SendResponse, SendAccessResponse, SendType } from '../types';
 import { pushSyncSend } from '../services/push-notification';
 import { PushType } from '../types/push-notification';
+import { validateSendCanSave } from '../services/policy-requirements';
 
 const sendsRoute = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 const MAX_SEND_FILE_SIZE = 501 * 1024 * 1024;
@@ -216,6 +217,7 @@ async function ensureSendAccess(c: any, send: SendRow, password?: string | null)
         throw new NotFoundError('Send not found.');
     }
 
+    if ((send as any).emails) throw new NotFoundError('Send not found.');
     if (!send.password) return null;
     if (!password) {
         return c.json({ error: 'password_required', error_description: 'A password is required.', object: 'error' }, 401);
@@ -281,7 +283,7 @@ function toSendAccessResponse(send: SendRow): SendAccessResponse {
     const response: SendAccessResponse & { authType: number } = {
         id: accessIdFromUuid(send.id),
         type: send.type as SendType,
-        authType: send.password ? 1 : 2,
+        authType: (send as any).emails ? 0 : send.password ? 1 : 2,
         name: data?.name || '',
         key: send.key || '',
         expirationDate: send.expirationDate,
@@ -307,7 +309,7 @@ function toSendResponse(send: any): SendResponse {
     // AuthType 推断逻辑 (参照 Bitwarden Core)
     // 0: Email, 1: Password, 2: None
     let authType = 2;
-    if (send.hideEmail && (send as any).emails) authType = 0; // Approximation, since we only use password
+    if ((send as any).emails) authType = 0;
     if (send.password) authType = 1;
 
     const baseResponse: any = {
@@ -325,6 +327,7 @@ function toSendResponse(send: any): SendResponse {
         expirationDate: send.expirationDate,
         deletionDate: send.deletionDate,
         password: send.password ? 'set' : null,
+        emails: (send as any).emails ?? null,
         disabled: send.disabled,
         hideEmail: send.hideEmail,
         object: 'send',
@@ -523,6 +526,12 @@ authed.post('/file/v2', async (c) => {
     if (body.fileLength > MAX_SEND_FILE_SIZE) {
         throw new BadRequestError('Max file size is 501 MB.');
     }
+    await validateSendCanSave(db, userId, {
+        type: body.type,
+        password: body.password ?? null,
+        hideEmail: body.hideEmail ?? false,
+        emails: body.emails ?? null,
+    });
 
     const now = new Date().toISOString();
     const sendId = generateUuid();
@@ -550,6 +559,7 @@ authed.post('/file/v2', async (c) => {
         data: JSON.stringify(fileData),
         key: body.key,
         password: hashedPassword,
+        emails: body.emails ?? null,
         maxAccessCount: body.maxAccessCount ?? null,
         accessCount: 0,
         expirationDate: body.expirationDate ?? null,
@@ -623,6 +633,12 @@ authed.post('/', async (c) => {
     if (body.type === undefined || !body.deletionDate) {
         throw new BadRequestError('Type and deletion date are required.');
     }
+    await validateSendCanSave(db, userId, {
+        type: body.type,
+        password: body.password ?? null,
+        hideEmail: body.hideEmail ?? false,
+        emails: body.emails ?? null,
+    });
 
     const now = new Date().toISOString();
     const sendId = generateUuid();
@@ -638,6 +654,7 @@ authed.post('/', async (c) => {
         id: sendId, userId, type: body.type,
         data: JSON.stringify(data), key: body.key,
         password: hashedPassword,
+        emails: body.emails ?? null,
         maxAccessCount: body.maxAccessCount ?? null, accessCount: 0,
         expirationDate: body.expirationDate ?? null,
         deletionDate: body.deletionDate,
@@ -739,11 +756,21 @@ authed.put('/:id', async (c) => {
     if (body.password !== undefined) {
         hashedPassword = body.password ? await hashSendPassword(body.password) : null;
     }
+    const nextEmails = body.emails !== undefined ? body.emails : (existing as any).emails ?? null;
+
+    await validateSendCanSave(db, userId, {
+        type: body.type ?? existing.type,
+        password: body.password ?? null,
+        hasPassword: !!hashedPassword,
+        hideEmail: body.hideEmail !== undefined ? body.hideEmail : existing.hideEmail,
+        emails: nextEmails,
+    });
 
     await db.update(sends).set({
         data: JSON.stringify(data),
         key: body.key !== undefined ? body.key : existing.key,
         password: hashedPassword,
+        emails: nextEmails,
         maxAccessCount: body.maxAccessCount !== undefined ? body.maxAccessCount : existing.maxAccessCount,
         expirationDate: body.expirationDate !== undefined ? body.expirationDate : existing.expirationDate,
         deletionDate: body.deletionDate || existing.deletionDate,
@@ -770,8 +797,16 @@ const removeSendAuthHandler = async (c: any) => {
         .where(and(eq(sends.id, sendId), eq(sends.userId, userId))).get();
     if (!existing) throw new NotFoundError('Send not found.');
 
+    await validateSendCanSave(db, userId, {
+        type: existing.type,
+        password: null,
+        hasPassword: false,
+        hideEmail: existing.hideEmail,
+        emails: null,
+    });
+
     const now = new Date().toISOString();
-    await db.update(sends).set({ password: null, revisionDate: now }).where(eq(sends.id, sendId));
+    await db.update(sends).set({ password: null, emails: null, revisionDate: now }).where(eq(sends.id, sendId));
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
 
     const updated = await db.select().from(sends).where(eq(sends.id, sendId)).get();

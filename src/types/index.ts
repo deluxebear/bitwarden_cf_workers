@@ -435,6 +435,8 @@ export interface SendRequest {
     expirationDate?: string | null;
     deletionDate: string;
     password?: string | null;
+    emails?: string | null;
+    authType?: number | null;
     disabled?: boolean;
     hideEmail?: boolean;
 }
@@ -456,6 +458,7 @@ export interface SendResponse {
     expirationDate: string | null;
     deletionDate: string;
     password: string | null; // 客户端只需知道是否有密码
+    emails?: string | null;
     disabled: boolean;
     hideEmail: boolean | null;
     object: string;

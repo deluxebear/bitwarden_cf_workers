@@ -390,7 +390,7 @@ sync.get('/', async (c) => {
     const formattedSends = activeSends.map((send): SendResponse => {
         const data = send.data ? JSON.parse(send.data) : null;
         let authType = 2;
-        if (send.hideEmail && (send as any).emails) authType = 0;
+        if ((send as any).emails) authType = 0;
         if (send.password) authType = 1;
 
         const baseResponse: any = {
@@ -408,6 +408,7 @@ sync.get('/', async (c) => {
             expirationDate: send.expirationDate,
             deletionDate: send.deletionDate,
             password: send.password ? 'set' : null,
+            emails: (send as any).emails ?? null,
             disabled: toJsonBool(send.disabled),
             hideEmail: toJsonBool(send.hideEmail),
             object: 'send',
