@@ -4212,6 +4212,33 @@ function parsePolicyData(data: string | null | undefined): Record<string, unknow
     try { return JSON.parse(data); } catch { return {}; }
 }
 
+type SavePolicyBody = {
+    enabled?: boolean;
+    Enabled?: boolean;
+    data?: Record<string, unknown> | null;
+    Data?: Record<string, unknown> | null;
+    policy?: {
+        enabled?: boolean;
+        Enabled?: boolean;
+        data?: Record<string, unknown> | null;
+        Data?: Record<string, unknown> | null;
+    };
+    Policy?: {
+        enabled?: boolean;
+        Enabled?: boolean;
+        data?: Record<string, unknown> | null;
+        Data?: Record<string, unknown> | null;
+    };
+};
+
+export function getSavePolicyRequest(body: SavePolicyBody) {
+    const policyBody = body.policy ?? body.Policy ?? body;
+    return {
+        enabled: policyBody.enabled ?? policyBody.Enabled ?? false,
+        data: policyBody.data ?? policyBody.Data ?? null,
+    };
+}
+
 /**
  * 对应 PolicyStatusResponseModel（含 canToggleState，不含 id/revisionDate）
  * 用于 GET /:id/policies/:type 端点
@@ -4545,15 +4572,9 @@ orgs.put('/:id/policies/:type', async (c) => {
     const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
     if (!org) throw new NotFoundError('Organization not found.');
 
-    const body = await c.req.json<{
-        enabled?: boolean;
-        Enabled?: boolean;
-        data?: Record<string, unknown> | null;
-        Data?: Record<string, unknown> | null;
-    }>();
+    const body = await c.req.json<SavePolicyBody>();
 
-    const newEnabled = body.enabled ?? body.Enabled ?? false;
-    const requestedData = body.data ?? body.Data ?? null;
+    const { enabled: newEnabled, data: requestedData } = getSavePolicyRequest(body);
 
     const allPolicies = await getOrgPolicies(db, orgId);
     const existing = allPolicies.find(p => p.type === policyType);
@@ -4634,16 +4655,9 @@ orgs.put('/:id/policies/:type/vnext', async (c) => {
     const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
     if (!org) throw new NotFoundError('Organization not found.');
 
-    const body = await c.req.json<{
-        policy?: { enabled?: boolean; Enabled?: boolean; data?: Record<string, unknown> | null; Data?: Record<string, unknown> | null };
-        Policy?: { enabled?: boolean; Enabled?: boolean; data?: Record<string, unknown> | null; Data?: Record<string, unknown> | null };
-        metadata?: Record<string, unknown> | null;
-        Metadata?: Record<string, unknown> | null;
-    }>();
+    const body = await c.req.json<SavePolicyBody>();
 
-    const policyBody = body.policy ?? body.Policy ?? {};
-    const newEnabled = policyBody.enabled ?? policyBody.Enabled ?? false;
-    const requestedData = policyBody.data ?? policyBody.Data ?? null;
+    const { enabled: newEnabled, data: requestedData } = getSavePolicyRequest(body);
 
     const allPolicies = await getOrgPolicies(db, orgId);
     const existing = allPolicies.find(p => p.type === policyType);

@@ -1,6 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
+import { getSavePolicyRequest } from './organizations';
+
 describe('organization policies route compatibility', () => {
     it('mounts full organization routes on both API and upstream-style organization paths', () => {
         const source = readFileSync('src/index.ts', 'utf8');
@@ -15,5 +17,32 @@ describe('organization policies route compatibility', () => {
         expect(source).toContain('function getPolicyStatusList');
         expect(source).toContain('data: getPolicyStatusList(orgId, policyList)');
         expect(source).toContain('CanToggleState: canToggleState');
+    });
+
+    it('accepts the current web vault nested SavePolicyRequest body', () => {
+        const request = getSavePolicyRequest({
+            policy: {
+                enabled: true,
+                data: null,
+            },
+            metadata: null,
+        } as any);
+
+        expect(request).toEqual({
+            enabled: true,
+            data: null,
+        });
+    });
+
+    it('keeps compatibility with flat legacy policy request bodies', () => {
+        const request = getSavePolicyRequest({
+            Enabled: true,
+            Data: { DisableSend: true },
+        });
+
+        expect(request).toEqual({
+            enabled: true,
+            data: { DisableSend: true },
+        });
     });
 });
