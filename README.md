@@ -221,7 +221,7 @@ npx wrangler deploy --config wrangler.deploy.toml
 2. Checkout `deluxebear/bitwarden_clients` 到 `clients/`。
 3. 安装两个仓库的 npm 依赖。
 4. 执行 Workers `typecheck` 和 `test`。
-5. 在 `clients/apps/web` 执行 `npm run dist:oss:selfhost`。
+5. 在 `clients/apps/web` 执行 `npm run dist:bit:selfhost`。
 6. 校验 `clients/apps/web/build/index.html` 存在并删除 `.map` 文件。
 7. 从 GitHub Secrets 生成 `workers/wrangler.deploy.toml`。
 8. 使用临时配置执行 D1 迁移。

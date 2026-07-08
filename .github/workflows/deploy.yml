@@ -66,7 +66,7 @@ jobs:
 
       - name: Build Web Vault static assets
         working-directory: ${{ env.CLIENTS_DIR }}/apps/web
-        run: npm run dist:oss:selfhost
+        run: npm run dist:bit:selfhost
 
       - name: Validate Web Vault static assets
         run: |
