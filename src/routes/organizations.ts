@@ -4192,11 +4192,17 @@ function toPolicyResponse(p: PolicyRow) {
     }
     return {
         id: p.id,
+        Id: p.id,
         organizationId: p.organizationId,
+        OrganizationId: p.organizationId,
         type: p.type,
+        Type: p.type,
         data,
+        Data: data,
         enabled: p.enabled,
+        Enabled: p.enabled,
         revisionDate: p.revisionDate,
+        RevisionDate: p.revisionDate,
         object: 'policy',
     };
 }
@@ -4218,10 +4224,15 @@ function toPolicyStatusResponse(
     const enabled = policy?.enabled ?? false;
     return {
         organizationId: orgId,
+        OrganizationId: orgId,
         type: policyType,
+        Type: policyType,
         data,
+        Data: data,
         enabled,
+        Enabled: enabled,
         canToggleState: canTogglePolicyState(policyType, enabled, allPolicies),
+        CanToggleState: canTogglePolicyState(policyType, enabled, allPolicies),
         object: 'policy',
     };
 }
@@ -4508,17 +4519,20 @@ orgs.put('/:id/policies/:type', async (c) => {
 
     const body = await c.req.json<{
         enabled?: boolean;
+        Enabled?: boolean;
         data?: Record<string, unknown> | null;
+        Data?: Record<string, unknown> | null;
     }>();
 
-    const newEnabled = body.enabled ?? false;
+    const newEnabled = body.enabled ?? body.Enabled ?? false;
+    const requestedData = body.data ?? body.Data ?? null;
 
     const allPolicies = await getOrgPolicies(db, orgId);
     const existing = allPolicies.find(p => p.type === policyType);
     const currentEnabled = existing?.enabled ?? false;
 
     const dataStr = runPolicyValidation(
-        policyType, newEnabled, body.data ?? null, currentEnabled, allPolicies,
+        policyType, newEnabled, requestedData, currentEnabled, allPolicies,
     );
     if (newEnabled && policyType === PolicyType.BlockClaimedDomainAccountCreation) {
         await assertClaimedDomainPolicyCanBeEnabled(db, orgId);
@@ -4593,19 +4607,22 @@ orgs.put('/:id/policies/:type/vnext', async (c) => {
     if (!org) throw new NotFoundError('Organization not found.');
 
     const body = await c.req.json<{
-        policy: { enabled?: boolean; data?: Record<string, unknown> | null };
+        policy?: { enabled?: boolean; Enabled?: boolean; data?: Record<string, unknown> | null; Data?: Record<string, unknown> | null };
+        Policy?: { enabled?: boolean; Enabled?: boolean; data?: Record<string, unknown> | null; Data?: Record<string, unknown> | null };
         metadata?: Record<string, unknown> | null;
+        Metadata?: Record<string, unknown> | null;
     }>();
 
-    const policyBody = body.policy ?? {};
-    const newEnabled = policyBody.enabled ?? false;
+    const policyBody = body.policy ?? body.Policy ?? {};
+    const newEnabled = policyBody.enabled ?? policyBody.Enabled ?? false;
+    const requestedData = policyBody.data ?? policyBody.Data ?? null;
 
     const allPolicies = await getOrgPolicies(db, orgId);
     const existing = allPolicies.find(p => p.type === policyType);
     const currentEnabled = existing?.enabled ?? false;
 
     const dataStr = runPolicyValidation(
-        policyType, newEnabled, policyBody.data ?? null, currentEnabled, allPolicies,
+        policyType, newEnabled, requestedData, currentEnabled, allPolicies,
     );
     if (newEnabled && policyType === PolicyType.BlockClaimedDomainAccountCreation) {
         await assertClaimedDomainPolicyCanBeEnabled(db, orgId);
