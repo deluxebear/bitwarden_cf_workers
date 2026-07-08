@@ -19,11 +19,11 @@
     "otpauth": "^9.5.0"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20250224.0",
+    "@cloudflare/workers-types": "^5.20260708.1",
     "@types/node": "^22.13.0",
     "drizzle-kit": "^0.30.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0",
-    "wrangler": "^4.88.0"
+    "wrangler": "^4.108.0"
   }
 }
