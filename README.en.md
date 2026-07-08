@@ -56,7 +56,7 @@
 
 ### Prerequisites
 
-- Node.js >= 18
+- Node.js >= 22 (required by Wrangler 4.x)
 - npm
 - [Cloudflare account](https://dash.cloudflare.com/sign-up) (free tier is sufficient)
 

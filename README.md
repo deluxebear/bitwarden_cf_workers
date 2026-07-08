@@ -56,7 +56,7 @@
 
 ### 前置条件
 
-- Node.js >= 18
+- Node.js >= 22（Wrangler 4.x 要求）
 - npm
 - [Cloudflare 账户](https://dash.cloudflare.com/sign-up)（免费即可）
 
