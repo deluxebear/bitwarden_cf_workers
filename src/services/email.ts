@@ -128,13 +128,22 @@ async function deliverCloudflareEmail(
         });
     } catch (error) {
         const details = error instanceof Error ? error.message : 'unknown';
+        const errorLike = error as { code?: unknown; name?: unknown };
+        const code = typeof errorLike.code === 'string' ? errorLike.code : null;
+        const name = typeof errorLike.name === 'string'
+            ? errorLike.name
+            : error instanceof Error ? error.name : null;
         console.error(JSON.stringify({
             event: 'email.cloudflare.failed',
             type,
             email: normalizeEmail(email),
+            code,
+            name,
             error: details,
         }));
-        throw new BadRequestError('Cloudflare Email Service rejected the message.');
+        throw new BadRequestError(code
+            ? `Cloudflare Email Service rejected the message (${code}).`
+            : 'Cloudflare Email Service rejected the message.');
     }
 }
 

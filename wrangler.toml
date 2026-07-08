@@ -3,6 +3,24 @@ main = "src/index.ts"
 compatibility_date = "2025-12-01"
 compatibility_flags = ["nodejs_compat"]
 
+[assets]
+directory = "../clients/apps/web/build"
+not_found_handling = "single-page-application"
+run_worker_first = [
+  "/api/*",
+  "/identity/*",
+  "/icons/*",
+  "/events/*",
+  "/notifications/*",
+  "/hub",
+  "/hub/*",
+  "/attachments/*",
+  "/organizations/*",
+  "/alive",
+  "/now",
+  "/version",
+]
+
 [vars]
 JWT_SECRET = "change-me-in-production"
 JWT_EXPIRATION = "3600"
@@ -16,31 +34,28 @@ ICONS_MAX_IMAGE_BYTES = "51200"
 # 设为 "true" 时，邀请链接一律进入「注册」页，被邀请人需设置主密钥（适合自建、该邮箱尚未注册或希望走注册流程）
 # FORCE_INVITE_REGISTER = "true"
 # 控制开放注册行为: "true" 始终允许 | "false" 始终禁止 | "auto" 无用户时允许，有用户后关闭（默认）
-SIGNUPS_ALLOWED = "true"
-# 本地开发默认：邮件 token 写入 wrangler 日志，并在响应中回显，便于 Web 注册/邮箱变更手测。
-# 生产推荐使用 Cloudflare Email Service：
-#   1. 在 Cloudflare Dashboard > Compute > Email Service > Email Sending 中 onboard 发件域名。
-#   2. 将下方 EMAIL_MODE 改为 "cloudflare"，配置 EMAIL_FROM，并启用 [[send_email]] 示例。
-#   3. 移除 EMAIL_RETURN_TOKENS，避免生产响应回显邮件 token。
-# EMAIL_MODE = "cloudflare"
-# EMAIL_FROM = "Bitwarden <no-reply@example.com>"
-# EMAIL_REPLY_TO = "support@example.com"
+SIGNUPS_ALLOWED = "false"
+# 生产邮件投递使用 Cloudflare Email Service。
+# 部署前需在 Cloudflare Dashboard > Compute > Email Service > Email Sending 中
+# 完成 ifn.app 发件域名 onboarding。
+EMAIL_MODE = "cloudflare"
+EMAIL_FROM = "Bitwarden <no-reply@ifn.app>"
+# EMAIL_REPLY_TO = "support@ifn.app"
 #
 # 通用 HTTP webhook provider 仍可用：
 # EMAIL_MODE = "provider"
 # EMAIL_PROVIDER_ENDPOINT = "https://mail.example.com/bitwarden-email"
-EMAIL_MODE = "log"
-EMAIL_RETURN_TOKENS = "true"
+# 本地调试如需回显 token，可临时改为 EMAIL_MODE="log" 并设置 EMAIL_RETURN_TOKENS="true"。
 
-# Cloudflare Email Service Workers binding。启用 EMAIL_MODE="cloudflare" 时必须配置。
-# [[send_email]]
-# name = "EMAIL"
-# remote = true
+# Cloudflare Email Service Workers binding。
+[[send_email]]
+name = "EMAIL"
+allowed_sender_addresses = ["no-reply@ifn.app"]
 
 [[d1_databases]]
 binding = "DB"
 database_name = "bitwarden-db"
-database_id = "local"
+database_id = "b8f0bb27-981f-4089-8eb3-6f9f967c8baa"
 migrations_dir = "drizzle"
 
 [dev]
@@ -52,8 +67,8 @@ bucket_name = "bitwarden-attachments"
 
 [[kv_namespaces]]
 binding = "ICONS_CACHE"
-id = "local-icons-cache"
-preview_id = "local-icons-cache"
+id = "07bd0124330848eebed4b01a044d40d6"
+preview_id = "524817ad20d944ca9bd763b4b1235800"
 
 # Durable Objects - 实时通知 (SignalR 兼容 WebSocket Hub)
 # 对应官方 Notifications/NotificationsHub.cs

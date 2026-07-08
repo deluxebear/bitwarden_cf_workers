@@ -14,6 +14,10 @@ function isEmailVerificationEnabled(env: Bindings): boolean {
         String(env.EMAIL_RETURN_TOKENS ?? '').toLowerCase() === 'true';
 }
 
+function isUserRegistrationDisabled(env: Bindings): boolean {
+    return String(env.SIGNUPS_ALLOWED ?? 'auto').toLowerCase().trim() === 'false';
+}
+
 /**
  * GET /api/config
  * 对应 ConfigController.Get
@@ -51,7 +55,7 @@ config.get('/', async (c) => {
         },
         communication: null,
         settings: {
-            disableUserRegistration: false,
+            disableUserRegistration: isUserRegistrationDisabled(c.env),
         },
         object: 'config',
     });
