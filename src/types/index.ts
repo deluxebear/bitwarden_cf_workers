@@ -164,6 +164,7 @@ export enum GrantType {
     Password = 'password',
     RefreshToken = 'refresh_token',
     ClientCredentials = 'client_credentials',
+    AuthorizationCode = 'authorization_code',
     WebAuthn = 'webauthn',
     SendAccess = 'send_access',
 }
@@ -220,6 +221,9 @@ export interface TokenRequest {
     deviceIdentifier?: string;
     deviceName?: string;
     refresh_token?: string;
+    code?: string;
+    code_verifier?: string;
+    redirect_uri?: string;
     authRequest?: string;
     TwoFactorProvider?: number;
     TwoFactorToken?: string;

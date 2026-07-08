@@ -30,6 +30,19 @@ import type { Bindings, Variables, KdfType, PreloginRequest, PreloginResponse, R
 const identity = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 const SEND_ACCESS_TOKEN_LIFETIME_SECONDS = 15 * 60;
 
+function unsupportedSsoResponse(c: any) {
+    return c.json({
+        error: 'unsupported_sso',
+        error_description: 'SSO/OIDC is not supported by this Workers deployment.',
+        ErrorModel: {
+            Message: 'SSO/OIDC is not supported by this Workers deployment.',
+            Object: 'error',
+        },
+        message: 'SSO/OIDC is not supported by this Workers deployment.',
+        object: 'error',
+    }, 400);
+}
+
 /**
  * POST /identity/accounts/prelogin
  * POST /identity/accounts/prelogin/password (新版端点)
@@ -78,6 +91,18 @@ async function handlePrelogin(c: any) {
 
 identity.post('/accounts/prelogin', handlePrelogin);
 identity.post('/accounts/prelogin/password', handlePrelogin);
+
+/**
+ * GET /identity/sso/prevalidate
+ * 当前阶段不实现完整 SSO runtime。显式返回 unsupported，避免 Web 客户端进入半成功状态。
+ */
+identity.get('/sso/prevalidate', (c) => unsupportedSsoResponse(c));
+
+/**
+ * GET /identity/connect/authorize
+ * SSO/OIDC Auth Code + PKCE 入口。完整 IdP runtime 属后续企业能力，当前明确失败。
+ */
+identity.get('/connect/authorize', (c) => unsupportedSsoResponse(c));
 
 /**
  * GET /identity/accounts/webauthn/assertion-options
@@ -542,6 +567,8 @@ identity.post('/connect/token', async (c) => {
         return await handleWebAuthnGrant(c, db, body, webAuthnToken, webAuthnDeviceResponse);
     } else if (body.grant_type === 'send_access') {
         return await handleSendAccessGrant(c, db, body as TokenRequest & SendAccessTokenRequest);
+    } else if (body.grant_type === 'authorization_code') {
+        return unsupportedSsoResponse(c);
     }
 
     throw new BadRequestError('Unsupported grant_type.');
