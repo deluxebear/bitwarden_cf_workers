@@ -9,7 +9,7 @@ import { drizzle } from 'drizzle-orm/d1';
 import { eq, and } from 'drizzle-orm';
 import { users, devices, refreshTokens, organizationUsers, sends } from '../db/schema';
 import { signJwt, signJwtClaims } from '../middleware/auth';
-import { generateUuid, generateSecureRandomString, generateRefreshToken, sha256, verifyPassword, verifySendPassword } from '../services/crypto';
+import { generateUuid, generateSecureRandomString, generateRefreshToken, sha256, verifyPassword, verifySendPassword, verifyInviteToken } from '../services/crypto';
 import { verifyAuthenticatorCode } from '../services/totp';
 import { logEvent } from '../services/events';
 import { BadRequestError } from '../middleware/error';
@@ -29,6 +29,62 @@ import type { Bindings, Variables, KdfType, PreloginRequest, PreloginResponse, R
 
 const identity = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 const SEND_ACCESS_TOKEN_LIFETIME_SECONDS = 15 * 60;
+
+type RegisterFinishInvite = {
+    organizationUserId?: string;
+    orgInviteToken?: string;
+};
+
+type D1Db = ReturnType<typeof drizzle>;
+
+function getRegisterFinishInvite(body: Record<string, unknown>): RegisterFinishInvite {
+    const organizationUserId = typeof body.organizationUserId === 'string'
+        ? body.organizationUserId
+        : typeof body.organization_user_id === 'string'
+            ? body.organization_user_id
+            : undefined;
+    const orgInviteToken = typeof body.orgInviteToken === 'string'
+        ? body.orgInviteToken
+        : typeof body.org_invite_token === 'string'
+            ? body.org_invite_token
+            : undefined;
+
+    return { organizationUserId, orgInviteToken };
+}
+
+async function getValidRegisterFinishInvite(
+    db: D1Db,
+    env: Bindings,
+    email: string,
+    invite: RegisterFinishInvite,
+) {
+    if (!invite.organizationUserId && !invite.orgInviteToken) return null;
+    if (!invite.organizationUserId || !invite.orgInviteToken) {
+        throw new BadRequestError('Organization invitation token is invalid.');
+    }
+
+    const payload = await verifyInviteToken(invite.orgInviteToken, env.JWT_SECRET);
+    if (!payload ||
+        payload.orgUserId !== invite.organizationUserId ||
+        payload.email.toLowerCase() !== email.toLowerCase()) {
+        throw new BadRequestError('Organization invitation token is invalid.');
+    }
+
+    const orgUser = await db.select().from(organizationUsers)
+        .where(and(
+            eq(organizationUsers.id, payload.orgUserId),
+            eq(organizationUsers.organizationId, payload.orgId),
+        ))
+        .get();
+
+    if (!orgUser ||
+        orgUser.status !== 0 ||
+        orgUser.email.toLowerCase() !== email.toLowerCase()) {
+        throw new BadRequestError('Organization invitation token is invalid.');
+    }
+
+    return orgUser;
+}
 
 function unsupportedSsoResponse(c: any) {
     return c.json({
@@ -280,6 +336,10 @@ identity.post('/accounts/register/finish', async (c) => {
         userAsymmetricKeys?: { publicKey: string; encryptedPrivateKey: string };
         keys?: { publicKey: string; encryptedPrivateKey: string };
         emailVerificationToken?: string;
+        organizationUserId?: string;
+        orgInviteToken?: string;
+        organization_user_id?: string;
+        org_invite_token?: string;
         name?: string;
     };
     const registration = normalizeRegistrationRequest(body);
@@ -292,16 +352,25 @@ identity.post('/accounts/register/finish', async (c) => {
     const email = registration.email.toLowerCase().trim();
     const { generateSecureRandomString } = await import('../services/crypto');
     const now = new Date().toISOString();
+    const registerInvite = await getValidRegisterFinishInvite(
+        db,
+        c.env,
+        email,
+        getRegisterFinishInvite(body),
+    );
 
     const existingUser = await db.select().from(users).where(eq(users.email, email)).get();
 
     if (existingUser) {
         // 该邮箱已存在：仅当存在待接受的组织邀请时允许「完成注册」（用新密码/密钥更新）
-        const pendingInvite = await db.select().from(organizationUsers)
+        const pendingInvite = registerInvite ?? await db.select().from(organizationUsers)
             .where(and(eq(organizationUsers.email, email), eq(organizationUsers.status, 0)))
             .get();
         if (!pendingInvite) {
             throw new BadRequestError('Email is already registered.');
+        }
+        if (registerInvite?.userId && registerInvite.userId !== existingUser.id) {
+            throw new BadRequestError('This invitation belongs to a different user.');
         }
         await db.update(users).set({
             masterPassword: registration.masterPasswordHash,
@@ -321,14 +390,16 @@ identity.post('/accounts/register/finish', async (c) => {
         return c.json(null, 200);
     }
 
-    // 新用户注册（非邀请）：检查是否允许开放注册
-    if (!await isSignupAllowed(c.env, db, email)) {
-        throw new BadRequestError('Registration is disabled. Please contact the administrator for an invitation.');
+    if (!registerInvite) {
+        // 新用户普通注册：检查是否允许开放注册，并要求邮箱验证码。
+        if (!await isSignupAllowed(c.env, db, email)) {
+            throw new BadRequestError('Registration is disabled. Please contact the administrator for an invitation.');
+        }
+        if (!body.emailVerificationToken) {
+            throw new BadRequestError('Email verification token is required.');
+        }
+        await consumeVerificationToken(db, email, 'registration', body.emailVerificationToken);
     }
-    if (!body.emailVerificationToken) {
-        throw new BadRequestError('Email verification token is required.');
-    }
-    await consumeVerificationToken(db, email, 'registration', body.emailVerificationToken);
 
     const userId = crypto.randomUUID();
 
