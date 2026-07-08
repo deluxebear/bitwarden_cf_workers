@@ -16,6 +16,13 @@ export class BadRequestError extends Error {
     }
 }
 
+export class ConflictError extends Error {
+    constructor(message: string = 'Conflict') {
+        super(message);
+        this.name = 'ConflictError';
+    }
+}
+
 export class NotFoundError extends Error {
     constructor(message: string = 'Not found') {
         super(message);
@@ -40,6 +47,10 @@ function buildErrorResponse(c: Context, err: Error) {
     if (err instanceof BadRequestError) {
         body.message = err.message;
         return c.json(body, 400);
+    }
+    if (err instanceof ConflictError) {
+        body.message = err.message;
+        return c.json(body, 409);
     }
     if (err instanceof NotFoundError) {
         body.message = err.message;

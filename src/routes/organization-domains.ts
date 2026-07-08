@@ -9,7 +9,7 @@
 import { Hono } from 'hono';
 import type { Context } from 'hono';
 import { drizzle } from 'drizzle-orm/d1';
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq, ne, sql } from 'drizzle-orm';
 import {
     organizationDomains,
     organizations,
@@ -18,7 +18,7 @@ import {
 } from '../db/schema';
 import type { OrganizationDomainRow, OrganizationRow, OrganizationUserRow, SsoConfigRow } from '../db/schema';
 import { authMiddleware } from '../middleware/auth';
-import { BadRequestError, NotFoundError } from '../middleware/error';
+import { BadRequestError, ConflictError, NotFoundError } from '../middleware/error';
 import { generateSecureRandomString, generateUuid } from '../services/crypto';
 import { logEvent } from '../services/events';
 import type { Bindings, Variables } from '../types';
@@ -28,6 +28,8 @@ const organizationDomainsRoutes = new Hono<{ Bindings: Bindings; Variables: Vari
 type D1Db = ReturnType<typeof drizzle>;
 type OrgDomainContext = Context<{ Bindings: Bindings; Variables: Variables }>;
 type Fetcher = typeof fetch;
+const DOMAIN_NOT_AVAILABLE_MESSAGE = 'The domain is not available to be claimed.';
+const VALID_DOMAIN_NAME_REGEX = /^(?!(http(s)?:\/\/|www\.))([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/;
 
 interface DnsJsonAnswer {
     type?: number;
@@ -73,16 +75,7 @@ function normalizeDomainName(value: unknown): string {
     }
 
     const domain = value.trim().toLowerCase();
-    if (
-        domain.length === 0 ||
-        domain.length > 255 ||
-        domain.includes('@') ||
-        domain.includes('/') ||
-        domain.includes(':') ||
-        domain.startsWith('.') ||
-        domain.endsWith('.') ||
-        !domain.includes('.')
-    ) {
+    if (domain.length === 0 || domain.length > 255 || !VALID_DOMAIN_NAME_REGEX.test(domain)) {
         throw new BadRequestError('Invalid domain name.');
     }
 
@@ -279,6 +272,19 @@ async function getOrganizationOrNotFound(db: D1Db, orgId: string): Promise<Organ
     return organization;
 }
 
+async function assertDomainIsNotVerifiedByAnotherOrganization(db: D1Db, orgId: string, domainName: string) {
+    const verifiedClaim = await db.select({ id: organizationDomains.id }).from(organizationDomains)
+        .where(and(
+            eq(organizationDomains.domainName, domainName),
+            ne(organizationDomains.organizationId, orgId),
+            sql`${organizationDomains.verifiedDate} IS NOT NULL`,
+        ))
+        .get();
+    if (verifiedClaim) {
+        throw new ConflictError(DOMAIN_NOT_AVAILABLE_MESSAGE);
+    }
+}
+
 /**
  * POST /api/organizations/domain/sso/verified
  */
@@ -394,12 +400,7 @@ organizationDomainsRoutes.post('/:id/domain', async (c) => {
         throw new BadRequestError('Domain already exists for this organization.');
     }
 
-    const verifiedClaim = await db.select({ id: organizationDomains.id }).from(organizationDomains)
-        .where(and(eq(organizationDomains.domainName, domainName), sql`${organizationDomains.verifiedDate} IS NOT NULL`))
-        .get();
-    if (verifiedClaim) {
-        throw new BadRequestError('Domain has already been claimed.');
-    }
+    await assertDomainIsNotVerifiedByAnotherOrganization(db, orgId, domainName);
 
     const now = new Date().toISOString();
     const nextRunDate = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
@@ -473,8 +474,12 @@ organizationDomainsRoutes.post('/:id/domain/:domainId/verify', async (c) => {
         .get();
     if (!domain) throw new NotFoundError('Organization domain not found.');
 
+    await assertDomainIsNotVerifiedByAnotherOrganization(db, orgId, domain.domainName);
     const domainVerified = await verifyDnsTxtRecord(c, domain);
     const now = new Date().toISOString();
+    if (domainVerified) {
+        await assertDomainIsNotVerifiedByAnotherOrganization(db, orgId, domain.domainName);
+    }
     await db
         .update(organizationDomains)
         .set({
