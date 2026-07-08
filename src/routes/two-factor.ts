@@ -10,6 +10,7 @@ import { users } from '../db/schema';
 import { authMiddleware } from '../middleware/auth';
 import { BadRequestError } from '../middleware/error';
 import { verifyPassword, generateSecureRandomString } from '../services/crypto';
+import { sendTwoFactorEmail } from '../services/email';
 import { generateAuthenticatorKey, verifyAuthenticatorCode } from '../services/totp';
 import {
     startWebAuthnRegistration,
@@ -146,7 +147,7 @@ function toDuoResponse(providers: Record<number, TwoFactorProvider>) {
     };
 }
 
-async function deliverEmailToken(env: Bindings, email: string, token: string): Promise<void> {
+async function deliverEmailToken(env: Bindings, email: string, token: string, expiresAt: string): Promise<void> {
     const delivery = env.TWO_FACTOR_EMAIL_DELIVERY?.toLowerCase();
     const debugEnabled = env.TWO_FACTOR_EMAIL_DEBUG === 'true';
     if (delivery === 'console' || debugEnabled) {
@@ -154,7 +155,7 @@ async function deliverEmailToken(env: Bindings, email: string, token: string): P
         return;
     }
 
-    throw new BadRequestError('Email 2FA delivery is not configured. Set TWO_FACTOR_EMAIL_DELIVERY=console for development or wire a real email service before enabling Email 2FA.');
+    await sendTwoFactorEmail(env, email, token, expiresAt);
 }
 
 async function storeAndDeliverEmailToken(
@@ -177,7 +178,7 @@ async function storeAndDeliverEmailToken(
         },
     };
 
-    await deliverEmailToken(env, email, token);
+    await deliverEmailToken(env, email, token, expires);
     await db.update(users).set({
         twoFactorProviders: JSON.stringify(providers),
         accountRevisionDate: new Date().toISOString(),

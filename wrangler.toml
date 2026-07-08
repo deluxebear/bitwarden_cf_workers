@@ -18,9 +18,24 @@ ICONS_MAX_IMAGE_BYTES = "51200"
 # 控制开放注册行为: "true" 始终允许 | "false" 始终禁止 | "auto" 无用户时允许，有用户后关闭（默认）
 SIGNUPS_ALLOWED = "true"
 # 本地开发默认：邮件 token 写入 wrangler 日志，并在响应中回显，便于 Web 注册/邮箱变更手测。
-# 生产应改为 EMAIL_MODE="provider" 并移除 EMAIL_RETURN_TOKENS。
+# 生产推荐使用 Cloudflare Email Service：
+#   1. 在 Cloudflare Dashboard > Compute > Email Service > Email Sending 中 onboard 发件域名。
+#   2. 将下方 EMAIL_MODE 改为 "cloudflare"，配置 EMAIL_FROM，并启用 [[send_email]] 示例。
+#   3. 移除 EMAIL_RETURN_TOKENS，避免生产响应回显邮件 token。
+# EMAIL_MODE = "cloudflare"
+# EMAIL_FROM = "Bitwarden <no-reply@example.com>"
+# EMAIL_REPLY_TO = "support@example.com"
+#
+# 通用 HTTP webhook provider 仍可用：
+# EMAIL_MODE = "provider"
+# EMAIL_PROVIDER_ENDPOINT = "https://mail.example.com/bitwarden-email"
 EMAIL_MODE = "log"
 EMAIL_RETURN_TOKENS = "true"
+
+# Cloudflare Email Service Workers binding。启用 EMAIL_MODE="cloudflare" 时必须配置。
+# [[send_email]]
+# name = "EMAIL"
+# remote = true
 
 [[d1_databases]]
 binding = "DB"

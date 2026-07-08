@@ -9,11 +9,16 @@ export type VerificationTokenType =
     | 'registration'
     | 'password_hint'
     | 'email_change'
-    | 'new_device';
+    | 'new_device'
+    | 'two_factor';
 
 type EmailEnv = {
+    EMAIL?: SendEmail;
     EMAIL_MODE?: string;
     EMAIL_RETURN_TOKENS?: string;
+    EMAIL_FROM?: string;
+    EMAIL_FROM_NAME?: string;
+    EMAIL_REPLY_TO?: string;
     EMAIL_PROVIDER_ENDPOINT?: string;
     EMAIL_PROVIDER_TOKEN?: string;
     VAULT_BASE_URL?: string;
@@ -32,11 +37,105 @@ function isTokenEchoEnabled(env: EmailEnv): boolean {
     return String(env.EMAIL_RETURN_TOKENS ?? '').toLowerCase() === 'true';
 }
 
-function getEmailMode(env: EmailEnv): 'disabled' | 'log' | 'provider' {
+function getEmailMode(env: EmailEnv): 'disabled' | 'log' | 'cloudflare' | 'provider' {
     const mode = String(env.EMAIL_MODE ?? 'disabled').toLowerCase();
+    if (mode === 'cloudflare') return 'cloudflare';
     if (mode === 'provider') return 'provider';
     if (mode === 'disabled') return 'disabled';
     return 'log';
+}
+
+function escapeHtml(value: unknown): string {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function parseFromAddress(env: EmailEnv): string | EmailAddress {
+    const configured = env.EMAIL_FROM?.trim();
+    if (!configured) {
+        throw new BadRequestError('Cloudflare email sender is not configured. Set EMAIL_FROM.');
+    }
+
+    const match = configured.match(/^(.+?)\s*<([^<>@\s]+@[^<>@\s]+)>$/);
+    const email = match ? match[2].trim() : configured;
+    const name = (env.EMAIL_FROM_NAME || (match ? match[1] : '')).trim().replace(/^"|"$/g, '');
+    return name ? { email, name } : email;
+}
+
+function getEmailMessage(type: VerificationTokenType, data: Record<string, unknown>) {
+    const token = String(data.token ?? '');
+    const expiresAt = String(data.expiresAt ?? '');
+    const vaultUrl = typeof data.vaultUrl === 'string' && data.vaultUrl ? data.vaultUrl : null;
+    const hint = String(data.hint ?? '');
+
+    switch (type) {
+        case 'registration':
+            return {
+                subject: 'Verify your Bitwarden account',
+                text: `Use this verification token to finish creating your Bitwarden account:\n\n${token}\n\nThis token expires at ${expiresAt}.${vaultUrl ? `\n\nVault: ${vaultUrl}` : ''}`,
+                html: `<p>Use this verification token to finish creating your Bitwarden account:</p><p><code>${escapeHtml(token)}</code></p><p>This token expires at ${escapeHtml(expiresAt)}.</p>${vaultUrl ? `<p><a href="${escapeHtml(vaultUrl)}">Open vault</a></p>` : ''}`,
+            };
+        case 'email_change':
+            return {
+                subject: 'Verify your new Bitwarden email address',
+                text: `Use this verification token to confirm your new email address:\n\n${token}\n\nThis token expires at ${expiresAt}.`,
+                html: `<p>Use this verification token to confirm your new email address:</p><p><code>${escapeHtml(token)}</code></p><p>This token expires at ${escapeHtml(expiresAt)}.</p>`,
+            };
+        case 'new_device':
+            return {
+                subject: 'Verify your new Bitwarden device',
+                text: `Use this verification token to finish signing in from a new device:\n\n${token}\n\nThis token expires at ${expiresAt}.`,
+                html: `<p>Use this verification token to finish signing in from a new device:</p><p><code>${escapeHtml(token)}</code></p><p>This token expires at ${escapeHtml(expiresAt)}.</p>`,
+            };
+        case 'password_hint':
+            return {
+                subject: 'Your Bitwarden master password hint',
+                text: hint ? `Your master password hint is:\n\n${hint}` : 'You do not have a master password hint configured.',
+                html: hint ? `<p>Your master password hint is:</p><p>${escapeHtml(hint)}</p>` : '<p>You do not have a master password hint configured.</p>',
+            };
+        case 'two_factor':
+            return {
+                subject: 'Your Bitwarden two-step login code',
+                text: `Use this code to finish signing in to Bitwarden:\n\n${token}${expiresAt ? `\n\nThis code expires at ${expiresAt}.` : ''}`,
+                html: `<p>Use this code to finish signing in to Bitwarden:</p><p><code>${escapeHtml(token)}</code></p>${expiresAt ? `<p>This code expires at ${escapeHtml(expiresAt)}.</p>` : ''}`,
+            };
+    }
+}
+
+async function deliverCloudflareEmail(
+    env: EmailEnv,
+    type: VerificationTokenType,
+    email: string,
+    data: Record<string, unknown>,
+): Promise<void> {
+    if (!env.EMAIL) {
+        throw new BadRequestError('Cloudflare email binding is not configured. Add [[send_email]] name = "EMAIL".');
+    }
+
+    const message = getEmailMessage(type, data);
+    try {
+        await env.EMAIL.send({
+            to: normalizeEmail(email),
+            from: parseFromAddress(env),
+            replyTo: env.EMAIL_REPLY_TO?.trim() || undefined,
+            subject: message.subject,
+            text: message.text,
+            html: message.html,
+        });
+    } catch (error) {
+        const details = error instanceof Error ? error.message : 'unknown';
+        console.error(JSON.stringify({
+            event: 'email.cloudflare.failed',
+            type,
+            email: normalizeEmail(email),
+            error: details,
+        }));
+        throw new BadRequestError('Cloudflare Email Service rejected the message.');
+    }
 }
 
 async function createVerificationToken(
@@ -83,6 +182,11 @@ async function deliverEmail(
             email: normalizeEmail(email),
             data,
         }));
+        return;
+    }
+
+    if (mode === 'cloudflare') {
+        await deliverCloudflareEmail(env, type, email, data);
         return;
     }
 
@@ -179,6 +283,10 @@ export async function sendRegistrationVerification(
 
 export async function sendPasswordHint(env: EmailEnv, email: string, hint: string | null): Promise<void> {
     await deliverEmail(env, 'password_hint', email, { hint: hint ?? '' });
+}
+
+export async function sendTwoFactorEmail(env: EmailEnv, email: string, token: string, expiresAt?: string): Promise<void> {
+    await deliverEmail(env, 'two_factor', email, { token, expiresAt: expiresAt ?? '' });
 }
 
 export async function sendEmailChangeToken(

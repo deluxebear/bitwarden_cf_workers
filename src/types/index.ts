@@ -13,6 +13,7 @@ export type Bindings = {
     ATTACHMENTS: R2Bucket;
     ICONS_CACHE: KVNamespace;
     NOTIFICATION_HUB: DurableObjectNamespace;
+    EMAIL?: SendEmail;
     GLOBAL_PREMIUM?: string;
     /**
      * 可选：用于自建许可证校验的 InstallationId。
@@ -42,9 +43,23 @@ export type Bindings = {
      * 邮件投递模式：
      * "disabled" - 禁用邮件；除非 EMAIL_RETURN_TOKENS=true，否则相关接口返回明确错误
      * "log"      - 本地开发默认，token 写入日志并在响应中回显
+     * "cloudflare" - 使用 Cloudflare Email Service send_email binding
      * "provider" - POST 到 EMAIL_PROVIDER_ENDPOINT
      */
     EMAIL_MODE?: string;
+    /**
+     * EMAIL_MODE=cloudflare 时的发件人，例如 no-reply@example.com 或 "Bitwarden <no-reply@example.com>"。
+     * 发件域名必须已在 Cloudflare Email Service 中完成 Email Sending onboarding。
+     */
+    EMAIL_FROM?: string;
+    /**
+     * 可选：EMAIL_MODE=cloudflare 时单独指定显示名称。
+     */
+    EMAIL_FROM_NAME?: string;
+    /**
+     * 可选：EMAIL_MODE=cloudflare 时的 Reply-To。
+     */
+    EMAIL_REPLY_TO?: string;
     /**
      * 本地/测试兼容：为 true 时在响应中回显邮件 token。
      */
