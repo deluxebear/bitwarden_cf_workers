@@ -19,6 +19,7 @@ import {
     collectionGroups,
     collectionCiphers,
     policies,
+    organizationDomains,
     organizationInviteLinks,
 } from '../db/schema';
 import type { OrganizationUserRow, OrganizationRow, UserRow, PolicyRow, OrganizationInviteLinkRow } from '../db/schema';
@@ -4240,6 +4241,49 @@ async function getOrgPolicies(db: D1Db, orgId: string): Promise<PolicyRow[]> {
     }
 }
 
+async function hasVerifiedOrganizationDomain(db: D1Db, orgId: string): Promise<boolean> {
+    const row = await db.select({ id: organizationDomains.id })
+        .from(organizationDomains)
+        .where(and(
+            eq(organizationDomains.organizationId, orgId),
+            sql`${organizationDomains.verifiedDate} IS NOT NULL`,
+        ))
+        .get();
+    return !!row;
+}
+
+async function ensureSingleOrgPolicyForVerifiedDomains(db: D1Db, orgId: string, now = new Date().toISOString()): Promise<void> {
+    if (!await hasVerifiedOrganizationDomain(db, orgId)) return;
+
+    const policy = await db.select().from(policies)
+        .where(and(eq(policies.organizationId, orgId), eq(policies.type, PolicyType.SingleOrg)))
+        .get();
+
+    if (policy) {
+        if (policy.enabled !== true) {
+            await db.update(policies).set({ enabled: true, revisionDate: now }).where(eq(policies.id, policy.id));
+        }
+        return;
+    }
+
+    await db.insert(policies).values({
+        id: generateUuid(),
+        organizationId: orgId,
+        type: PolicyType.SingleOrg,
+        enabled: true,
+        data: null,
+        creationDate: now,
+        revisionDate: now,
+    });
+}
+
+async function assertSingleOrgCanBeDisabledForOrg(db: D1Db, orgId: string, policyType: number, enabled: boolean): Promise<void> {
+    if (policyType !== PolicyType.SingleOrg || enabled) return;
+    if (await hasVerifiedOrganizationDomain(db, orgId)) {
+        throw new BadRequestError('Single organization policy is required while the organization has verified claimed domains.');
+    }
+}
+
 /** 对应 PolicyResponseModel（含 id、revisionDate） */
 function toPolicyResponse(p: PolicyRow) {
     let data: Record<string, unknown> | null = null;
@@ -4493,6 +4537,7 @@ orgs.get('/:id/policies', async (c) => {
     const orgUser = await getOrgUser(db, orgId, userId);
     requireOwnerOrAdmin(orgUser);
 
+    await ensureSingleOrgPolicyForVerifiedDomains(db, orgId);
     const policyList = await getOrgPolicies(db, orgId);
 
     return c.json({
@@ -4594,6 +4639,7 @@ orgs.get('/:id/policies/:type', async (c) => {
     const orgUser = await getOrgUser(db, orgId, userId);
     requireOwnerOrAdmin(orgUser);
 
+    await ensureSingleOrgPolicyForVerifiedDomains(db, orgId);
     const allPolicies = await getOrgPolicies(db, orgId);
     const policy = allPolicies.find(p => p.type === policyType);
 
@@ -4631,6 +4677,7 @@ orgs.put('/:id/policies/:type', async (c) => {
     const body = await c.req.json<SavePolicyBody>();
 
     const { enabled: newEnabled, data: requestedData } = getSavePolicyRequest(body);
+    await assertSingleOrgCanBeDisabledForOrg(db, orgId, policyType, newEnabled);
 
     const allPolicies = await getOrgPolicies(db, orgId);
     const existing = allPolicies.find(p => p.type === policyType);
@@ -4714,6 +4761,7 @@ orgs.put('/:id/policies/:type/vnext', async (c) => {
     const body = await c.req.json<SavePolicyBody>();
 
     const { enabled: newEnabled, data: requestedData } = getSavePolicyRequest(body);
+    await assertSingleOrgCanBeDisabledForOrg(db, orgId, policyType, newEnabled);
 
     const allPolicies = await getOrgPolicies(db, orgId);
     const existing = allPolicies.find(p => p.type === policyType);
