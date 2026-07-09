@@ -25,4 +25,14 @@ describe('system admin route', () => {
         expect(source).toContain('await deleteUserAccountData(db, c.env, target.id);');
         expect(source).toContain("throw new BadRequestError('System administrators cannot delete their own account from this endpoint.');");
     });
+
+    it('adds and revokes organization access without deleting the server account', () => {
+        const source = readFileSync('src/routes/system-admin.ts', 'utf8');
+
+        expect(source).toContain("import { validateUserCanJoinOrganization } from '../services/policy-requirements';");
+        expect(source).toContain("adminRoutes.post('/users/:id/organizations/:orgId'");
+        expect(source).toContain("adminRoutes.put('/users/:id/organizations/:orgId/revoke'");
+        expect(source).toContain('status: ORG_USER_STATUS_ACCEPTED');
+        expect(source).toContain('status: ORG_USER_STATUS_REVOKED');
+    });
 });

@@ -6,15 +6,18 @@
  */
 
 import { Hono, type Context } from 'hono';
-import { and, asc, eq, inArray } from 'drizzle-orm';
+import { and, asc, eq, inArray, or } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/d1';
 
 import { organizations, organizationUsers, users } from '../db/schema';
 import { authMiddleware } from '../middleware/auth';
 import { BadRequestError, NotFoundError } from '../middleware/error';
+import { generateUuid } from '../services/crypto';
 import { deleteUserAccountData } from '../services/claimed-accounts';
-import { pushLogOut } from '../services/push-notification';
+import { validateUserCanJoinOrganization } from '../services/policy-requirements';
+import { pushLogOut, pushSyncUser } from '../services/push-notification';
 import type { Bindings, Variables } from '../types';
+import { PushType } from '../types/push-notification';
 
 type D1Db = ReturnType<typeof drizzle>;
 type AppContext = Context<{ Bindings: Bindings; Variables: Variables }>;
@@ -22,6 +25,11 @@ type SystemAdminEnv = Pick<Bindings, 'SYSTEM_ADMIN_EMAILS' | 'ADMIN_EMAILS'>;
 
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 500;
+const ORG_USER_STATUS_ACCEPTED = 1;
+const ORG_USER_STATUS_CONFIRMED = 2;
+const ORG_USER_STATUS_REVOKED = -1;
+const ORG_USER_STATUS_REVOKED_LEGACY = 3;
+const ORG_USER_TYPE_USER = 2;
 
 const adminRoutes = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 adminRoutes.use('/*', authMiddleware);
@@ -217,6 +225,112 @@ async function deleteRegisteredUser(c: AppContext) {
     return c.body(null, 204);
 }
 
+async function bumpUserRevisionDate(db: D1Db, userId: string, now?: string): Promise<void> {
+    await db.update(users)
+        .set({ accountRevisionDate: now ?? new Date().toISOString() })
+        .where(eq(users.id, userId));
+}
+
+async function getTargetUserAndOrganization(db: D1Db, userId: string, orgId: string) {
+    const targetUser = await db.select().from(users).where(eq(users.id, userId)).get();
+    if (!targetUser) throw new NotFoundError('User not found.');
+
+    const organization = await db.select({ id: organizations.id })
+        .from(organizations)
+        .where(eq(organizations.id, orgId))
+        .get();
+    if (!organization) throw new NotFoundError('Organization not found.');
+
+    return { targetUser, organization };
+}
+
+async function findOrganizationMembership(db: D1Db, userId: string, orgId: string, email: string) {
+    return db.select()
+        .from(organizationUsers)
+        .where(and(
+            eq(organizationUsers.organizationId, orgId),
+            or(
+                eq(organizationUsers.userId, userId),
+                eq(organizationUsers.email, email.trim().toLowerCase()),
+            ),
+        ))
+        .get();
+}
+
+function isRevokedOrganizationUserStatus(status: number): boolean {
+    return status === ORG_USER_STATUS_REVOKED || status === ORG_USER_STATUS_REVOKED_LEGACY;
+}
+
+async function addRegisteredUserToOrganization(c: AppContext) {
+    const db = drizzle(c.env.DB);
+    const targetUserId = c.req.param('id');
+    const orgId = c.req.param('orgId');
+    const { targetUser } = await getTargetUserAndOrganization(db, targetUserId, orgId);
+
+    await validateUserCanJoinOrganization(db, targetUser, orgId);
+
+    const now = new Date().toISOString();
+    const existingMembership = await findOrganizationMembership(db, targetUser.id, orgId, targetUser.email);
+
+    if (existingMembership) {
+        const restoreStatus = existingMembership.key ? ORG_USER_STATUS_CONFIRMED : ORG_USER_STATUS_ACCEPTED;
+        await db.update(organizationUsers).set({
+            userId: targetUser.id,
+            email: targetUser.email.trim().toLowerCase(),
+            status: isRevokedOrganizationUserStatus(existingMembership.status)
+                ? restoreStatus
+                : existingMembership.status,
+            revisionDate: now,
+        }).where(eq(organizationUsers.id, existingMembership.id));
+    } else {
+        await db.insert(organizationUsers).values({
+            id: generateUuid(),
+            organizationId: orgId,
+            userId: targetUser.id,
+            email: targetUser.email.trim().toLowerCase(),
+            status: ORG_USER_STATUS_ACCEPTED,
+            type: ORG_USER_TYPE_USER,
+            creationDate: now,
+            revisionDate: now,
+        });
+    }
+
+    await bumpUserRevisionDate(db, targetUser.id, now);
+    c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncOrganizations, targetUser.id, null));
+
+    const user = await getRegisteredUserById(db, targetUser.id);
+    return c.json({ ...user, object: 'systemUser' });
+}
+
+async function revokeRegisteredUserOrganizationAccess(c: AppContext) {
+    const db = drizzle(c.env.DB);
+    const actingUserId = c.get('userId');
+    const targetUserId = c.req.param('id');
+    const orgId = c.req.param('orgId');
+
+    if (targetUserId === actingUserId) {
+        throw new BadRequestError('System administrators cannot revoke their own organization access from this endpoint.');
+    }
+
+    const { targetUser } = await getTargetUserAndOrganization(db, targetUserId, orgId);
+    const membership = await findOrganizationMembership(db, targetUser.id, orgId, targetUser.email);
+    if (!membership) throw new NotFoundError('Member not found.');
+
+    if (!isRevokedOrganizationUserStatus(membership.status)) {
+        const now = new Date().toISOString();
+        await db.update(organizationUsers).set({
+            status: ORG_USER_STATUS_REVOKED,
+            revisionDate: now,
+        }).where(eq(organizationUsers.id, membership.id));
+
+        await bumpUserRevisionDate(db, targetUser.id, now);
+        c.executionCtx.waitUntil(pushSyncUser(c.env, PushType.SyncOrganizations, targetUser.id, null));
+    }
+
+    const user = await getRegisteredUserById(db, targetUser.id);
+    return c.json({ ...user, object: 'systemUser' });
+}
+
 /**
  * GET /admin/status
  * 返回当前登录用户是否具备服务器级系统管理员权限。
@@ -273,6 +387,27 @@ adminRoutes.delete('/users/:id', async (c) => {
  */
 adminRoutes.post('/users/:id/delete', async (c) => {
     return deleteRegisteredUser(c);
+});
+
+/**
+ * POST /admin/users/:id/organizations/:orgId
+ * 将服务器上已注册账号加入指定组织。由于服务器没有明文组织密钥，新建 membership
+ * 使用 Accepted 状态，让组织成员页的既有确认流程负责生成用户专属组织密钥。
+ */
+adminRoutes.post('/users/:id/organizations/:orgId', async (c) => {
+    return addRegisteredUserToOrganization(c);
+});
+
+/**
+ * PUT /admin/users/:id/organizations/:orgId/revoke
+ * 撤销服务器用户在指定组织中的访问权限，但保留服务器账号。
+ */
+adminRoutes.put('/users/:id/organizations/:orgId/revoke', async (c) => {
+    return revokeRegisteredUserOrganizationAccess(c);
+});
+
+adminRoutes.post('/users/:id/organizations/:orgId/revoke', async (c) => {
+    return revokeRegisteredUserOrganizationAccess(c);
 });
 
 export default adminRoutes;
