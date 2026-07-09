@@ -49,6 +49,7 @@ import reportsRoutes from './routes/reports';
 import iconsRoutes from './routes/icons';
 import plansRoutes from './routes/plans';
 import setupIntentRoutes from './routes/setup-intent';
+import systemAdminRoutes from './routes/system-admin';
 import type { Bindings, Variables } from './types';
 import { verifyAttachmentDownloadToken } from './services/attachment-token';
 
@@ -146,6 +147,8 @@ app.route('/api/reports', reportsRoutes);
 app.route('/api/plans', plansRoutes);
 app.route('/api/billing', billingRoutes);
 app.route('/api/setup-intent', setupIntentRoutes);
+app.route('/api/admin', systemAdminRoutes);
+app.route('/admin', systemAdminRoutes);
 app.route('/icons', iconsRoutes);
 app.route('/', iconsRoutes);
 app.route('/', notificationSendRoutes);

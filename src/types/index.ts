@@ -95,6 +95,15 @@ export type Bindings = {
      * 未配置时 /send 返回 404，避免公开暴露通知投递入口。
      */
     NOTIFICATIONS_SEND_TOKEN?: string;
+    /**
+     * 自部署系统管理员邮箱列表，逗号分隔。
+     * 用于服务器级账号管理入口；未设置时使用数据库中最早注册用户作为 bootstrap 管理员。
+     */
+    SYSTEM_ADMIN_EMAILS?: string;
+    /**
+     * 兼容旧配置名，语义同 SYSTEM_ADMIN_EMAILS。
+     */
+    ADMIN_EMAILS?: string;
 };
 
 // Hono 应用变量
