@@ -47,6 +47,13 @@ import {
     getAutoConfirmRecipientUserIds,
     validateUserCanJoinOrganization,
 } from '../services/policy-requirements';
+import {
+    assertOrganizationUserCanLeave,
+    deleteUserAccountData,
+    getVerifiedDomainSetForOrganization,
+    isOrganizationUserClaimed,
+    isOrganizationUserClaimedByDomains,
+} from '../services/claimed-accounts';
 
 const orgs = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 orgs.use('/*', authMiddleware);
@@ -1394,6 +1401,7 @@ orgs.post('/:id/leave', async (c) => {
         .where(and(eq(organizationUsers.organizationId, orgId), eq(organizationUsers.userId, userId))).get();
 
     if (!orgUser) throw new NotFoundError('Organization not found.');
+    await assertOrganizationUserCanLeave(db, orgUser);
 
     // Owner 不能直接离开（如果是唯一 Owner）
     if (orgUser.type === 0) {
@@ -1596,8 +1604,12 @@ orgs.get('/:id/users', async (c) => {
         }
     }
 
+    const verifiedDomains = await getVerifiedDomainSetForOrganization(db, orgId);
     const data = usersList.map(u => {
-        const resp = toOrganizationUserResponse(u, u.userId ? usersMap[u.userId] : undefined);
+        const user = u.userId ? usersMap[u.userId] : undefined;
+        const resp = toOrganizationUserResponse(u, user, {
+            claimedByOrganization: isOrganizationUserClaimedByDomains(u, verifiedDomains, user),
+        });
         if (includeGroups && orgUserGroupsMap[u.id]) resp.groups = orgUserGroupsMap[u.id];
         return resp;
     });
@@ -2117,9 +2129,47 @@ orgs.post('/:id/users/bulk-auto-confirm', async (c) => {
     return c.json(toBulkResponseList(results));
 });
 
+async function deleteClaimedOrganizationUserAccount(
+    c: OrgContext,
+    db: D1Db,
+    orgId: string,
+    orgUserId: string,
+    actingOrgUser: OrganizationUserRow,
+    actingUserId: string,
+): Promise<void> {
+    const target = await db.select().from(organizationUsers)
+        .where(and(eq(organizationUsers.id, orgUserId), eq(organizationUsers.organizationId, orgId)))
+        .get();
+    if (!target) throw new NotFoundError('Organization user not found.');
+    if (!target.userId) throw new BadRequestError('Only accepted organization accounts can be deleted.');
+    if (target.userId === actingUserId) {
+        throw new BadRequestError('Cannot delete your own account from the organization.');
+    }
+    if (target.type === 0 && actingOrgUser.type !== 0) {
+        throw new BadRequestError('Only owners can delete owner accounts.');
+    }
+
+    const targetUser = await db.select().from(users).where(eq(users.id, target.userId)).get();
+    if (!targetUser) throw new NotFoundError('User not found.');
+
+    if (!await isOrganizationUserClaimed(db, target, targetUser)) {
+        throw new BadRequestError('User is not a claimed organization account. Use remove or revoke for membership changes.');
+    }
+
+    await deleteUserAccountData(db, c.env, target.userId);
+    await logEvent(c.env.DB, 1503, {
+        userId: target.userId,
+        actingUserId,
+        organizationId: orgId,
+        organizationUserId: orgUserId,
+        deviceType: getDeviceTypeFromRequest(c),
+    });
+    c.executionCtx.waitUntil(pushLogOut(c.env, target.userId, null));
+}
+
 /**
  * DELETE/POST /api/organizations/:id/users/delete-account
- * 当前 Workers 不支持 claimed-account 删除事务，明确返回每个目标的受限错误。
+ * 删除 claimed organization account；非 claimed 成员必须继续使用 remove/revoke。
  */
 async function bulkDeleteAccountHandler(c: OrgContext) {
     const db = drizzle(c.env.DB);
@@ -2132,10 +2182,17 @@ async function bulkDeleteAccountHandler(c: OrgContext) {
     const manager = await getOrgUser(db, orgId, userId);
     requireManageUsers(manager);
 
-    return c.json(toBulkResponseList(ids.map((id) => ({
-        id,
-        error: 'Claimed organization account deletion is not supported by this Workers schema. Use remove/revoke for membership changes.',
-    }))));
+    const results: Array<{ id: string; error: string | null }> = [];
+    for (const id of ids) {
+        try {
+            await deleteClaimedOrganizationUserAccount(c, db, orgId, id, manager, userId);
+            results.push({ id, error: null });
+        } catch (error) {
+            results.push({ id, error: error instanceof Error ? error.message : String(error) });
+        }
+    }
+
+    return c.json(toBulkResponseList(results));
 }
 
 orgs.delete('/:id/users/delete-account', bulkDeleteAccountHandler);
@@ -2153,12 +2210,8 @@ async function deleteAccountHandler(c: OrgContext) {
     const manager = await getOrgUser(db, orgId, userId);
     requireManageUsers(manager);
 
-    const target = await db.select({ id: organizationUsers.id }).from(organizationUsers)
-        .where(and(eq(organizationUsers.id, orgUserId), eq(organizationUsers.organizationId, orgId)))
-        .get();
-    if (!target) throw new NotFoundError('Organization user not found.');
-
-    throw new BadRequestError('Claimed organization account deletion is not supported by this Workers schema. Use remove/revoke for membership changes.');
+    await deleteClaimedOrganizationUserAccount(c, db, orgId, orgUserId, manager, userId);
+    return c.body(null, 200);
 }
 
 orgs.delete('/:id/users/:orgUserId/delete-account', deleteAccountHandler);
@@ -2189,7 +2242,10 @@ orgs.get('/:id/users/:orgUserId', async (c) => {
     const userCollections = await db.select().from(collectionUsers)
         .where(eq(collectionUsers.organizationUserId, orgUserId)).all();
 
-    const resp = toOrganizationUserResponse(targetOrgUser, user);
+    const verifiedDomains = await getVerifiedDomainSetForOrganization(db, orgId);
+    const resp = toOrganizationUserResponse(targetOrgUser, user, {
+        claimedByOrganization: isOrganizationUserClaimedByDomains(targetOrgUser, verifiedDomains, user),
+    });
     resp.collections = userCollections.map(cu => ({
         id: cu.collectionId,
         readOnly: cu.readOnly ?? false,

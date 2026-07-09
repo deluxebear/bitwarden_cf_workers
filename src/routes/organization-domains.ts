@@ -14,6 +14,7 @@ import {
     organizationDomains,
     organizations,
     organizationUsers,
+    policies,
     ssoConfigs,
 } from '../db/schema';
 import type { OrganizationDomainRow, OrganizationRow, OrganizationUserRow, SsoConfigRow } from '../db/schema';
@@ -21,6 +22,7 @@ import { authMiddleware } from '../middleware/auth';
 import { BadRequestError, ConflictError, NotFoundError } from '../middleware/error';
 import { generateSecureRandomString, generateUuid } from '../services/crypto';
 import { logEvent } from '../services/events';
+import { PolicyType } from '../services/policy-validators';
 import type { Bindings, Variables } from '../types';
 import { getDeviceTypeFromRequest } from './events';
 
@@ -159,10 +161,41 @@ export function dnsTxtRecordsContainToken(records: string[], expectedTxt: string
     return records.some((record) => record === expectedTxt);
 }
 
+export async function verifyOrganizationDomainDns(
+    domain: Pick<OrganizationDomainRow, 'domainName' | 'txt'>,
+    fetcher: Fetcher = fetch,
+    resolverUrl?: string,
+): Promise<boolean> {
+    const records = await resolveDnsTxtRecords(domain.domainName, fetcher, resolverUrl);
+    return dnsTxtRecordsContainToken(records, domain.txt);
+}
+
 async function verifyDnsTxtRecord(c: OrgDomainContext, domain: OrganizationDomainRow): Promise<boolean> {
     const resolverUrl = (c.env as { DNS_RESOLVER_URL?: string }).DNS_RESOLVER_URL?.trim();
-    const records = await resolveDnsTxtRecords(domain.domainName, fetch, resolverUrl || undefined);
-    return dnsTxtRecordsContainToken(records, domain.txt);
+    return verifyOrganizationDomainDns(domain, fetch, resolverUrl || undefined);
+}
+
+async function ensureSingleOrgPolicyEnabled(db: D1Db, orgId: string, now: string): Promise<void> {
+    const existing = await db.select().from(policies)
+        .where(and(eq(policies.organizationId, orgId), eq(policies.type, PolicyType.SingleOrg)))
+        .get();
+
+    if (existing) {
+        if (existing.enabled !== true) {
+            await db.update(policies).set({ enabled: true, revisionDate: now }).where(eq(policies.id, existing.id));
+        }
+        return;
+    }
+
+    await db.insert(policies).values({
+        id: generateUuid(),
+        organizationId: orgId,
+        type: PolicyType.SingleOrg,
+        enabled: true,
+        data: null,
+        creationDate: now,
+        revisionDate: now,
+    });
 }
 
 function getRequestString(body: Record<string, unknown>, ...keys: string[]): string | null {
@@ -486,6 +519,7 @@ organizationDomainsRoutes.post('/:id/domain/:domainId/verify', async (c) => {
             verifiedDate: domainVerified ? (domain.verifiedDate ?? now) : domain.verifiedDate,
             lastCheckedDate: now,
             jobRunCount: Math.min((domain.jobRunCount ?? 0) + 1, 3),
+            nextRunDate: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
         })
         .where(eq(organizationDomains.id, domain.id));
 
@@ -493,6 +527,7 @@ organizationDomainsRoutes.post('/:id/domain/:domainId/verify', async (c) => {
     if (!verified) throw new NotFoundError('Organization domain not found after verification.');
 
     if (domainVerified) {
+        await ensureSingleOrgPolicyEnabled(db, orgId, now);
         await logEvent(c.env.DB, 2002, {
             organizationId: orgId,
             actingUserId: userId,

@@ -20,6 +20,7 @@ import type { Bindings, Variables, CipherRequest, CipherResponse, CipherType, Ci
 import { pushSyncCipher, pushSyncUser } from '../services/push-notification';
 import { PushType } from '../types/push-notification';
 import { assertPersonalVaultWriteAllowed } from '../services/policy-requirements';
+import { assertUserNotClaimedForAccountAction } from '../services/claimed-accounts';
 
 const ciphersRoute = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
@@ -1889,6 +1890,11 @@ ciphersRoute.post('/purge', async (c) => {
     const { verifyPassword } = await import('../services/crypto');
     const valid = await verifyPassword(body.masterPasswordHash, user.masterPassword || '');
     if (!valid) throw new BadRequestError('Invalid master password.');
+    await assertUserNotClaimedForAccountAction(
+        db,
+        userId,
+        'Claimed organization accounts cannot purge their vault.',
+    );
 
     // 永久删除所有已软删除（在回收站）的 ciphers
     const softDeleted = await db.select({ id: ciphers.id }).from(ciphers)

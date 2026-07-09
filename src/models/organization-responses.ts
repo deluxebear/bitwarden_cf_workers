@@ -116,7 +116,11 @@ export function toOrganizationSubscriptionResponse(org: any) {
  * ProfileOrganizationResponseModel - 用于 Sync
  * 对应官方 Api/AdminConsole/Models/Response/ProfileOrganizationResponseModel.cs
  */
-export function toProfileOrganizationResponse(org: any, orgUser: any) {
+export function toProfileOrganizationResponse(
+    org: any,
+    orgUser: any,
+    options: { userIsClaimedByOrganization?: boolean } = {},
+) {
     const planType = org.planType ?? 0;
     return {
         id: org.id,
@@ -174,7 +178,7 @@ export function toProfileOrganizationResponse(org: any, orgUser: any) {
         familySponsorshipLastSyncDate: null,
         familySponsorshipValidUntil: null,
         familySponsorshipToDelete: null,
-        userIsClaimedByOrganization: false,
+        userIsClaimedByOrganization: options.userIsClaimedByOrganization ?? false,
         userIsManagedByOrganization: false,
         isAdminInitiated: false,
         accessSecretsManager: toJsonBool(orgUser.accessSecretsManager),
@@ -191,7 +195,11 @@ export function toProfileOrganizationResponse(org: any, orgUser: any) {
  * OrganizationUserUserDetailsResponseModel - GET /organizations/{orgId}/users
  * 对应官方 Api/AdminConsole/Models/Response/Organizations/OrganizationUserUserDetailsResponseModel.cs
  */
-export function toOrganizationUserResponse(orgUser: any, user?: any) {
+export function toOrganizationUserResponse(
+    orgUser: any,
+    user?: any,
+    options: { claimedByOrganization?: boolean } = {},
+) {
     return {
         id: orgUser.id,
         userId: orgUser.userId ?? null,
@@ -209,7 +217,7 @@ export function toOrganizationUserResponse(orgUser: any, user?: any) {
         avatarColor: user?.avatarColor ?? null,
         twoFactorEnabled: user?.twoFactorProviders ? true : false,
         ssoBound: false,
-        claimedByOrganization: false,
+        claimedByOrganization: options.claimedByOrganization ?? false,
         managedByOrganization: false,
         // collections/groups (populated separately if needed)
         collections: [] as any[],

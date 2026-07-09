@@ -16,6 +16,13 @@ import { normalizeRegistrationRequest } from '../services/registration';
 import { buildDevTokenResponse, consumeVerificationToken, sendEmailChangeToken, sendNewDeviceVerification, sendPasswordHint } from '../services/email';
 import { assertEmailNotBlockedByClaimedDomain, getMasterPasswordPolicyForUser } from '../services/policy-requirements';
 import { touchUser } from '../services/revisions';
+import {
+    assertClaimedUserCanChangeEmail,
+    assertUserNotClaimedForAccountAction,
+    deleteUserAccountData,
+    getVerifiedDomainSetForOrganization,
+    isOrganizationUserClaimedByDomains,
+} from '../services/claimed-accounts';
 import type { Bindings, Variables, ProfileResponse, AccountKeysResponse } from '../types';
 import { pushLogOut, pushSyncUser } from '../services/push-notification';
 import { PushType } from '../types/push-notification';
@@ -223,45 +230,50 @@ accounts.get('/profile', async (c) => {
 
     const globalPremium = String(c.env.GLOBAL_PREMIUM).toLowerCase() === 'true';
 
-    const profileOrgs = orgsData.map(d => ({
-        id: d.org.id,
-        name: d.org.name,
-        key: d.orgUser.key,
-        status: d.orgUser.status,
-        type: d.orgUser.type,
-        enabled: d.org.enabled,
-        useTotp: d.org.useTotp ?? true,
-        use2fa: true,
-        useApi: true,
-        useSso: false,
-        useKeyConnector: false,
-        useScim: false,
-        useGroups: false,
-        useDirectory: false,
-        useEvents: true,
-        usePolicies: true,
-        useResetPassword: false,
-        useCustomPermissions: false,
-        useActivateAutofillPolicy: false,
-        useRiskInsights: false,
-        useOrganizationDomains: false,
-        useAdminSponsoredFamilies: false,
-        useSecretsManager: false,
-        usePhishingBlocker: false,
-        useDisableSMAdsForUsers: false,
-        usePasswordManager: true,
-        useMyItems: true,
-        useAutomaticUserConfirmation: false,
-        usersGetPremium: globalPremium || (d.org.planType ?? 0) >= 1,
-        keyConnectorEnabled: false,
-        maxStorageGb: d.org.maxStorageGb ?? 1,
-        seats: d.org.seats ?? 0,
-        maxCollections: null,
-        accessSecretsManager: false,
-        planProductType: d.org.planType ?? 0,
-        permissions: d.orgUser.permissions ? JSON.parse(d.orgUser.permissions) : null,
-        object: 'profileOrganization',
-    }));
+    const profileOrgs = [];
+    for (const d of orgsData) {
+        const verifiedDomains = await getVerifiedDomainSetForOrganization(db, d.org.id);
+        profileOrgs.push({
+            id: d.org.id,
+            name: d.org.name,
+            key: d.orgUser.key,
+            status: d.orgUser.status,
+            type: d.orgUser.type,
+            enabled: d.org.enabled,
+            useTotp: d.org.useTotp ?? true,
+            use2fa: true,
+            useApi: true,
+            useSso: false,
+            useKeyConnector: false,
+            useScim: false,
+            useGroups: false,
+            useDirectory: false,
+            useEvents: true,
+            usePolicies: true,
+            useResetPassword: false,
+            useCustomPermissions: false,
+            useActivateAutofillPolicy: false,
+            useRiskInsights: false,
+            useOrganizationDomains: false,
+            useAdminSponsoredFamilies: false,
+            useSecretsManager: false,
+            usePhishingBlocker: false,
+            useDisableSMAdsForUsers: false,
+            usePasswordManager: true,
+            useMyItems: true,
+            useAutomaticUserConfirmation: false,
+            usersGetPremium: globalPremium || (d.org.planType ?? 0) >= 1,
+            keyConnectorEnabled: false,
+            maxStorageGb: d.org.maxStorageGb ?? 1,
+            seats: d.org.seats ?? 0,
+            maxCollections: null,
+            accessSecretsManager: false,
+            planProductType: d.org.planType ?? 0,
+            permissions: d.orgUser.permissions ? JSON.parse(d.orgUser.permissions) : null,
+            userIsClaimedByOrganization: isOrganizationUserClaimedByDomains(d.orgUser, verifiedDomains, user),
+            object: 'profileOrganization',
+        });
+    }
 
     const response = toProfileResponse(user, c.env);
     response.organizations = profileOrgs;
@@ -603,6 +615,7 @@ accounts.post('/email-token', async (c) => {
     const newEmail = body.newEmail.toLowerCase().trim();
     const existing = await db.select({ id: users.id }).from(users).where(eq(users.email, newEmail)).get();
     if (existing && existing.id !== userId) throw new BadRequestError('Email already taken.');
+    await assertClaimedUserCanChangeEmail(db, userId, newEmail);
 
     const token = await sendEmailChangeToken(db, c.env, userId, newEmail);
     const devResponse = buildDevTokenResponse(c.env, token);
@@ -636,6 +649,7 @@ accounts.put('/email', async (c) => {
     const newEmail = body.newEmail.toLowerCase().trim();
     const existing = await db.select({ id: users.id }).from(users).where(eq(users.email, newEmail)).get();
     if (existing && existing.id !== userId) throw new BadRequestError('Email already taken.');
+    await assertClaimedUserCanChangeEmail(db, userId, newEmail);
     await consumeVerificationToken(db, newEmail, 'email_change', body.token, userId);
 
     const now = new Date().toISOString();
@@ -673,7 +687,12 @@ accounts.delete('/', async (c) => {
         if (!valid) throw new BadRequestError('Invalid master password.');
     }
 
-    await db.delete(users).where(eq(users.id, userId));
+    await assertUserNotClaimedForAccountAction(
+        db,
+        userId,
+        'Claimed organization accounts cannot delete their account.',
+    );
+    await deleteUserAccountData(db, c.env, userId);
 
     return c.body(null, 204);
 });

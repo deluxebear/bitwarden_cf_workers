@@ -5,12 +5,16 @@
 // 任务清单:
 // - every 5 min  : deleteSends          - 删除到期 Send (DeleteSendsJob)
 // - daily 0:00   : deleteTrashedCiphers - 永久删除30天前软删除 Cipher (DeleteCiphersJob)
+// - daily 0:00   : verifyOrgDomains     - 持续复验声明域名 TXT
 // - fri 22:00    : deleteExpiredTokens  - 清理过期 Refresh Token (DatabaseExpiredGrantsJob)
 
 import { drizzle } from 'drizzle-orm/d1';
-import { lte, and, isNotNull, sql } from 'drizzle-orm';
-import { sends, ciphers, refreshTokens, collectionCiphers, authRequests } from '../db/schema';
+import { lte, and, eq, isNotNull, sql } from 'drizzle-orm';
+import { sends, ciphers, refreshTokens, collectionCiphers, authRequests, organizationDomains, policies } from '../db/schema';
 import type { Bindings } from '../types';
+import { generateUuid } from './crypto';
+import { PolicyType } from './policy-validators';
+import { verifyOrganizationDomainDns } from '../routes/organization-domains';
 
 /**
  * 定时任务调度入口
@@ -25,6 +29,7 @@ export async function handleScheduled(cron: string, env: Bindings): Promise<void
             break;
         case '0 0 * * *':
             await deleteTrashedCiphers(env);
+            await verifyOrganizationDomains(env);
             break;
         case '0 22 * * 5':
             await deleteExpiredRefreshTokens(env);
@@ -179,4 +184,95 @@ async function deleteExpiredAuthRequests(env: Bindings): Promise<void> {
         .where(lte(authRequests.creationDate, fifteenMinutesAgo));
 
     console.log(`[DeleteAuthRequests] Cleaned up expired auth requests.`);
+}
+
+async function ensureSingleOrgPolicyEnabled(db: ReturnType<typeof drizzle>, orgId: string, now: string): Promise<void> {
+    const existing = await db.select().from(policies)
+        .where(and(eq(policies.organizationId, orgId), eq(policies.type, PolicyType.SingleOrg)))
+        .get();
+
+    if (existing) {
+        if (existing.enabled !== true) {
+            await db.update(policies).set({ enabled: true, revisionDate: now }).where(eq(policies.id, existing.id));
+        }
+        return;
+    }
+
+    await db.insert(policies).values({
+        id: generateUuid(),
+        organizationId: orgId,
+        type: PolicyType.SingleOrg,
+        enabled: true,
+        data: null,
+        creationDate: now,
+        revisionDate: now,
+    });
+}
+
+/**
+ * 持续复验组织声明域名。
+ *
+ * 官方要求 TXT 记录保持存在，并会在声明流程中多次尝试验证；
+ * Workers 使用 nextRunDate/jobRunCount 做轻量调度。
+ */
+async function verifyOrganizationDomains(env: Bindings): Promise<void> {
+    const db = drizzle(env.DB);
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const nextRunDate = new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString();
+    const removalCutoff = new Date(now.getTime() - 10 * 24 * 60 * 60 * 1000).toISOString();
+    const resolverUrl = (env as { DNS_RESOLVER_URL?: string }).DNS_RESOLVER_URL?.trim();
+
+    const dueDomains = await db.select().from(organizationDomains)
+        .where(lte(organizationDomains.nextRunDate, nowIso))
+        .all();
+
+    if (dueDomains.length === 0) {
+        console.log('[VerifyOrganizationDomains] No due organization domains found.');
+        return;
+    }
+
+    let verifiedCount = 0;
+    let deverifiedCount = 0;
+    let removedCount = 0;
+
+    for (const domain of dueDomains) {
+        let dnsValid = false;
+        try {
+            dnsValid = await verifyOrganizationDomainDns(domain, fetch, resolverUrl || undefined);
+        } catch (error) {
+            console.error(`[VerifyOrganizationDomains] DNS check failed for ${domain.domainName}:`, error);
+        }
+
+        if (dnsValid) {
+            await db.update(organizationDomains).set({
+                verifiedDate: domain.verifiedDate ?? nowIso,
+                lastCheckedDate: nowIso,
+                jobRunCount: 0,
+                nextRunDate,
+            }).where(eq(organizationDomains.id, domain.id));
+            await ensureSingleOrgPolicyEnabled(db, domain.organizationId, nowIso);
+            verifiedCount += 1;
+            continue;
+        }
+
+        const nextRunCount = Math.min((domain.jobRunCount ?? 0) + 1, 3);
+        if (!domain.verifiedDate && nextRunCount >= 3 && domain.creationDate <= removalCutoff) {
+            await db.delete(organizationDomains).where(eq(organizationDomains.id, domain.id));
+            removedCount += 1;
+            continue;
+        }
+
+        await db.update(organizationDomains).set({
+            verifiedDate: null,
+            lastCheckedDate: nowIso,
+            jobRunCount: domain.verifiedDate ? 1 : nextRunCount,
+            nextRunDate,
+        }).where(eq(organizationDomains.id, domain.id));
+        if (domain.verifiedDate) deverifiedCount += 1;
+    }
+
+    console.log(
+        `[VerifyOrganizationDomains] processed=${dueDomains.length} verified=${verifiedCount} deverified=${deverifiedCount} removed=${removedCount}`,
+    );
 }

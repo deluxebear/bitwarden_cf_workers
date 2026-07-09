@@ -2,7 +2,12 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { BadRequestError } from '../middleware/error';
 
-import { dnsTxtRecordsContainToken, extractDnsTxtRecords, resolveDnsTxtRecords } from './organization-domains';
+import {
+    dnsTxtRecordsContainToken,
+    extractDnsTxtRecords,
+    resolveDnsTxtRecords,
+    verifyOrganizationDomainDns,
+} from './organization-domains';
 
 describe('organization domain DNS TXT verification helpers', () => {
     it('extracts TXT records from DNS-over-HTTPS JSON responses', () => {
@@ -45,6 +50,21 @@ describe('organization domain DNS TXT verification helpers', () => {
         expect(fetcher).toHaveBeenCalledWith('https://resolver.example/dns-query?name=example.com&type=TXT', {
             headers: { accept: 'application/dns-json' },
         });
+    });
+
+    it('verifies a domain when its exact TXT token exists', async () => {
+        const fetcher = vi.fn(
+            async () =>
+                new Response(JSON.stringify({ Answer: [{ type: 16, data: '"bw=abc123"' }] }), {
+                    status: 200,
+                }),
+        ) as typeof fetch;
+
+        await expect(verifyOrganizationDomainDns(
+            { domainName: 'example.com', txt: 'bw=abc123' },
+            fetcher,
+            'https://resolver.example/dns-query',
+        )).resolves.toBe(true);
     });
 
     it('throws a bad request when the DNS resolver fails', async () => {

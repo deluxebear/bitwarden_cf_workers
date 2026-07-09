@@ -16,6 +16,7 @@ import { NotFoundError } from '../middleware/error';
 import { batchedInArrayQuery, D1_BATCH_SIZE } from '../services/db';
 import { toProfileOrganizationResponse } from '../models/organization-responses';
 import { buildAttachmentDownloadUrl } from '../services/attachment-token';
+import { getVerifiedDomainSetForOrganization, isOrganizationUserClaimedByDomains } from '../services/claimed-accounts';
 import type {
     Bindings, Variables, CipherType, CipherRepromptType, SendType,
     ProfileResponse, SyncResponse, GlobalEquivalentDomain,
@@ -231,7 +232,13 @@ sync.get('/', async (c) => {
         .where(and(eq(organizationUsers.userId, userId), eq(organizationUsers.status, 2)))
         .all();
 
-    const profileOrganizations = orgsData.map(d => toProfileOrganizationResponse(d.org, d.orgUser));
+    const profileOrganizations = [];
+    for (const d of orgsData) {
+        const verifiedDomains = await getVerifiedDomainSetForOrganization(db, d.org.id);
+        profileOrganizations.push(toProfileOrganizationResponse(d.org, d.orgUser, {
+            userIsClaimedByOrganization: isOrganizationUserClaimedByDomains(d.orgUser, verifiedDomains, user),
+        }));
+    }
 
     // 如果用户有组织，获取 Collections 和所有相关的 Ciphers
     const myCollections: any[] = [];
