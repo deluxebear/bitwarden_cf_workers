@@ -257,10 +257,13 @@ export async function assertCanCreateOrganization(db: D1Db, userId: string): Pro
 }
 
 export async function assertPersonalVaultWriteAllowed(db: D1Db, userId: string): Promise<void> {
-    const rows = await getEnabledPoliciesForUser(db, userId, PolicyType.OrganizationDataOwnership);
-    if (rows.length > 0) {
+    if (await isPersonalVaultWriteRestricted(db, userId)) {
         throw new BadRequestError('Due to an Enterprise Policy, you are restricted from saving items to your individual vault.');
     }
+}
+
+export async function isPersonalVaultWriteRestricted(db: D1Db, userId: string): Promise<boolean> {
+    return (await getEnabledPoliciesForUser(db, userId, PolicyType.OrganizationDataOwnership)).length > 0;
 }
 
 function normalizeDomain(domain: string): string {

@@ -14,6 +14,7 @@ import { generateUuid } from '../services/crypto';
 import type { Bindings, Variables, FolderRequest, FolderResponse } from '../types';
 import { pushSyncFolder } from '../services/push-notification';
 import { PushType } from '../types/push-notification';
+import { assertPersonalVaultWriteAllowed } from '../services/policy-requirements';
 
 const foldersRoute = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
@@ -68,6 +69,7 @@ foldersRoute.post('/', async (c) => {
     const body = await c.req.json<FolderRequest>();
 
     if (!body.name) throw new BadRequestError('Name is required.');
+    await assertPersonalVaultWriteAllowed(db, userId);
 
     const now = new Date().toISOString();
     const folderId = generateUuid();
@@ -102,6 +104,7 @@ foldersRoute.put('/:id', async (c) => {
     const existing = await db.select().from(folders)
         .where(and(eq(folders.id, folderId), eq(folders.userId, userId))).get();
     if (!existing) throw new NotFoundError('Folder not found.');
+    await assertPersonalVaultWriteAllowed(db, userId);
 
     const now = new Date().toISOString();
     await db.update(folders).set({
@@ -131,6 +134,7 @@ foldersRoute.post('/:id', async (c) => {
     const existing = await db.select().from(folders)
         .where(and(eq(folders.id, folderId), eq(folders.userId, userId))).get();
     if (!existing) throw new NotFoundError('Folder not found.');
+    await assertPersonalVaultWriteAllowed(db, userId);
 
     const now = new Date().toISOString();
     await db.update(folders).set({ name: body.name, revisionDate: now }).where(eq(folders.id, folderId));

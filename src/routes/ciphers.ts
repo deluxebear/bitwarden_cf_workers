@@ -46,6 +46,16 @@ type CipherAccess = {
     manage: boolean;
 };
 
+async function assertCipherPersonalVaultWriteAllowed(
+    db: ReturnType<typeof drizzle>,
+    userId: string,
+    cipher: Pick<CipherRow, 'organizationId'>,
+): Promise<void> {
+    if (!cipher.organizationId) {
+        await assertPersonalVaultWriteAllowed(db, userId);
+    }
+}
+
 function buildCipherData(body: Partial<CipherRequest>): Record<string, unknown> {
     const data: Record<string, unknown> = {
         name: body.name ?? '',
@@ -588,6 +598,7 @@ const uploadAttachmentHandler = async (c: any) => {
     const cipherId = c.req.param('id');
 
     const cipher = await getEditableCipher(db, cipherId, userId);
+    await assertCipherPersonalVaultWriteAllowed(db, userId, cipher);
 
     const { file, formData } = await extractFileFromRequest(c);
 
@@ -641,6 +652,7 @@ ciphersRoute.post('/:id/attachment/v2', async (c) => {
     const cipherId = c.req.param('id');
 
     const cipher = await getEditableCipher(db, cipherId, userId);
+    await assertCipherPersonalVaultWriteAllowed(db, userId, cipher);
 
     const body = await c.req.json<{
         key?: string;
@@ -695,6 +707,7 @@ ciphersRoute.post('/:id/attachment/:attachmentId', async (c) => {
     const attachmentId = c.req.param('attachmentId');
 
     const cipher = await getEditableCipher(db, cipherId, userId);
+    await assertCipherPersonalVaultWriteAllowed(db, userId, cipher);
 
     const attachmentsMap = cipher.attachments ? JSON.parse(cipher.attachments) : {};
     if (!attachmentsMap[attachmentId]) {
@@ -788,6 +801,7 @@ const deleteAttachmentHandler = async (c: any) => {
     const attachmentId = c.req.param('attachmentId');
 
     const cipher = await getEditableCipher(db, cipherId, userId);
+    await assertCipherPersonalVaultWriteAllowed(db, userId, cipher);
 
     const attachmentsMap = cipher.attachments ? JSON.parse(cipher.attachments) : {};
     if (!attachmentsMap[attachmentId]) {
@@ -1550,6 +1564,7 @@ ciphersRoute.put('/:id/restore', async (c) => {
     const existing = await db.select().from(ciphers)
         .where(and(eq(ciphers.id, cipherId), eq(ciphers.userId, userId))).get();
     if (!existing) throw new NotFoundError('Cipher not found.');
+    await assertCipherPersonalVaultWriteAllowed(db, userId, existing);
 
     const now = new Date().toISOString();
     await db.update(ciphers).set({ deletedDate: null, revisionDate: now }).where(eq(ciphers.id, cipherId));
@@ -1725,6 +1740,10 @@ ciphersRoute.put('/restore', async (c) => {
     const now = new Date().toISOString();
     const results: any[] = [];
     for (const id of body.ids) {
+        const existing = await db.select().from(ciphers)
+            .where(and(eq(ciphers.id, id), eq(ciphers.userId, userId))).get();
+        if (!existing) continue;
+        await assertCipherPersonalVaultWriteAllowed(db, userId, existing);
         await db.update(ciphers).set({ deletedDate: null, revisionDate: now })
             .where(and(eq(ciphers.id, id), eq(ciphers.userId, userId)));
         await logEvent(c.env.DB, 1116, { userId, cipherId: id });
@@ -1858,6 +1877,7 @@ ciphersRoute.put('/move', async (c) => {
         const cipher = await db.select().from(ciphers)
             .where(and(eq(ciphers.id, id), eq(ciphers.userId, userId))).get();
         if (cipher) {
+            await assertCipherPersonalVaultWriteAllowed(db, userId, cipher);
             const folders = cipher.folders ? JSON.parse(cipher.folders) : {};
             if (body.folderId) folders[userId] = body.folderId;
             else delete folders[userId];
@@ -1920,6 +1940,7 @@ const partialCipherHandler = async (c: any) => {
     const body = await c.req.json() as { folderId?: string | null; favorite?: boolean };
 
     const existing = await getAccessibleCipher(db, cipherId, userId);
+    await assertCipherPersonalVaultWriteAllowed(db, userId, existing);
     const now = new Date().toISOString();
     const favorites = existing.favorites ? JSON.parse(existing.favorites) : {};
     const folderMap = existing.folders ? JSON.parse(existing.folders) : {};
@@ -2039,6 +2060,7 @@ ciphersRoute.post('/move', async (c) => {
         const cipher = await db.select().from(ciphers)
             .where(and(eq(ciphers.id, id), eq(ciphers.userId, userId))).get();
         if (!cipher) continue;
+        await assertCipherPersonalVaultWriteAllowed(db, userId, cipher);
         const folderMap = cipher.folders ? JSON.parse(cipher.folders) : {};
         if (body.folderId) folderMap[userId] = body.folderId;
         else delete folderMap[userId];
@@ -2146,6 +2168,7 @@ ciphersRoute.put('/archive', async (c) => {
         const existing = await db.select().from(ciphers)
             .where(and(eq(ciphers.id, id), eq(ciphers.userId, userId))).get();
         if (!existing) continue;
+        await assertCipherPersonalVaultWriteAllowed(db, userId, existing);
 
         await db.update(ciphers).set({ archivedDate: now, revisionDate: now })
             .where(and(eq(ciphers.id, id), eq(ciphers.userId, userId)));
@@ -2192,6 +2215,7 @@ ciphersRoute.put('/unarchive', async (c) => {
         const existing = await db.select().from(ciphers)
             .where(and(eq(ciphers.id, id), eq(ciphers.userId, userId))).get();
         if (!existing) continue;
+        await assertCipherPersonalVaultWriteAllowed(db, userId, existing);
 
         await db.update(ciphers).set({ archivedDate: null, revisionDate: now })
             .where(and(eq(ciphers.id, id), eq(ciphers.userId, userId)));
@@ -2231,6 +2255,7 @@ ciphersRoute.post('/:id', async (c) => {
     const existing = await db.select().from(ciphers)
         .where(and(eq(ciphers.id, id), eq(ciphers.userId, userId))).get();
     if (!existing) throw new NotFoundError('Cipher not found.');
+    await assertCipherPersonalVaultWriteAllowed(db, userId, existing);
 
     const now = new Date().toISOString();
     const data: any = {
@@ -2424,6 +2449,7 @@ ciphersRoute.put('/:id', async (c) => {
             throw new NotFoundError('Cipher not found.');
         }
     }
+    await assertCipherPersonalVaultWriteAllowed(db, userId, existing);
 
     const now = new Date().toISOString();
     const data: any = {
@@ -2490,6 +2516,7 @@ ciphersRoute.put('/:id/archive', async (c) => {
     const existing = await db.select().from(ciphers)
         .where(and(eq(ciphers.id, cipherId), eq(ciphers.userId, userId))).get();
     if (!existing) throw new NotFoundError('Cipher not found.');
+    await assertCipherPersonalVaultWriteAllowed(db, userId, existing);
 
     const now = new Date().toISOString();
     await db.update(ciphers).set({ archivedDate: now, revisionDate: now }).where(eq(ciphers.id, cipherId));
@@ -2519,6 +2546,7 @@ ciphersRoute.put('/:id/unarchive', async (c) => {
     const existing = await db.select().from(ciphers)
         .where(and(eq(ciphers.id, cipherId), eq(ciphers.userId, userId))).get();
     if (!existing) throw new NotFoundError('Cipher not found.');
+    await assertCipherPersonalVaultWriteAllowed(db, userId, existing);
 
     const now = new Date().toISOString();
     await db.update(ciphers).set({ archivedDate: null, revisionDate: now }).where(eq(ciphers.id, cipherId));
