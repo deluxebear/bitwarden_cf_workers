@@ -286,7 +286,7 @@ describe('official client compatibility contract', () => {
             },
         );
 
-        it.each(['password', 'refresh_token', 'authorization_code', 'webauthn'])(
+        it.each(['password', 'authorization_code', 'webauthn'])(
             'rejects unknown client_id for the %s grant before grant processing',
             async (grantType) => {
                 const response = await SELF.fetch('https://example.com/identity/connect/token', {
@@ -304,6 +304,23 @@ describe('official client compatibility contract', () => {
                 }));
             },
         );
+
+        it('does not apply the client_id allowlist to the refresh_token grant', async () => {
+            // 官方客户端刷新时的 client_id 取自 access token 的 claim，早期 token 可能没有；
+            // 刷新以 refresh_token 校验身份，不应因 client_id 被拦，否则现存会话无法续期。
+            const response = await SELF.fetch('https://example.com/identity/connect/token', {
+                method: 'POST',
+                headers: { 'content-type': 'application/x-www-form-urlencoded' },
+                body: new URLSearchParams({
+                    grant_type: 'refresh_token',
+                    client_id: 'unregistered-client',
+                }),
+            });
+            expect(response.status).toBe(400);
+            const bodyJson = await response.json() as Record<string, unknown>;
+            // 进入了 refresh_token 处理（缺 refresh_token），而不是被 client_id 拦截
+            expect(bodyJson.error).not.toBe('invalid_client');
+        });
 
         it('does not apply the interactive client allowlist to the internal send_access grant', async () => {
             const response = await SELF.fetch('https://example.com/identity/connect/token', {

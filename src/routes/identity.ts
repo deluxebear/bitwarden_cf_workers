@@ -71,7 +71,9 @@ import { canAccessPremium } from '../services/premium';
 const identity = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 const SEND_ACCESS_TOKEN_LIFETIME_SECONDS = 15 * 60;
 const OFFICIAL_CLIENT_IDS = new Set(['web', 'browser', 'desktop', 'mobile', 'cli', 'connector']);
-const CLIENT_BOUND_GRANTS = new Set(['password', 'refresh_token', 'authorization_code', 'webauthn']);
+// refresh_token 不在此列：客户端刷新时的 client_id 取自当前 access token 的 client_id claim，
+// 早期签发的 token 可能没有该 claim；刷新本身以 refresh_token 校验身份，不依赖 client_id。
+const CLIENT_BOUND_GRANTS = new Set(['password', 'authorization_code', 'webauthn']);
 
 type RegisterFinishInvite = {
     organizationUserId?: string;
@@ -1046,6 +1048,7 @@ async function handleAuthorizationCodeGrant(c: any, db: D1Db, body: TokenRequest
         device: loginDevice.id,
         scope: ['api', 'offline_access'],
         amr: ['sso'],
+        client_id: body.client_id || undefined,
     }, c.env.JWT_SECRET, expiresIn);
     const refreshToken = generateRefreshToken();
     const refreshExpiresIn = Number.parseInt(c.env.JWT_REFRESH_EXPIRATION || '2592000', 10);
@@ -1686,6 +1689,7 @@ async function handlePasswordGrant(c: any, db: any, body: NewDeviceTokenRequest)
         device: loginDevice.id,
         scope: ['api', 'offline_access'],
         amr: ['Application'],
+        client_id: body.client_id || undefined,
     }, c.env.JWT_SECRET, expiresIn);
 
     // 签发 refresh token
@@ -1817,6 +1821,7 @@ async function handleRefreshTokenGrant(c: any, db: any, body: TokenRequest) {
         device: storedToken.deviceId || '',
         scope: ['api', 'offline_access'],
         amr: ['Application'],
+        client_id: body.client_id || undefined,
     }, c.env.JWT_SECRET, expiresIn);
 
     // 签发新 refresh token（rotation）
@@ -2030,6 +2035,7 @@ async function handleWebAuthnGrant(c: any, db: any, body: TokenRequest, rawToken
         device: loginDevice.id,
         scope: ['api', 'offline_access'],
         amr: ['Application'],
+        client_id: body.client_id || undefined,
     }, c.env.JWT_SECRET, expiresIn);
 
     const refreshTokenValue = generateRefreshToken();

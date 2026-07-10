@@ -162,6 +162,7 @@ export interface JwtPayload {
     device: string;
     scope: string[];
     amr: string[];
+    client_id?: string; // 客户端在 refresh_token 请求中回传此 claim
 }
 
 // KDF 类型 - 对应原始 KdfType enum
