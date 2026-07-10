@@ -27,20 +27,25 @@ jobs:
       contents: read
     steps:
       - name: Checkout Workers
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: ${{ env.WORKERS_DIR }}
 
       - name: Checkout Clients
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: deluxebear/bitwarden_clients
           ref: ${{ github.event.inputs.clients_ref || 'main' }}
           path: ${{ env.CLIENTS_DIR }}
           token: ${{ secrets.CLIENTS_REPO_TOKEN || github.token }}
 
+      - name: Resolve Clients revision
+        id: clients-revision
+        working-directory: ${{ env.CLIENTS_DIR }}
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "22"
           cache: "npm"
@@ -52,7 +57,15 @@ jobs:
         working-directory: ${{ env.WORKERS_DIR }}
         run: npm ci
 
+      - name: Restore Web Vault build
+        id: web-vault-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ env.CLIENTS_DIR }}/apps/web/build
+          key: web-vault-v1-${{ runner.os }}-node22-${{ steps.clients-revision.outputs.sha }}
+
       - name: Install Clients dependencies
+        if: steps.web-vault-cache.outputs.cache-hit != 'true'
         working-directory: ${{ env.CLIENTS_DIR }}
         run: npm ci
 
@@ -65,6 +78,7 @@ jobs:
         run: npm run test
 
       - name: Build Web Vault static assets
+        if: steps.web-vault-cache.outputs.cache-hit != 'true'
         working-directory: ${{ env.CLIENTS_DIR }}/apps/web
         run: npm run dist:bit:selfhost
 
@@ -74,6 +88,13 @@ jobs:
           test -f "${CLIENTS_DIR}/apps/web/build/index.html"
           find "${CLIENTS_DIR}/apps/web/build" -type f -name "*.map" -delete
           du -sh "${CLIENTS_DIR}/apps/web/build"
+
+      - name: Save Web Vault build
+        if: steps.web-vault-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ env.CLIENTS_DIR }}/apps/web/build
+          key: web-vault-v1-${{ runner.os }}-node22-${{ steps.clients-revision.outputs.sha }}
 
       - name: Validate required deployment secrets
         run: |
