@@ -14,7 +14,7 @@ import type { Bindings, Variables } from '../types';
 import { verifyJwt } from '../middleware/auth';
 import { eq } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/d1';
-import { organizationUsers } from '../db/schema';
+import { organizationUsers, users } from '../db/schema';
 
 type HubBindings = Bindings & {
     NOTIFICATION_HUB: DurableObjectNamespace;
@@ -45,17 +45,23 @@ hub.get('/hub', async (c) => {
 
     // 验证 JWT
     const payload = await verifyJwt(accessToken, c.env.JWT_SECRET);
-    if (!payload) {
+    if (!payload || !Array.isArray(payload.scope) || !payload.scope.includes('api') || !payload.sub) {
         return c.json({ message: 'Unauthorized' }, 401);
     }
 
     const userId = payload.sub;
     const deviceId = payload.device || null;
 
+    const db = drizzle(c.env.DB);
+    const user = await db.select({ securityStamp: users.securityStamp })
+        .from(users).where(eq(users.id, userId)).get();
+    if (!user || user.securityStamp !== payload.sstamp) {
+        return c.json({ message: 'Unauthorized' }, 401);
+    }
+
     // 查询用户所属组织
     let orgIds: string[] = [];
     try {
-        const db = drizzle(c.env.DB);
         const orgMemberships = await db
             .select({ organizationId: organizationUsers.organizationId })
             .from(organizationUsers)

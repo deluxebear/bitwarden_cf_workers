@@ -6,6 +6,10 @@
  */
 
 import type { NotificationRequest } from '../durable-objects/notification-hub';
+import { drizzle } from 'drizzle-orm/d1';
+import { and, eq } from 'drizzle-orm';
+import { devices, organizationUsers } from '../db/schema';
+import { sendWebPush, type WebPushIdempotencyStore, type WebPushSubscription } from './web-push';
 import {
     PushType,
     type PushNotificationData,
@@ -23,6 +27,12 @@ const DO_BINDING = 'NOTIFICATION_HUB';
 // 使用固定 ID，所有连接共享一个 DO 实例（单实例足以处理自建场景的连接数）
 const DO_ID_NAME = 'global-notification-hub';
 
+type HubEnv = {
+    NOTIFICATION_HUB: DurableObjectNamespace;
+    DB?: D1Database;
+    [key: string]: unknown;
+};
+
 /**
  * 获取 NotificationHub DO stub
  */
@@ -39,49 +49,52 @@ async function sendToHub(
     req: NotificationRequest,
 ): Promise<void> {
     const stub = getHubStub(env);
-    await stub.fetch(new Request('https://do/notify', {
+    const response = await stub.fetch(new Request('https://do/notify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(req),
     }));
+    if (!response.ok) throw new Error(`NotificationHub rejected notification: HTTP ${response.status}`);
 }
 
 /**
  * 推送通知到用户
  */
 async function pushToUser(
-    env: { NOTIFICATION_HUB: DurableObjectNamespace },
+    env: HubEnv,
     userId: string,
     data: PushNotificationData<unknown>,
     contextId: string | null,
+    eventId = crypto.randomUUID(),
+    idempotency?: WebPushIdempotencyStore,
 ): Promise<void> {
-    await sendToHub(env, {
-        type: 'push',
-        target: 'user',
-        targetId: userId,
-        method: 'ReceiveMessage',
-        data,
-        contextId,
-    });
+    await Promise.all([
+        sendToHub(env, {
+            type: 'push', target: 'user', targetId: userId,
+            method: 'ReceiveMessage', data, contextId,
+        }),
+        pushToRegisteredWebDevices(env, 'user', userId, data, contextId, eventId, idempotency),
+    ]);
 }
 
 /**
  * 推送通知到组织
  */
 async function pushToOrganization(
-    env: { NOTIFICATION_HUB: DurableObjectNamespace },
+    env: HubEnv,
     orgId: string,
     data: PushNotificationData<unknown>,
     contextId: string | null,
+    eventId = crypto.randomUUID(),
+    idempotency?: WebPushIdempotencyStore,
 ): Promise<void> {
-    await sendToHub(env, {
-        type: 'push',
-        target: 'organization',
-        targetId: orgId,
-        method: 'ReceiveMessage',
-        data,
-        contextId,
-    });
+    await Promise.all([
+        sendToHub(env, {
+            type: 'push', target: 'organization', targetId: orgId,
+            method: 'ReceiveMessage', data, contextId,
+        }),
+        pushToRegisteredWebDevices(env, 'organization', orgId, data, contextId, eventId, idempotency),
+    ]);
 }
 
 /**
@@ -106,7 +119,167 @@ async function pushToAnonymousToken(
 // 公开 API - 业务层调用
 // ============================================================
 
-type HubEnv = { NOTIFICATION_HUB: DurableObjectNamespace };
+type RegisteredWebPushAuth = {
+    endpoint?: string;
+    p256dh?: string;
+    auth?: string;
+    organizationIds?: string[];
+};
+
+export type WebPushQueueMessage = {
+    deviceId: string;
+    subscription: WebPushSubscription;
+    serializedSubscription: string;
+    payload: unknown;
+    eventId: string;
+};
+
+type WebPushEnv = HubEnv & { WEB_PUSH_QUEUE?: Queue<WebPushQueueMessage> };
+
+type ClaimResult = { status: 'claimed'; token: string } |
+    { status: 'leased'; remainingSeconds: number } | { status: 'completed' };
+
+async function claimDelivery(env: HubEnv, key: string): Promise<ClaimResult> {
+    const response = await getHubStub(env).fetch(new Request('https://do/web-push/claim', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key, leaseSeconds: 30 }),
+    }));
+    if (!response.ok) throw new Error(`Web Push idempotency claim failed: HTTP ${response.status}`);
+    return await response.json() as ClaimResult;
+}
+
+async function finishDelivery(env: HubEnv, action: 'complete' | 'release', key: string, token: string): Promise<boolean> {
+    const response = await getHubStub(env).fetch(new Request(`https://do/web-push/${action}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key, token }),
+    }));
+    if (!response.ok) throw new Error(`Web Push idempotency ${action} failed: HTTP ${response.status}`);
+    return ((await response.json()) as { updated?: boolean }).updated === true;
+}
+
+function binding(env: HubEnv, name: string): string | null {
+    const value = env[name];
+    return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function webPushConfig(env: HubEnv) {
+    const publicKey = binding(env, 'WEB_PUSH_VAPID_PUBLIC_KEY');
+    const privateKey = binding(env, 'WEB_PUSH_VAPID_PRIVATE_KEY');
+    const subject = binding(env, 'WEB_PUSH_VAPID_SUBJECT');
+    return publicKey && privateKey && subject ? { publicKey, privateKey, subject } : null;
+}
+
+function parseWebPushAuth(value: string | null): RegisteredWebPushAuth | null {
+    if (!value) return null;
+    try {
+        const parsed = JSON.parse(value) as RegisteredWebPushAuth;
+        if (!parsed.endpoint || !parsed.p256dh || !parsed.auth) return null;
+        return parsed;
+    } catch {
+        return null;
+    }
+}
+
+async function pushToRegisteredWebDevices(
+    env: HubEnv,
+    target: 'user' | 'organization',
+    targetId: string,
+    data: PushNotificationData<unknown>,
+    contextId: string | null,
+    eventId: string,
+    idempotency?: WebPushIdempotencyStore,
+): Promise<void> {
+    const config = webPushConfig(env);
+    if (!config || !env.DB) return;
+    const db = drizzle(env.DB);
+    const rows = target === 'user'
+        ? await db.select({ id: devices.id, auth: devices.webPushAuth }).from(devices)
+            .where(and(eq(devices.userId, targetId), eq(devices.active, true))).all()
+        : await db.select({ id: devices.id, auth: devices.webPushAuth }).from(devices)
+            .innerJoin(organizationUsers, eq(organizationUsers.userId, devices.userId))
+            .where(and(
+                eq(organizationUsers.organizationId, targetId),
+                eq(organizationUsers.status, 2),
+                eq(devices.active, true),
+            )).all();
+
+    const uniqueDevices = [...new Map(rows.map((device) => [device.id, device])).values()];
+    await Promise.all(uniqueDevices.map(async (device) => {
+        if (device.id === contextId) return;
+        const auth = parseWebPushAuth(device.auth);
+        if (!auth || (target === 'organization' && !auth.organizationIds?.includes(targetId))) return;
+        const claimKey = `${eventId}:${device.id}`;
+        let leaseToken: string | null = null;
+        let enqueueing = false;
+        try {
+            const claim = await claimDelivery(env, claimKey);
+            if (claim.status !== 'claimed') return;
+            leaseToken = claim.token;
+            const result = await sendWebPush(auth as Required<Pick<RegisteredWebPushAuth, 'endpoint' | 'p256dh' | 'auth'>>,
+                { ...data, EventId: eventId }, eventId, config);
+            if (result.status === 'delivered' || result.status === 'duplicate') {
+                await finishDelivery(env, 'complete', claimKey, leaseToken);
+            }
+            if (result.status === 'failed') await finishDelivery(env, 'complete', claimKey, leaseToken);
+            if (result.status === 'expired') {
+                await db.update(devices).set({ webPushAuth: null, revisionDate: new Date().toISOString() })
+                    .where(and(eq(devices.id, device.id), eq(devices.webPushAuth, device.auth!)));
+                await finishDelivery(env, 'complete', claimKey, leaseToken);
+            }
+            if (result.status === 'retryable') {
+                const queue = (env as WebPushEnv).WEB_PUSH_QUEUE;
+                if (!queue) throw new Error('WEB_PUSH_QUEUE is required for retries.');
+                enqueueing = true;
+                await queue.send({ deviceId: device.id, subscription: auth as WebPushSubscription,
+                    serializedSubscription: device.auth!, payload: { ...data, EventId: eventId }, eventId },
+                { delaySeconds: result.retryAfterSeconds ?? 30 });
+                enqueueing = false;
+                await finishDelivery(env, 'release', claimKey, leaseToken);
+                console.warn(JSON.stringify({ event: 'web_push.retryable',
+                    statusCode: result.statusCode, attempts: result.attempts }));
+            }
+        } catch (error) {
+            if (!enqueueing && leaseToken) await finishDelivery(env, 'release', claimKey, leaseToken).catch(() => undefined);
+            console.error(JSON.stringify({ event: 'web_push.failed',
+                errorCode: error instanceof Error ? error.name : 'WEB_PUSH_ERROR' }));
+            if (enqueueing) throw error;
+        }
+    }));
+}
+
+export async function handleWebPushQueue(batch: MessageBatch<WebPushQueueMessage>, env: WebPushEnv): Promise<void> {
+    const config = webPushConfig(env);
+    if (!config || !env.DB) return batch.retryAll({ delaySeconds: 300 });
+    const db = drizzle(env.DB);
+    await Promise.all(batch.messages.map(async (message) => {
+        const body = message.body;
+        const key = `${body.eventId}:${body.deviceId}`;
+        const delay = () => Math.min(3600, 30 * (2 ** Math.min(Math.max(message.attempts - 1, 0), 7)));
+        let leaseToken: string | null = null;
+        try {
+            const claim = await claimDelivery(env, key);
+            if (claim.status === 'completed') return message.ack();
+            if (claim.status === 'leased') return message.retry({ delaySeconds: claim.remainingSeconds });
+            leaseToken = claim.token;
+            const result = await sendWebPush(body.subscription, body.payload, body.eventId, config, { maxAttempts: 1 });
+            if (result.status === 'delivered' || result.status === 'duplicate') {
+                await finishDelivery(env, 'complete', key, leaseToken); message.ack(); return;
+            }
+            if (result.status === 'expired') {
+                await db.update(devices).set({ webPushAuth: null, revisionDate: new Date().toISOString() })
+                    .where(and(eq(devices.id, body.deviceId), eq(devices.webPushAuth, body.serializedSubscription)));
+                await finishDelivery(env, 'complete', key, leaseToken); message.ack(); return;
+            }
+            if (result.status === 'failed') {
+                await finishDelivery(env, 'complete', key, leaseToken); message.ack(); return;
+            }
+            await finishDelivery(env, 'release', key, leaseToken);
+            message.retry({ delaySeconds: Math.max(delay(), result.retryAfterSeconds ?? 0) });
+        } catch {
+            if (leaseToken) await finishDelivery(env, 'release', key, leaseToken).catch(() => undefined);
+            message.retry({ delaySeconds: delay() });
+        }
+    }));
+}
 
 /**
  * 通用推送通知。
@@ -119,6 +292,8 @@ export async function pushNotification(
     type: PushType,
     payload: unknown,
     contextId: string | null,
+    eventId = crypto.randomUUID(),
+    idempotency?: WebPushIdempotencyStore,
 ): Promise<void> {
     const data: PushNotificationData<unknown> = {
         Type: type,
@@ -126,12 +301,9 @@ export async function pushNotification(
         ContextId: contextId,
     };
 
-    if (target === 'user') {
-        await pushToUser(env, targetId, data, contextId);
-        return;
-    }
-
-    await pushToOrganization(env, targetId, data, contextId);
+    await (target === 'user'
+        ? pushToUser(env, targetId, data, contextId, eventId, idempotency)
+        : pushToOrganization(env, targetId, data, contextId, eventId, idempotency));
 }
 
 /**

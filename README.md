@@ -251,6 +251,7 @@ npx wrangler deploy --config wrangler.deploy.toml
 | `EMAIL_PROVIDER_ENDPOINT` | `EMAIL_MODE=provider` 时使用 | webhook 邮件服务地址 |
 | `SIGNUPS_ALLOWED` | 可选 | `auto`、`true` 或 `false` |
 | `VAULT_BASE_URL` | 建议 | Web Vault 正式访问地址，用于邀请链接 |
+| `SSO_BASE_URL` | 使用 OIDC 时必需 | Worker 的公网 HTTPS origin，用于 OIDC 回调 |
 | `FORCE_INVITE_REGISTER` | 可选 | `true` 时邀请链接强制进入注册流程 |
 | `CLIENTS_REPO_TOKEN` | 私有 clients 仓库时必需 | 读取 `deluxebear/bitwarden_clients` 的 token |
 
@@ -302,6 +303,35 @@ Web Vault 和 API 由同一个 Worker 提供。自托管 Web Vault 构建由 `EN
 | `JWT_REFRESH_EXPIRATION` | `2592000` | Refresh Token 有效期（秒），默认 30 天 |
 | `GLOBAL_PREMIUM` | `true` | 全局启用 Premium 功能 |
 
+### 高级二步验证与 SSO
+
+以下值必须通过 `wrangler secret put` 配置，不能写入 TOML 或提交到仓库：
+
+| Secret | 用途 |
+|--------|------|
+| `DUO_CONFIG_ENCRYPTION_KEY` | 加密 D1 中的 Duo Client Secret；必须是 Base64/Base64URL 编码的 32 字节随机密钥 |
+| `YUBICO_CLIENT_ID` / `YUBICO_SECRET` | Yubico OTP Validation 凭据 |
+| `WEB_PUSH_VAPID_PRIVATE_KEY` | Web Push VAPID P-256 私钥，Base64URL 编码的 32 字节标量 |
+| `HEALTH_CHECK_TOKEN` | `/healthz/extended` 的高熵服务令牌；未配置时深度探针返回 404 |
+| OIDC 配置指定的 secret binding | 组织 OIDC Client Secret；binding 名由组织配置保存 |
+
+生成 Duo 加密密钥并写入 Worker：
+
+```bash
+openssl rand -base64 32 | npx wrangler secret put DUO_CONFIG_ENCRYPTION_KEY
+```
+
+启用 Duo 前还必须设置 `VAULT_BASE_URL` 为 Web Vault 的公网 HTTPS 地址；Duo 回调会使用其中的 `duo-redirect-connector.html`。
+
+Web Push 还需在公开变量中配置 `WEB_PUSH_VAPID_PUBLIC_KEY` 和 `WEB_PUSH_VAPID_SUBJECT`。只有公钥、私钥和 subject 三项齐全时，`/api/config` 才会向客户端声明 `pushTechnology=WebPush`；否则继续使用 SignalR。
+
+生产启用 Web Push 前需先创建重试队列和死信队列，并将名称通过 `WEB_PUSH_QUEUE_NAME`、`WEB_PUSH_DLQ_NAME` 传给部署配置渲染器：
+
+```bash
+npx wrangler queues create bitwarden-web-push
+npx wrangler queues create bitwarden-web-push-dlq
+```
+
 ### 注册与邀请
 
 | 变量 | 默认值 | 说明 |
@@ -346,8 +376,19 @@ Web Vault 和 API 由同一个 Worker 提供。自托管 Web Vault 构建由 `EN
 | `ATTACHMENTS` | R2 | 附件文件存储 |
 | `ICONS_CACHE` | KV | Icons 缓存（跨用户复用） |
 | `NOTIFICATION_HUB` | Durable Object | 实时 WebSocket 推送 |
+| `WEB_PUSH_QUEUE` | Queue | Web Push 429/5xx/网络故障的持久化延迟重试；消费者最终失败进入 DLQ |
 
 ---
+
+## 可观测性与健康检查
+
+- 所有 HTTP 响应包含 `X-Request-Id`。调用方可传入 8–64 位字母、数字、`_`、`-` 组成的请求 ID；无效或缺失时由 Worker 生成 UUID。
+- 每个请求输出一条结构化 JSON 完成日志，字段为 `requestId`、`method`、`route`、`status`、`duration`、`errorCode`。日志不包含查询参数、请求体、认证头、邮箱、OTP 或密钥。
+- `GET /healthz` 是不访问绑定的轻量存活探针。
+- `GET /healthz/extended` 仅在配置 secret `HEALTH_CHECK_TOKEN` 后启用，并要求 `Authorization: Bearer <token>`；它会并行验证 D1、KV、R2 与 Durable Object，全部可用返回 `200`，否则返回不含底层错误和资源 ID 的 `503 degraded`。未配置或鉴权失败返回 `404`，避免被公开请求放大资源消耗。
+- `GET /version` 优先读取可选 `WORKER_VERSION`，其次读取 Cloudflare Version Metadata binding（建议绑定名 `CF_VERSION_METADATA`），均未配置时安全返回 `unknown`。
+
+生产环境建议在 Wrangler 中启用 Workers Observability，并为高流量服务配置合适的 head sampling rate。`WORKER_VERSION` 和 Version Metadata binding 需由部署配置注入；它们都不是 secret。
 
 ## 定时任务
 

@@ -1,7 +1,23 @@
 name = "bitwarden-workers-dev"
 main = "src/index.ts"
-compatibility_date = "2025-12-01"
+compatibility_date = "2026-07-10"
 compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+head_sampling_rate = 1.0
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1.0
+invocation_logs = true
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 0.1
+
+[version_metadata]
+binding = "CF_VERSION_METADATA"
 
 [assets]
 directory = "../clients/apps/web/build"
@@ -33,6 +49,10 @@ ICONS_MAX_IMAGE_BYTES = "51200"
 #
 # 邀请链接中的 Web Vault 地址，例如 https://vault.example.com 或 http://localhost:8080（本地开发）
 # VAULT_BASE_URL = "http://localhost:8080"
+# Duo Universal Prompt 需要公网 HTTPS VAULT_BASE_URL；DUO_CONFIG_ENCRYPTION_KEY 必须用 wrangler secret put 设置。
+# Web Push：公开键与 subject 可写入 vars，WEB_PUSH_VAPID_PRIVATE_KEY 必须用 wrangler secret put 设置。
+# WEB_PUSH_VAPID_PUBLIC_KEY = "<base64url uncompressed P-256 public key>"
+# WEB_PUSH_VAPID_SUBJECT = "mailto:admin@example.com"
 # 设为 "true" 时，邀请链接一律进入「注册」页，被邀请人需设置主密钥（适合自建、该邮箱尚未注册或希望走注册流程）
 # FORCE_INVITE_REGISTER = "true"
 # 控制开放注册行为: "true" 始终允许 | "false" 始终禁止 | "auto" 无用户时允许，有用户后关闭（默认）
@@ -62,6 +82,18 @@ bucket_name = "bitwarden-attachments-dev"
 binding = "ICONS_CACHE"
 id = "local-icons-cache"
 preview_id = "local-icons-cache"
+
+# Web Push 的持久化重试队列。生产部署前需创建主队列和死信队列。
+[[queues.producers]]
+binding = "WEB_PUSH_QUEUE"
+queue = "bitwarden-web-push-dev"
+
+[[queues.consumers]]
+queue = "bitwarden-web-push-dev"
+max_batch_size = 10
+max_batch_timeout = 5
+max_retries = 8
+dead_letter_queue = "bitwarden-web-push-dlq-dev"
 
 # Durable Objects - 实时通知 (SignalR 兼容 WebSocket Hub)
 # 对应官方 Notifications/NotificationsHub.cs

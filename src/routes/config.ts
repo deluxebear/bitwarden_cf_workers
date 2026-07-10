@@ -18,6 +18,22 @@ function isUserRegistrationDisabled(env: Bindings): boolean {
     return String(env.SIGNUPS_ALLOWED ?? 'auto').toLowerCase().trim() === 'false';
 }
 
+export function getWebPushServerConfig(env: Bindings) {
+    const publicKey = env.WEB_PUSH_VAPID_PUBLIC_KEY?.trim();
+    const privateKey = env.WEB_PUSH_VAPID_PRIVATE_KEY?.trim();
+    const subject = env.WEB_PUSH_VAPID_SUBJECT?.trim();
+    return publicKey && privateKey && subject
+        ? { pushTechnology: 1, vapidPublicKey: publicKey }
+        : { pushTechnology: 0, vapidPublicKey: null };
+}
+
+function deploymentVersion(env: Bindings): string {
+    const explicit = env.WORKER_VERSION?.trim();
+    if (explicit) return explicit;
+    const metadata = env.CF_VERSION_METADATA;
+    return metadata?.tag?.trim() || metadata?.id || 'unknown';
+}
+
 /**
  * GET /api/config
  * 对应 ConfigController.Get
@@ -26,7 +42,7 @@ config.get('/', async (c) => {
     // 从请求中推断 notifications URL（与 api 同源）
     const origin = new URL(c.req.url).origin;
     return c.json({
-        version: '2025.1.0',
+        version: deploymentVersion(c.env),
         gitHash: 'workers',
         server: null, // null = 官方服务器标志，isOfficialBitwardenServer() 检查此字段
         environment: {
@@ -49,10 +65,7 @@ config.get('/', async (c) => {
             'pm-19051-send-email-verification': isEmailVerificationEnabled(c.env),
         },
         // 新增字段 - 对应 ConfigResponseModel
-        push: {
-            pushTechnology: 0, // SignalR
-            vapidPublicKey: null,
-        },
+        push: getWebPushServerConfig(c.env),
         communication: null,
         settings: {
             disableUserRegistration: isUserRegistrationDisabled(c.env),

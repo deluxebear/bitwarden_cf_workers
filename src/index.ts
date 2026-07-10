@@ -14,10 +14,9 @@
 
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { logger } from 'hono/logger';
 import { errorHandler, globalErrorHandler } from './middleware/error';
 import { debugMiddleware } from './middleware/debug';
-import identityRoutes from './routes/identity';
+import identityRoutes, { handleOidcCallback } from './routes/identity';
 import accountsRoutes from './routes/accounts';
 import accountBillingRoutes from './routes/account-billing';
 import billingRoutes from './routes/billing';
@@ -52,6 +51,7 @@ import setupIntentRoutes from './routes/setup-intent';
 import systemAdminRoutes from './routes/system-admin';
 import type { Bindings, Variables } from './types';
 import { verifyAttachmentDownloadToken } from './services/attachment-token';
+import { handleWebPushQueue, type WebPushQueueMessage } from './services/push-notification';
 
 const app = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
@@ -76,22 +76,93 @@ app.use('*', cors({
     origin: '*',
     allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowHeaders: ['Content-Type', 'Authorization', 'Accept', 'Device-Type', 'Bitwarden-Client-Name', 'Bitwarden-Client-Version'],
-    exposeHeaders: ['Content-Length'],
+    exposeHeaders: ['Content-Length', 'X-Request-Id'],
     maxAge: 86400,
 }));
 app.use('*', debugMiddleware);
-app.use('*', logger());
 app.use('*', errorHandler);
 
-// 健康检查
+type HealthCheckResult = { ok: boolean; durationMs: number };
+
+async function checkWithTimeout(operation: () => Promise<unknown>, timeoutMs = 1_500): Promise<HealthCheckResult> {
+    const startedAt = performance.now();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+        await Promise.race([
+            operation(),
+            new Promise<never>((_, reject) => {
+                timeout = setTimeout(() => reject(new Error('health check timeout')), timeoutMs);
+            }),
+        ]);
+        return { ok: true, durationMs: Math.max(0, Math.round(performance.now() - startedAt)) };
+    } catch {
+        return { ok: false, durationMs: Math.max(0, Math.round(performance.now() - startedAt)) };
+    } finally {
+        if (timeout !== undefined) clearTimeout(timeout);
+    }
+}
+
+function readDeploymentVersion(env: Bindings): { version: string; deploymentId: string | null; deployedAt: string | null } {
+    const explicitVersion = typeof env.WORKER_VERSION === 'string' && env.WORKER_VERSION.trim()
+        ? env.WORKER_VERSION.trim()
+        : null;
+    const metadata = typeof env.CF_VERSION_METADATA === 'object' && env.CF_VERSION_METADATA !== null
+        ? env.CF_VERSION_METADATA as Record<string, unknown>
+        : null;
+    const deploymentId = typeof metadata?.id === 'string' ? metadata.id : null;
+    const tag = typeof metadata?.tag === 'string' && metadata.tag.trim() ? metadata.tag.trim() : null;
+    const deployedAt = typeof metadata?.timestamp === 'string' ? metadata.timestamp : null;
+
+    return { version: explicitVersion ?? tag ?? deploymentId ?? 'unknown', deploymentId, deployedAt };
+}
+
+function constantTimeEqual(left: string, right: string): boolean {
+    const encoder = new TextEncoder();
+    const leftBytes = encoder.encode(left);
+    const rightBytes = encoder.encode(right);
+    const length = Math.max(leftBytes.length, rightBytes.length);
+    let difference = leftBytes.length ^ rightBytes.length;
+    for (let index = 0; index < length; index += 1) {
+        difference |= (leftBytes[index] ?? 0) ^ (rightBytes[index] ?? 0);
+    }
+    return difference === 0;
+}
+
+// 轻量存活探针不访问外部资源，可用于高频平台健康检查。
 app.get('/', (c) => c.json({ status: 'ok', service: 'bitwarden-workers' }));
+app.get('/healthz', (c) => c.json({ status: 'ok' }));
+
+// 深度探针只读取固定哨兵键，不泄露资源 ID 或底层错误。
+app.get('/healthz/extended', async (c) => {
+    const expectedToken = c.env.HEALTH_CHECK_TOKEN?.trim();
+    const authorization = c.req.header('Authorization');
+    const suppliedToken = authorization?.startsWith('Bearer ') ? authorization.slice(7) : '';
+    // 未配置或鉴权失败均返回 404，避免公开深度探针及其资源消耗面。
+    if (!expectedToken || !constantTimeEqual(suppliedToken, expectedToken)) {
+        return c.json({ message: 'Not found' }, 404);
+    }
+    const [d1, kv, r2, durableObject] = await Promise.all([
+        checkWithTimeout(() => c.env.DB.prepare('SELECT 1').first()),
+        checkWithTimeout(() => c.env.ICONS_CACHE.get('__healthcheck__')),
+        checkWithTimeout(() => c.env.ATTACHMENTS.head('__healthcheck__')),
+        checkWithTimeout(async () => {
+            const id = c.env.NOTIFICATION_HUB.idFromName('__healthcheck__');
+            const response = await c.env.NOTIFICATION_HUB.get(id).fetch('https://health.internal/healthz');
+            if (response.status !== 404 && !response.ok) throw new Error('durable object unavailable');
+        }),
+    ]);
+    const checks = { d1, kv, r2, durableObject };
+    const healthy = Object.values(checks).every((check) => check.ok);
+    return c.json({ status: healthy ? 'ok' : 'degraded', checks }, healthy ? 200 : 503);
+});
 
 // Info 端点 - 对应 Api/Controllers/InfoController.cs
 app.get('/alive', (c) => c.text(new Date().toISOString()));
 app.get('/now', (c) => c.text(new Date().toISOString()));
-app.get('/version', (c) => c.json({ version: '2025.1.0' }));
+app.get('/version', (c) => c.json(readDeploymentVersion(c.env)));
 
 // 挂载路由
+app.on(['GET', 'POST'], '/oidc-signin', handleOidcCallback);
 app.route('/identity', identityRoutes);
 app.route('/api/accounts', accountsRoutes);
 app.route('/api/account', accountBillingRoutes);
@@ -214,6 +285,9 @@ export { NotificationHub } from './durable-objects/notification-hub';
 
 export default {
     fetch: app.fetch,
+    async queue(batch: MessageBatch<WebPushQueueMessage>, env: Bindings) {
+        await handleWebPushQueue(batch, env);
+    },
     async scheduled(controller: ScheduledController, env: Bindings, ctx: ExecutionContext) {
         ctx.waitUntil(handleScheduled(controller.cron, env));
     },

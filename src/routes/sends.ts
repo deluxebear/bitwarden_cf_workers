@@ -15,6 +15,7 @@ import type { Bindings, Variables, SendRequest, SendResponse, SendAccessResponse
 import { pushSyncSend } from '../services/push-notification';
 import { PushType } from '../types/push-notification';
 import { validateSendCanSave } from '../services/policy-requirements';
+import { putObjectThenPersist, removeMetadataThenDeleteObject } from '../services/storage-compensation';
 
 const sendsRoute = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 const MAX_SEND_FILE_SIZE = 501 * 1024 * 1024;
@@ -700,10 +701,6 @@ authed.post('/:id/file/:fileId', async (c) => {
         throw new BadRequestError('File received does not match expected file length.');
     }
 
-    await c.env.ATTACHMENTS.put(`sends/${sendId}/${fileId}`, file.stream(), {
-        httpMetadata: { contentType: file.type || 'application/octet-stream' },
-    });
-
     const now = new Date().toISOString();
     data.id = fileId;
     data.file = {
@@ -713,10 +710,16 @@ authed.post('/:id/file/:fileId', async (c) => {
         sizeName: formatSizeName(file.size),
         validated: true,
     };
-    await db.update(sends).set({
-        data: JSON.stringify(data),
-        revisionDate: now,
-    }).where(eq(sends.id, sendId));
+    await putObjectThenPersist(
+        c.env.ATTACHMENTS, `sends/${sendId}/${fileId}`, file.stream(),
+        { httpMetadata: { contentType: file.type || 'application/octet-stream' } },
+        async () => {
+            await db.update(sends).set({
+                data: JSON.stringify(data),
+                revisionDate: now,
+            }).where(eq(sends.id, sendId));
+        },
+    );
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
 
     const contextId = c.get('jwtPayload')?.device || null;
@@ -839,15 +842,28 @@ authed.delete('/:id', async (c) => {
         .where(and(eq(sends.id, sendId), eq(sends.userId, userId))).get();
     if (!existing) throw new NotFoundError('Send not found.');
 
+    let fileKey: string | null = null;
     if (existing.type === 1) {
         const data = parseSendData(existing);
         const fileId = getSendFileId(data);
         if (fileId) {
-            await c.env.ATTACHMENTS.delete(`sends/${sendId}/${fileId}`);
+            fileKey = `sends/${sendId}/${fileId}`;
         }
     }
 
-    await db.delete(sends).where(eq(sends.id, sendId));
+    if (fileKey) {
+        await removeMetadataThenDeleteObject(
+            c.env.ATTACHMENTS, fileKey,
+            async () => {
+                await db.delete(sends).where(eq(sends.id, sendId));
+            },
+            async () => {
+                await db.insert(sends).values(existing);
+            },
+        );
+    } else {
+        await db.delete(sends).where(eq(sends.id, sendId));
+    }
     const now = new Date().toISOString();
     await db.update(users).set({ accountRevisionDate: now }).where(eq(users.id, userId));
 

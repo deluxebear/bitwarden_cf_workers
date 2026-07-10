@@ -4,17 +4,36 @@
 //
 // 任务清单:
 // - every 5 min  : deleteSends          - 删除到期 Send (DeleteSendsJob)
+// - every 5 min  : emergencyAccess      - 自动批准超过等待期的恢复请求
 // - daily 0:00   : deleteTrashedCiphers - 永久删除30天前软删除 Cipher (DeleteCiphersJob)
 // - daily 0:00   : verifyOrgDomains     - 持续复验声明域名 TXT
 // - fri 22:00    : deleteExpiredTokens  - 清理过期 Refresh Token (DatabaseExpiredGrantsJob)
 
 import { drizzle } from 'drizzle-orm/d1';
-import { lte, and, eq, isNotNull, sql } from 'drizzle-orm';
-import { sends, ciphers, refreshTokens, collectionCiphers, authRequests, organizationDomains, policies } from '../db/schema';
+import { lte, and, eq, isNotNull, isNull, sql } from 'drizzle-orm';
+import {
+    sends,
+    ciphers,
+    refreshTokens,
+    collectionCiphers,
+    authRequests,
+    organizationDomains,
+    policies,
+    emergencyAccess,
+    oidcLoginStates,
+    oidcAuthorizationCodes,
+} from '../db/schema';
 import type { Bindings } from '../types';
 import { generateUuid } from './crypto';
 import { PolicyType } from './policy-validators';
 import { verifyOrganizationDomainDns } from '../routes/organization-domains';
+import {
+    approveExpiredEmergencyAccess,
+    EmergencyAccessDomainError,
+    EmergencyAccessStatus,
+    type EmergencyAccessRecord,
+} from './emergency-access';
+import { purgeExpiredDuoLoginStates } from './duo-storage';
 
 /**
  * 定时任务调度入口
@@ -26,6 +45,9 @@ export async function handleScheduled(cron: string, env: Bindings): Promise<void
         case '*/5 * * * *':
             await deleteSends(env);
             await deleteExpiredAuthRequests(env);
+            await deleteExpiredOidcArtifacts(env);
+            await purgeExpiredDuoLoginStates(env.DB);
+            await approveExpiredEmergencyAccessRecords(env);
             break;
         case '0 0 * * *':
             await deleteTrashedCiphers(env);
@@ -37,6 +59,53 @@ export async function handleScheduled(cron: string, env: Bindings): Promise<void
         default:
             console.log(`[Scheduled] Unknown cron: ${cron}`);
     }
+}
+
+/** 清理匿名 OIDC 流程产生的过期 state 与一次性授权码，避免 D1 持续膨胀。 */
+export async function deleteExpiredOidcArtifacts(env: Bindings, now = new Date()): Promise<void> {
+    const db = drizzle(env.DB);
+    const cutoff = now.toISOString();
+    await db.batch([
+        db.delete(oidcLoginStates).where(lte(oidcLoginStates.expirationDate, cutoff)),
+        db.delete(oidcAuthorizationCodes).where(lte(oidcAuthorizationCodes.expirationDate, cutoff)),
+    ]);
+}
+
+/** 自动批准已超过等待期的恢复请求；CAS 防止与拒绝、撤销请求互相覆盖。 */
+export async function approveExpiredEmergencyAccessRecords(
+    env: Bindings,
+    now = new Date(),
+): Promise<number> {
+    const db = drizzle(env.DB);
+    const candidates = await db.select().from(emergencyAccess).where(and(
+        eq(emergencyAccess.status, EmergencyAccessStatus.RecoveryInitiated),
+        isNotNull(emergencyAccess.recoveryInitiatedDate),
+        isNull(emergencyAccess.revokedDate),
+    )).all();
+    let approved = 0;
+    for (const candidate of candidates) {
+        let updated: EmergencyAccessRecord;
+        try {
+            updated = approveExpiredEmergencyAccess(candidate as EmergencyAccessRecord, now);
+        } catch (error) {
+            if (error instanceof EmergencyAccessDomainError
+                && (error.code === 'waiting_period' || error.code === 'invalid_transition')) {
+                continue;
+            }
+            throw error;
+        }
+        const result = await db.update(emergencyAccess).set({
+            status: updated.status,
+            revisionDate: updated.revisionDate,
+        }).where(and(
+            eq(emergencyAccess.id, candidate.id),
+            eq(emergencyAccess.status, EmergencyAccessStatus.RecoveryInitiated),
+            eq(emergencyAccess.revisionDate, candidate.revisionDate),
+            isNull(emergencyAccess.revokedDate),
+        )).run();
+        if (result.meta.changes === 1) approved += 1;
+    }
+    return approved;
 }
 
 /**

@@ -262,7 +262,7 @@ accounts.get('/profile', async (c) => {
             usePasswordManager: true,
             useMyItems: true,
             useAutomaticUserConfirmation: false,
-            usersGetPremium: globalPremium || (d.org.planType ?? 0) >= 1,
+            usersGetPremium: globalPremium || (d.org.usersGetPremium ?? true),
             keyConnectorEnabled: false,
             maxStorageGb: d.org.maxStorageGb ?? 1,
             seats: d.org.seats ?? 0,

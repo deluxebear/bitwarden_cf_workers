@@ -67,6 +67,45 @@ export class NotificationHub {
         if (url.pathname === '/notify' && request.method === 'POST') {
             return this.handleNotifyRequest(request);
         }
+        if (url.pathname.startsWith('/web-push/') && request.method === 'POST') {
+            const action = url.pathname.slice('/web-push/'.length);
+            const { key, token, leaseSeconds = 30 } = await request.json() as {
+                key?: string; token?: string; leaseSeconds?: number;
+            };
+            if (!key) return new Response('Bad Request', { status: 400 });
+            const storageKey = `web-push:${key}`;
+            type ClaimState = { state: 'leased' | 'completed'; token: string; expiresAt: number };
+            if (action === 'claim') {
+                const now = Date.now();
+                const result = await this.state.storage.transaction(async (transaction) => {
+                    const current = await transaction.get<ClaimState>(storageKey);
+                    if (current?.state === 'completed' && current.expiresAt > now) return { status: 'completed' as const };
+                    if (current?.state === 'leased' && current.expiresAt > now) {
+                        return { status: 'leased' as const, remainingSeconds: Math.max(1, Math.ceil((current.expiresAt - now) / 1000)) };
+                    }
+                    const leaseToken = crypto.randomUUID();
+                    await transaction.put(storageKey, { state: 'leased', token: leaseToken,
+                        expiresAt: now + Math.max(1, Math.min(leaseSeconds, 86400)) * 1000 } satisfies ClaimState);
+                    return { status: 'claimed' as const, token: leaseToken };
+                });
+                return Response.json(result);
+            }
+            if ((action === 'complete' || action === 'release') && token) {
+                const updated = await this.state.storage.transaction(async (transaction) => {
+                    const current = await transaction.get<ClaimState>(storageKey);
+                    if (current?.state !== 'leased' || current.token !== token) return false;
+                    if (action === 'complete') {
+                        await transaction.put(storageKey, { state: 'completed', token,
+                            expiresAt: Date.now() + 86400_000 } satisfies ClaimState);
+                    } else {
+                        await transaction.delete(storageKey);
+                    }
+                    return true;
+                });
+                return Response.json({ updated });
+            }
+            return new Response('Bad Request', { status: 400 });
+        }
 
         // 处理 WebSocket 升级请求
         if (request.headers.get('Upgrade') === 'websocket') {

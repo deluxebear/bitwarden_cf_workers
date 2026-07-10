@@ -19,6 +19,21 @@ import {
     getWebAuthnProvider,
     getRegisteredKeys,
 } from '../services/webauthn';
+import {
+    isYubiKeyPublicId,
+    getYubicoValidationConfig,
+    parseYubiKeyOtp,
+    verifyYubicoOtp,
+    type YubicoFetch,
+} from '../services/yubikey';
+import { checkDuoHealth, validateDuoConfig, type DuoConfig } from '../services/duo';
+import {
+    deleteDuoConfig,
+    getDuoConfigByOwner,
+    upsertDuoConfig,
+    type StoredDuoConfig,
+} from '../services/duo-storage';
+import { canAccessPremium } from '../services/premium';
 import type {
     Bindings, Variables, TwoFactorProviderResponse,
     TwoFactorAuthenticatorResponse, TwoFactorRecoverResponse, TwoFactorProvider
@@ -106,12 +121,6 @@ function generateEmailToken(): string {
     return String(value % 1000000).padStart(6, '0');
 }
 
-function maskSecret(secret: string | null | undefined): string | null {
-    if (!secret) return secret ?? null;
-    if (secret.length <= 6) return secret;
-    return `${secret.slice(0, 6)}${'*'.repeat(secret.length - 6)}`;
-}
-
 function toEmailResponse(providers: Record<number, TwoFactorProvider>) {
     const provider = providers[TwoFactorProviderType.Email];
     const email = normalizeEmail(provider?.metaData?.Email ?? provider?.metaData?.email);
@@ -124,27 +133,201 @@ function toEmailResponse(providers: Record<number, TwoFactorProvider>) {
 
 function toYubiKeyResponse(providers: Record<number, TwoFactorProvider>) {
     const metadata = providers[TwoFactorProviderType.YubiKey]?.metaData ?? {};
+    const displayValue = (value: unknown): string | null => {
+        if (typeof value !== 'string') return null;
+        const normalized = value.trim().toLowerCase();
+        return parseYubiKeyOtp(normalized)?.publicId ??
+            (isYubiKeyPublicId(normalized) ? normalized : null);
+    };
     return {
         enabled: providers[TwoFactorProviderType.YubiKey]?.enabled ?? false,
-        key1: metadata.Key1 ?? null,
-        key2: metadata.Key2 ?? null,
-        key3: metadata.Key3 ?? null,
-        key4: metadata.Key4 ?? null,
-        key5: metadata.Key5 ?? null,
+        key1: displayValue(metadata.Key1),
+        key2: displayValue(metadata.Key2),
+        key3: displayValue(metadata.Key3),
+        key4: displayValue(metadata.Key4),
+        key5: displayValue(metadata.Key5),
         nfc: metadata.Nfc ?? false,
         object: 'twoFactorYubiKey',
     };
 }
 
-function toDuoResponse(providers: Record<number, TwoFactorProvider>) {
-    const metadata = providers[TwoFactorProviderType.Duo]?.metaData ?? {};
+const MAX_YUBIKEYS = 5;
+
+type YubiKeyRegistrationBody = {
+    key1?: unknown;
+    Key1?: unknown;
+    key2?: unknown;
+    Key2?: unknown;
+    key3?: unknown;
+    Key3?: unknown;
+    key4?: unknown;
+    Key4?: unknown;
+    key5?: unknown;
+    Key5?: unknown;
+    keys?: unknown;
+    Keys?: unknown;
+    nfc?: unknown;
+    Nfc?: unknown;
+    secret?: string;
+    masterPasswordHash?: string;
+};
+
+/**
+ * 兼容官方 Key1..Key5 以及部分客户端使用的 keys 数组。
+ * 空字符串代表未配置的槽位，不参与 Yubico 校验。
+ */
+export function getYubiKeyOtps(body: YubiKeyRegistrationBody): string[] {
+    const arrayValue = body.keys ?? body.Keys;
+    if (arrayValue !== undefined) {
+        if (!Array.isArray(arrayValue) || arrayValue.length > MAX_YUBIKEYS) {
+            throw new BadRequestError(`A maximum of ${MAX_YUBIKEYS} YubiKeys is allowed.`);
+        }
+        return arrayValue
+            .filter((value) => value !== null && value !== undefined && value !== '')
+            .map((value) => {
+                if (typeof value !== 'string') throw new BadRequestError('Invalid YubiKey OTP.');
+                return value.trim();
+            });
+    }
+
+    const values = [
+        body.key1 ?? body.Key1,
+        body.key2 ?? body.Key2,
+        body.key3 ?? body.Key3,
+        body.key4 ?? body.Key4,
+        body.key5 ?? body.Key5,
+    ];
+    return values
+        .filter((value) => value !== null && value !== undefined && value !== '')
+        .map((value) => {
+            if (typeof value !== 'string') throw new BadRequestError('Invalid YubiKey OTP.');
+            return value.trim();
+        });
+}
+
+/** 校验注册 OTP，并只返回可安全持久化的 12 位 YubiKey public ID。 */
+export async function validateYubiKeyRegistration(
+    otps: string[],
+    env: Bindings,
+    fetchImpl: YubicoFetch = fetch,
+    existingPublicIds: ReadonlySet<string> = new Set(),
+): Promise<string[]> {
+    if (otps.length === 0) throw new BadRequestError('At least one YubiKey is required.');
+    if (otps.length > MAX_YUBIKEYS) {
+        throw new BadRequestError(`A maximum of ${MAX_YUBIKEYS} YubiKeys is allowed.`);
+    }
+
+    const publicIds: string[] = [];
+    for (const otp of otps) {
+        const normalized = otp.trim().toLowerCase();
+        let publicId: string;
+        if (isYubiKeyPublicId(normalized)) {
+            if (!existingPublicIds.has(normalized)) {
+                throw new BadRequestError('Existing YubiKey public ID does not match this account.');
+            }
+            publicId = normalized;
+        } else {
+            if (!parseYubiKeyOtp(normalized)) throw new BadRequestError('Invalid YubiKey OTP.');
+            const config = getYubicoValidationConfig(env);
+            if (!config) throw new BadRequestError('YubiKey validation is not configured.');
+            const result = await verifyYubicoOtp(normalized, config, fetchImpl);
+            if (!result.valid || !result.publicId) throw new BadRequestError('Invalid YubiKey OTP.');
+            publicId = result.publicId;
+        }
+        if (publicIds.includes(publicId)) {
+            throw new BadRequestError('Each YubiKey must be unique.');
+        }
+        publicIds.push(publicId);
+    }
+    return publicIds;
+}
+
+export function buildYubiKeyProvider(publicIds: string[], nfc: boolean): TwoFactorProvider {
+    const metaData: Record<string, string | boolean> = { Nfc: nfc };
+    publicIds.forEach((publicId, index) => {
+        if (index < MAX_YUBIKEYS) metaData[`Key${index + 1}`] = publicId;
+    });
+    return { enabled: true, metaData };
+}
+
+export function buildDuoProvider(config: StoredDuoConfig): TwoFactorProvider {
     return {
-        enabled: providers[TwoFactorProviderType.Duo]?.enabled ?? false,
-        host: metadata.Host ?? null,
-        clientSecret: maskSecret(metadata.ClientSecret),
-        clientId: metadata.ClientId ?? null,
+        enabled: true,
+        metaData: {
+            ConfigId: config.id,
+            ClientId: config.clientId,
+            Host: config.host,
+        },
+    };
+}
+
+export function toDuoResponse(
+    providers: Record<number, TwoFactorProvider>,
+    config: StoredDuoConfig | null,
+) {
+    const metadata = providers[TwoFactorProviderType.Duo]?.metaData ?? {};
+    const enabled = providers[TwoFactorProviderType.Duo]?.enabled === true &&
+        config !== null && metadata.ConfigId === config.id;
+    return {
+        enabled,
+        host: config?.host ?? null,
+        clientSecret: config ? `${config.clientSecretPrefix}${'*'.repeat(34)}` : null,
+        clientId: config?.clientId ?? null,
         object: 'twoFactorDuo',
     };
+}
+
+function getDuoEncryptionKey(env: Bindings): string {
+    const key = env.DUO_CONFIG_ENCRYPTION_KEY?.trim();
+    if (!key) throw new BadRequestError('Duo configuration encryption is not configured.');
+    return key;
+}
+
+function readDuoConfig(body: Record<string, unknown>, previous: StoredDuoConfig | null): DuoConfig {
+    const clientId = body.clientId ?? body.ClientId;
+    const clientSecret = body.clientSecret ?? body.ClientSecret;
+    const host = body.host ?? body.Host;
+    if (typeof clientId !== 'string' || typeof clientSecret !== 'string' || typeof host !== 'string') {
+        throw new BadRequestError('Duo Client ID, Client Secret, and Host are required.');
+    }
+    let normalizedSecret: string = clientSecret;
+    if (/^.{6}\*{34}$/.test(normalizedSecret)) {
+        if (!previous || normalizedSecret.slice(0, 6) !== previous.clientSecretPrefix) {
+            throw new BadRequestError('The masked Duo Client Secret does not match the current configuration.');
+        }
+        normalizedSecret = previous.clientSecret;
+    }
+    try {
+        return validateDuoConfig({ clientId: clientId.trim(), clientSecret: normalizedSecret, host });
+    } catch (error) {
+        throw new BadRequestError(error instanceof Error ? error.message : 'Duo configuration is invalid.');
+    }
+}
+
+async function assertDuoHealthy(config: DuoConfig): Promise<void> {
+    try {
+        if (!await checkDuoHealth(config)) throw new Error('Duo health check was rejected.');
+    } catch {
+        throw new BadRequestError('Unable to validate Duo configuration.');
+    }
+}
+
+async function rollbackPersonalDuoConfig(
+    db: D1Database,
+    encryptionKey: string,
+    userId: string,
+    previous: StoredDuoConfig | null,
+    writtenRevision: string,
+): Promise<void> {
+    try {
+        if (previous) {
+            await upsertDuoConfig(db, encryptionKey, { userId }, previous, writtenRevision);
+        } else {
+            await deleteDuoConfig(db, { userId }, writtenRevision);
+        }
+    } catch {
+        // 只回滚自己写入的 revision；更新后的并发配置绝不能被删除。
+    }
 }
 
 async function deliverEmailToken(env: Bindings, email: string, token: string, expiresAt: string): Promise<void> {
@@ -324,17 +507,26 @@ function deviceVerificationSettingsResponse(env: Bindings) {
 twoFactor.get('/get-device-verification-settings', (c) => c.json(deviceVerificationSettingsResponse(c.env)));
 twoFactor.put('/device-verification-settings', (c) => c.json(deviceVerificationSettingsResponse(c.env)));
 
-/**
- * POST /api/two-factor/get-yubikey
- */
-twoFactor.post('/get-yubikey', async (c) => {
+async function getYubiKey(c: Context<{ Bindings: Bindings; Variables: Variables }>) {
     const db = drizzle(c.env.DB);
     const userId = c.get('userId');
-    const body = await c.req.json().catch(() => ({}));
+    const body = c.req.method === 'GET'
+        ? {
+            secret: c.req.header('x-user-verification-secret'),
+            masterPasswordHash: c.req.header('x-master-password-hash'),
+        }
+        : await c.req.json().catch(() => ({}));
 
     const user = await verifySecret(db, userId, body);
     return c.json(toYubiKeyResponse(getProviders(user)));
-});
+}
+
+/**
+ * GET/POST /api/two-factor/get-yubikey
+ * GET 兼容入口通过请求头传递验证 secret，避免将主密钥哈希写入 URL。
+ */
+twoFactor.get('/get-yubikey', getYubiKey);
+twoFactor.post('/get-yubikey', getYubiKey);
 
 /**
  * POST /api/two-factor/get-duo
@@ -345,17 +537,105 @@ twoFactor.post('/get-duo', async (c) => {
     const body = await c.req.json().catch(() => ({}));
 
     const user = await verifySecret(db, userId, body);
-    return c.json(toDuoResponse(getProviders(user)));
+    const encryptionKey = getDuoEncryptionKey(c.env);
+    let config: StoredDuoConfig | null;
+    try {
+        config = await getDuoConfigByOwner(c.env.DB, encryptionKey, { userId });
+    } catch {
+        throw new BadRequestError('Unable to read Duo configuration.');
+    }
+    return c.json(toDuoResponse(getProviders(user), config));
 });
 
-async function unsupportedPremiumProvider() {
-    throw new BadRequestError('This two-factor provider is not implemented for this Workers deployment.');
+async function enableYubiKey(c: Context<{ Bindings: Bindings; Variables: Variables }>) {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const body: YubiKeyRegistrationBody = await c.req.json<YubiKeyRegistrationBody>().catch(() => ({}));
+    const user = await verifySecret(db, userId, body);
+    const providers = getProviders(user);
+    const existingMetadata = providers[TwoFactorProviderType.YubiKey]?.metaData ?? {};
+    const existingPublicIds = new Set(
+        ['Key1', 'Key2', 'Key3', 'Key4', 'Key5']
+            .map((key) => typeof existingMetadata[key] === 'string' ? existingMetadata[key].trim().toLowerCase() : '')
+            .filter((key) => isYubiKeyPublicId(key)),
+    );
+    if (!await canAccessPremium(c.env.DB, user, c.env.GLOBAL_PREMIUM)) {
+        throw new BadRequestError('Premium is required to use YubiKey two-factor authentication.');
+    }
+    const publicIds = await validateYubiKeyRegistration(
+        getYubiKeyOtps(body), c.env, fetch, existingPublicIds,
+    );
+    providers[TwoFactorProviderType.YubiKey] = buildYubiKeyProvider(
+        publicIds,
+        body.nfc === true || body.Nfc === true,
+    );
+
+    const recoveryCode = user.twoFactorRecoveryCode || generateSecureRandomString(32);
+    await db.update(users).set({
+        twoFactorProviders: JSON.stringify(providers),
+        twoFactorRecoveryCode: recoveryCode,
+        accountRevisionDate: new Date().toISOString(),
+    }).where(eq(users.id, userId));
+
+    return c.json(toYubiKeyResponse(providers));
 }
 
-twoFactor.put('/yubikey', unsupportedPremiumProvider);
-twoFactor.post('/yubikey', unsupportedPremiumProvider);
-twoFactor.put('/duo', unsupportedPremiumProvider);
-twoFactor.post('/duo', unsupportedPremiumProvider);
+twoFactor.put('/yubikey', enableYubiKey);
+twoFactor.post('/yubikey', enableYubiKey);
+
+async function enableDuo(c: Context<{ Bindings: Bindings; Variables: Variables }>) {
+    const db = drizzle(c.env.DB);
+    const userId = c.get('userId');
+    const body = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+    const user = await verifySecret(db, userId, body);
+    if (!await canAccessPremium(c.env.DB, user, c.env.GLOBAL_PREMIUM)) {
+        throw new BadRequestError('Premium is required to use Duo two-factor authentication.');
+    }
+
+    const encryptionKey = getDuoEncryptionKey(c.env);
+    let previous: StoredDuoConfig | null;
+    try {
+        previous = await getDuoConfigByOwner(c.env.DB, encryptionKey, { userId });
+    } catch {
+        throw new BadRequestError('Unable to read Duo configuration.');
+    }
+    const duoConfig = readDuoConfig(body, previous);
+    await assertDuoHealthy(duoConfig);
+
+    let stored: StoredDuoConfig;
+    try {
+        stored = await upsertDuoConfig(
+            c.env.DB, encryptionKey, { userId }, duoConfig, previous?.revisionDate ?? null,
+        );
+    } catch {
+        throw new BadRequestError('Unable to save Duo configuration.');
+    }
+
+    const providers = getProviders(user);
+    providers[TwoFactorProviderType.Duo] = buildDuoProvider(stored);
+    const now = new Date().toISOString();
+    const recoveryCode = user.twoFactorRecoveryCode || generateSecureRandomString(32);
+    try {
+        const updated = await c.env.DB.prepare(`
+            UPDATE users
+            SET two_factor_providers = ?,
+                two_factor_recovery_code = COALESCE(two_factor_recovery_code, ?),
+                account_revision_date = ?
+            WHERE id = ? AND two_factor_providers IS ?
+        `).bind(
+            JSON.stringify(providers), recoveryCode, now, userId, user.twoFactorProviders,
+        ).run();
+        if (updated.meta.changes !== 1) throw new Error('Concurrent user update.');
+    } catch {
+        await rollbackPersonalDuoConfig(c.env.DB, encryptionKey, userId, previous, stored.revisionDate);
+        throw new BadRequestError('Unable to save Duo configuration.');
+    }
+
+    return c.json(toDuoResponse(providers, stored));
+}
+
+twoFactor.put('/duo', enableDuo);
+twoFactor.post('/duo', enableDuo);
 
 /**
  * POST /api/two-factor/get-authenticator
@@ -504,6 +784,19 @@ async function disableProvider(c: Context<{ Bindings: Bindings; Variables: Varia
     const providers = getProviders(user);
 
     if (providers[body.type]) {
+        const previousProvidersJson = user.twoFactorProviders;
+        let previousDuoConfig: StoredDuoConfig | null = null;
+        let duoEncryptionKey: string | null = null;
+        if (body.type === TwoFactorProviderType.Duo) {
+            duoEncryptionKey = getDuoEncryptionKey(c.env);
+            try {
+                previousDuoConfig = await getDuoConfigByOwner(
+                    c.env.DB, duoEncryptionKey, { userId },
+                );
+            } catch {
+                throw new BadRequestError('Unable to disable Duo configuration.');
+            }
+        }
         delete providers[body.type];
 
         const now = new Date().toISOString();
@@ -517,7 +810,27 @@ async function disableProvider(c: Context<{ Bindings: Bindings; Variables: Varia
             updateData.twoFactorRecoveryCode = null;
         }
 
-        await db.update(users).set(updateData).where(eq(users.id, userId));
+        try {
+            const updated = await c.env.DB.prepare(`
+                UPDATE users
+                SET two_factor_providers = ?, account_revision_date = ?,
+                    two_factor_recovery_code = CASE WHEN ? THEN NULL ELSE two_factor_recovery_code END
+                WHERE id = ? AND two_factor_providers IS ?
+            `).bind(
+                updateData.twoFactorProviders,
+                now,
+                Object.keys(providers).length === 0 ? 1 : 0,
+                userId,
+                previousProvidersJson,
+            ).run();
+            if (updated.meta.changes !== 1) throw new Error('Concurrent user update.');
+        } catch {
+            throw new BadRequestError('Unable to disable two-factor provider.');
+        }
+        if (body.type === TwoFactorProviderType.Duo && previousDuoConfig) {
+            // Provider 已通过 CAS 禁用；仅删除读取到的旧 revision，绝不删除并发新配置。
+            await deleteDuoConfig(c.env.DB, { userId }, previousDuoConfig.revisionDate).catch(() => false);
+        }
     }
 
     return c.json({

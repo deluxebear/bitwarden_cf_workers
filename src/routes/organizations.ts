@@ -55,6 +55,13 @@ import {
     isOrganizationUserClaimed,
     isOrganizationUserClaimedByDomains,
 } from '../services/claimed-accounts';
+import { checkDuoHealth, validateDuoConfig, type DuoConfig } from '../services/duo';
+import {
+    deleteDuoConfig,
+    getDuoConfigByOwner,
+    upsertDuoConfig,
+    type StoredDuoConfig,
+} from '../services/duo-storage';
 
 const orgs = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 orgs.use('/*', authMiddleware);
@@ -1183,16 +1190,113 @@ orgs.get('/:id/two-factor', async (c) => {
     });
 });
 
-/**
- * 帮助函数：校验当前用户存在。
- *
- * 自托管 Workers 环境下，为简化实现，不强制校验 SecretVerificationRequest.secret，
- * 仅确认当前登录用户存在即可（前端已通过一次用户验证弹窗）。
- */
-async function verifyOrgSecret(db: D1Db, userId: string, _secret: string | undefined): Promise<void> {
-    const user = await db.select().from(users).where(eq(users.id, userId)).get();
+/** 校验组织敏感操作的 SecretVerificationRequest。 */
+async function verifyOrgSecret(db: D1Db, userId: string, secret: string | undefined): Promise<void> {
+    const user = await db.select({ masterPassword: users.masterPassword })
+        .from(users).where(eq(users.id, userId)).get();
     if (!user) {
         throw new NotFoundError('User not found.');
+    }
+    if (!secret || !await verifyPassword(secret, user.masterPassword || '')) {
+        throw new BadRequestError('User verification failed.');
+    }
+}
+
+type OrganizationTwoFactorProvider = {
+    enabled: boolean;
+    metaData: Record<string, unknown>;
+};
+
+function getOrganizationProviders(value: string | null): Record<string, OrganizationTwoFactorProvider> {
+    if (!value) return {};
+    try {
+        const parsed = JSON.parse(value);
+        return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+        return {};
+    }
+}
+
+export function buildOrganizationDuoProvider(config: StoredDuoConfig): OrganizationTwoFactorProvider {
+    return {
+        enabled: true,
+        metaData: {
+            ConfigId: config.id,
+            ClientId: config.clientId,
+            Host: config.host,
+        },
+    };
+}
+
+export function toOrganizationDuoResponse(
+    providers: Record<string, OrganizationTwoFactorProvider>,
+    config: StoredDuoConfig | null,
+) {
+    const provider = providers['6'];
+    const enabled = provider?.enabled === true && config !== null &&
+        provider.metaData.ConfigId === config.id;
+    return {
+        Enabled: enabled,
+        Host: config?.host ?? null,
+        ClientSecret: config ? `${config.clientSecretPrefix}${'*'.repeat(34)}` : null,
+        ClientId: config?.clientId ?? null,
+        object: 'twoFactorDuo',
+    };
+}
+
+function getOrganizationDuoEncryptionKey(env: Bindings): string {
+    const key = env.DUO_CONFIG_ENCRYPTION_KEY?.trim();
+    if (!key) throw new BadRequestError('Duo configuration encryption is not configured.');
+    return key;
+}
+
+function readOrganizationDuoConfig(
+    body: Record<string, unknown>,
+    previous: StoredDuoConfig | null,
+): DuoConfig {
+    const clientId = body.clientId ?? body.ClientId;
+    const clientSecret = body.clientSecret ?? body.ClientSecret;
+    const host = body.host ?? body.Host;
+    if (typeof clientId !== 'string' || typeof clientSecret !== 'string' || typeof host !== 'string') {
+        throw new BadRequestError('Duo Client ID, Client Secret, and Host are required.');
+    }
+    let normalizedSecret: string = clientSecret;
+    if (/^.{6}\*{34}$/.test(normalizedSecret)) {
+        if (!previous || normalizedSecret.slice(0, 6) !== previous.clientSecretPrefix) {
+            throw new BadRequestError('The masked Duo Client Secret does not match the current configuration.');
+        }
+        normalizedSecret = previous.clientSecret;
+    }
+    try {
+        return validateDuoConfig({ clientId: clientId.trim(), clientSecret: normalizedSecret, host });
+    } catch (error) {
+        throw new BadRequestError(error instanceof Error ? error.message : 'Duo configuration is invalid.');
+    }
+}
+
+async function assertOrganizationDuoHealthy(config: DuoConfig): Promise<void> {
+    try {
+        if (!await checkDuoHealth(config)) throw new Error('Duo health check was rejected.');
+    } catch {
+        throw new BadRequestError('Unable to validate Duo configuration.');
+    }
+}
+
+async function rollbackOrganizationDuoConfig(
+    db: D1Database,
+    encryptionKey: string,
+    organizationId: string,
+    previous: StoredDuoConfig | null,
+    writtenRevision: string,
+): Promise<void> {
+    try {
+        if (previous) {
+            await upsertDuoConfig(db, encryptionKey, { organizationId }, previous, writtenRevision);
+        } else {
+            await deleteDuoConfig(db, { organizationId }, writtenRevision);
+        }
+    } catch {
+        // 只回滚自己刚写入的 revision，保留之后成功提交的并发配置。
     }
 }
 
@@ -1206,10 +1310,10 @@ orgs.post('/:id/two-factor/get-duo', async (c) => {
     const db = drizzle(c.env.DB);
     const orgId = c.req.param('id');
     const userId = c.get('userId');
-    const body = await c.req.json<{ secret: string }>();
+    const body = await c.req.json<{ secret?: string; masterPasswordHash?: string }>();
 
     // 校验当前用户密码（同 SecretVerificationRequest）
-    await verifyOrgSecret(db as D1Db, userId, body.secret);
+    await verifyOrgSecret(db as D1Db, userId, body.secret ?? body.masterPasswordHash);
 
     const orgUser = await getOrgUser(db as D1Db, orgId, userId);
     requireOwnerOrAdmin(orgUser);
@@ -1217,38 +1321,14 @@ orgs.post('/:id/two-factor/get-duo', async (c) => {
     const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
     if (!org) throw new NotFoundError('Organization not found.');
 
-    let enabled = false;
-    let host: string | null = null;
-    let clientId: string | null = null;
-    let clientSecret: string | null = null;
-
-    if (org.twoFactorProviders) {
-        try {
-            const providers = JSON.parse(org.twoFactorProviders) as Record<string, { enabled?: boolean; metaData?: Record<string, any> }>;
-            const duoProvider = providers['6']; // TwoFactorProviderType.OrganizationDuo
-            if (duoProvider && duoProvider.metaData) {
-                enabled = !!duoProvider.enabled;
-                host = duoProvider.metaData.Host ?? null;
-                clientId = duoProvider.metaData.ClientId ?? null;
-                const rawSecret = duoProvider.metaData.ClientSecret as string | undefined;
-                if (rawSecret && rawSecret.length > 6) {
-                    clientSecret = `${rawSecret.slice(0, 6)}${'*'.repeat(rawSecret.length - 6)}`;
-                } else {
-                    clientSecret = rawSecret ?? null;
-                }
-            }
-        } catch {
-            /* ignore parse error */
-        }
+    const encryptionKey = getOrganizationDuoEncryptionKey(c.env);
+    let config: StoredDuoConfig | null;
+    try {
+        config = await getDuoConfigByOwner(c.env.DB, encryptionKey, { organizationId: orgId });
+    } catch {
+        throw new BadRequestError('Unable to read Duo configuration.');
     }
-
-    return c.json({
-        Enabled: enabled,
-        Host: host,
-        ClientSecret: clientSecret,
-        ClientId: clientId,
-        object: 'twoFactorDuo',
-    });
+    return c.json(toOrganizationDuoResponse(getOrganizationProviders(org.twoFactorProviders), config));
 });
 
 /**
@@ -1256,61 +1336,123 @@ orgs.post('/:id/two-factor/get-duo', async (c) => {
  * POST /api/organizations/:id/two-factor/duo (alias)
  * 对应 TwoFactorController.PutOrganizationDuo/PostOrganizationDuo（自托管简化版）
  *
- * 直接保存 Duo 配置到 organizations.twoFactorProviders 中，不调用真实 Duo API 验证。
+ * Duo secret 加密保存到 duo_configs；provider JSON 只保存非敏感引用。
  */
-async function upsertOrganizationDuo(c: any) {
+async function upsertOrganizationDuo(c: OrgContext) {
     const db = drizzle(c.env.DB);
     const orgId = c.req.param('id');
     const userId = c.get('userId');
-    const body = await c.req.json() as { secret: string; clientSecret: string; clientId: string; host: string };
+    const body: Record<string, unknown> = await c.req.json<Record<string, unknown>>().catch(() => ({}));
 
-    await verifyOrgSecret(db as D1Db, userId, body.secret);
+    const verificationSecret = body.secret ?? body.masterPasswordHash;
+    await verifyOrgSecret(
+        db as D1Db,
+        userId,
+        typeof verificationSecret === 'string' ? verificationSecret : undefined,
+    );
 
     const orgUser = await getOrgUser(db as D1Db, orgId, userId);
     requireOwnerOrAdmin(orgUser);
 
     const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
     if (!org) throw new NotFoundError('Organization not found.');
+    if (!org.use2fa) throw new BadRequestError('Organization two-factor authentication is not available.');
 
-    let providers: Record<string, { enabled: boolean; metaData: Record<string, any> }>;
-    if (org.twoFactorProviders) {
-        try {
-            providers = JSON.parse(org.twoFactorProviders);
-        } catch {
-            providers = {};
-        }
-    } else {
-        providers = {};
+    const encryptionKey = getOrganizationDuoEncryptionKey(c.env);
+    let previous: StoredDuoConfig | null;
+    try {
+        previous = await getDuoConfigByOwner(c.env.DB, encryptionKey, { organizationId: orgId });
+    } catch {
+        throw new BadRequestError('Unable to read Duo configuration.');
+    }
+    const duoConfig = readOrganizationDuoConfig(body, previous);
+    await assertOrganizationDuoHealthy(duoConfig);
+
+    let stored: StoredDuoConfig;
+    try {
+        stored = await upsertDuoConfig(
+            c.env.DB,
+            encryptionKey,
+            { organizationId: orgId },
+            duoConfig,
+            previous?.revisionDate ?? null,
+        );
+    } catch {
+        throw new BadRequestError('Unable to save Duo configuration.');
     }
 
-    providers['6'] = {
-        enabled: true,
-        metaData: {
-            ClientSecret: body.clientSecret,
-            ClientId: body.clientId,
-            Host: body.host,
-        },
-    };
+    const providers = getOrganizationProviders(org.twoFactorProviders);
+    providers['6'] = buildOrganizationDuoProvider(stored);
 
     const now = new Date().toISOString();
-    await db.update(organizations).set({
-        twoFactorProviders: JSON.stringify(providers),
-        revisionDate: now,
-    }).where(eq(organizations.id, orgId));
+    try {
+        const updated = await c.env.DB.prepare(`
+            UPDATE organizations SET two_factor_providers = ?, revision_date = ?
+            WHERE id = ? AND two_factor_providers IS ?
+        `).bind(JSON.stringify(providers), now, orgId, org.twoFactorProviders).run();
+        if (updated.meta.changes !== 1) throw new Error('Concurrent organization update.');
+    } catch {
+        await rollbackOrganizationDuoConfig(
+            c.env.DB, encryptionKey, orgId, previous, stored.revisionDate,
+        );
+        throw new BadRequestError('Unable to save Duo configuration.');
+    }
 
-    return c.json({
-        Enabled: true,
-        Host: body.host,
-        ClientSecret: body.clientSecret.length > 6
-            ? `${body.clientSecret.slice(0, 6)}${'*'.repeat(body.clientSecret.length - 6)}`
-            : body.clientSecret,
-        ClientId: body.clientId,
-        object: 'twoFactorDuo',
-    });
+    return c.json(toOrganizationDuoResponse(providers, stored));
 }
 
 orgs.put('/:id/two-factor/duo', upsertOrganizationDuo);
 orgs.post('/:id/two-factor/duo', upsertOrganizationDuo);
+
+/** DELETE /api/organizations/:id/two-factor：禁用指定组织 2FA provider。 */
+orgs.delete('/:id/two-factor', async (c) => {
+    const db = drizzle(c.env.DB);
+    const orgId = c.req.param('id');
+    const userId = c.get('userId');
+    const body: {
+        type?: number;
+        Type?: number;
+        secret?: string;
+        masterPasswordHash?: string;
+    } = await c.req.json().catch(() => ({}));
+    const providerType = body.type ?? body.Type;
+    if (providerType !== 6) throw new BadRequestError('Unsupported organization two-factor provider.');
+    await verifyOrgSecret(db as D1Db, userId, body.secret ?? body.masterPasswordHash);
+    const orgUser = await getOrgUser(db as D1Db, orgId, userId);
+    requireOwnerOrAdmin(orgUser);
+    const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
+    if (!org) throw new NotFoundError('Organization not found.');
+
+    const encryptionKey = getOrganizationDuoEncryptionKey(c.env);
+    let previous: StoredDuoConfig | null;
+    try {
+        previous = await getDuoConfigByOwner(c.env.DB, encryptionKey, { organizationId: orgId });
+    } catch {
+        throw new BadRequestError('Unable to disable Duo configuration.');
+    }
+
+    const providers = getOrganizationProviders(org.twoFactorProviders);
+    delete providers['6'];
+    try {
+        const updated = await c.env.DB.prepare(`
+            UPDATE organizations SET two_factor_providers = ?, revision_date = ?
+            WHERE id = ? AND two_factor_providers IS ?
+        `).bind(
+            JSON.stringify(providers), new Date().toISOString(), orgId, org.twoFactorProviders,
+        ).run();
+        if (updated.meta.changes !== 1) throw new Error('Concurrent organization update.');
+    } catch {
+        throw new BadRequestError('Unable to disable Duo configuration.');
+    }
+
+    if (previous) {
+        await deleteDuoConfig(
+            c.env.DB, { organizationId: orgId }, previous.revisionDate,
+        ).catch(() => false);
+    }
+
+    return c.json({ Type: 6, Enabled: false, object: 'twoFactorProvider' });
+});
 
 /**
  * DELETE /api/organizations/:id

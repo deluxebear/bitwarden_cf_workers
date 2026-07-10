@@ -21,6 +21,16 @@ const required = (name) => {
 
 const optional = (name) => process.env[name]?.trim();
 
+const optionalRate = (name) => {
+  const value = optional(name);
+  if (!value) return undefined;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
+    throw new Error(`${name} must be a number between 0 and 1`);
+  }
+  return parsed;
+};
+
 const tomlString = (value) => `"${String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 
 const replaceLine = (config, pattern, replacement) => {
@@ -52,6 +62,18 @@ const removeVar = (config, name) => {
   const existing = new RegExp(`^${name}\\s*=\\s*".*"\\n?`, "m");
   return config.replace(existing, "");
 };
+
+const setObservabilityRate = (config, section, value) => {
+  if (value === undefined) return config;
+  const escaped = section.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`(\\[${escaped}\\][\\s\\S]*?^head_sampling_rate\\s*=\\s*)[0-9.]+`, "m");
+  if (!pattern.test(config)) throw new Error(`Unable to find ${section} head_sampling_rate`);
+  return config.replace(pattern, `$1${value}`);
+};
+
+const replaceQueueName = (config, currentName, value) => value
+  ? config.replaceAll(`queue = ${tomlString(currentName)}`, `queue = ${tomlString(value)}`)
+  : config;
 
 let config = readFileSync(sourcePath, "utf8");
 
@@ -106,7 +128,15 @@ config = setVar(config, "EMAIL_REPLY_TO", optional("EMAIL_REPLY_TO"));
 config = setVar(config, "EMAIL_PROVIDER_ENDPOINT", optional("EMAIL_PROVIDER_ENDPOINT"));
 config = setVar(config, "SIGNUPS_ALLOWED", optional("SIGNUPS_ALLOWED"));
 config = setVar(config, "VAULT_BASE_URL", optional("VAULT_BASE_URL"));
+config = setVar(config, "SSO_BASE_URL", optional("SSO_BASE_URL"));
 config = setVar(config, "FORCE_INVITE_REGISTER", optional("FORCE_INVITE_REGISTER"));
+config = setVar(config, "WORKER_VERSION", optional("WORKER_VERSION"));
+config = setVar(config, "WEB_PUSH_VAPID_PUBLIC_KEY", optional("WEB_PUSH_VAPID_PUBLIC_KEY"));
+config = setVar(config, "WEB_PUSH_VAPID_SUBJECT", optional("WEB_PUSH_VAPID_SUBJECT"));
+config = setObservabilityRate(config, "observability.logs", optionalRate("WORKERS_LOG_SAMPLING_RATE"));
+config = setObservabilityRate(config, "observability.traces", optionalRate("WORKERS_TRACE_SAMPLING_RATE"));
+config = replaceQueueName(config, "bitwarden-web-push-dev", optional("WEB_PUSH_QUEUE_NAME"));
+config = replaceQueueName(config, "bitwarden-web-push-dlq-dev", optional("WEB_PUSH_DLQ_NAME"));
 
 if (!optional("EMAIL_REPLY_TO")) {
   config = removeVar(config, "EMAIL_REPLY_TO");

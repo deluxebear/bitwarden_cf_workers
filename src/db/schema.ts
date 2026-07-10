@@ -5,6 +5,7 @@
  */
 
 import { sqliteTable, text, integer, index, uniqueIndex, primaryKey } from 'drizzle-orm/sqlite-core';
+import { sql } from 'drizzle-orm';
 
 // ==================== Users ====================
 // 对应 Core/Entities/User.cs
@@ -48,6 +49,37 @@ export const users = sqliteTable('users', {
     lastKeyRotationDate: text('last_key_rotation_date'),
     lastEmailChangeDate: text('last_email_change_date'),
 });
+
+// ==================== Emergency Access ====================
+// 密钥由 grantor 客户端使用 grantee 公钥加密；服务端仅保存密文。
+export const emergencyAccess = sqliteTable('emergency_access', {
+    id: text('id').primaryKey(),
+    grantorId: text('grantor_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+    granteeId: text('grantee_id').references(() => users.id, { onDelete: 'cascade' }),
+    email: text('email'),
+    keyEncrypted: text('key_encrypted'),
+    type: integer('type').notNull(), // 0 = View, 1 = Takeover
+    status: integer('status').notNull(), // EmergencyAccessStatus
+    waitTimeDays: integer('wait_time_days').notNull(),
+    recoveryInitiatedDate: text('recovery_initiated_date'),
+    recoveryRejectedDate: text('recovery_rejected_date'),
+    lastNotificationDate: text('last_notification_date'),
+    revokedDate: text('revoked_date'),
+    revokedByUserId: text('revoked_by_user_id').references(() => users.id, { onDelete: 'set null' }),
+    creationDate: text('creation_date').notNull(),
+    revisionDate: text('revision_date').notNull(),
+}, (table) => [
+    index('idx_emergency_access_grantor_id').on(table.grantorId),
+    index('idx_emergency_access_grantee_id').on(table.granteeId),
+    index('idx_emergency_access_email').on(table.email),
+    index('idx_emergency_access_status').on(table.status),
+    uniqueIndex('idx_emergency_access_active_grantor_email')
+        .on(table.grantorId, table.email)
+        .where(sql`${table.revokedDate} IS NULL AND ${table.email} IS NOT NULL`),
+    uniqueIndex('idx_emergency_access_active_grantor_grantee')
+        .on(table.grantorId, table.granteeId)
+        .where(sql`${table.revokedDate} IS NULL AND ${table.granteeId} IS NOT NULL`),
+]);
 
 // ==================== Ciphers ====================
 // 对应 Core/Vault/Entities/Cipher.cs
@@ -102,6 +134,27 @@ export const devices = sqliteTable('devices', {
 }, (table) => [
     index('idx_devices_user_id').on(table.userId),
     index('idx_devices_identifier').on(table.identifier),
+]);
+
+// ==================== Security Tasks ====================
+// 对应 Core/Vault/Entities/SecurityTask.cs。revision 用于 CAS 状态变更；
+// pending 唯一索引确保同一组织/密码项的来源事件不会并发创建重复任务。
+export const securityTasks = sqliteTable('security_tasks', {
+    id: text('id').primaryKey(),
+    organizationId: text('organization_id').notNull().references(() => organizations.id, { onDelete: 'cascade' }),
+    cipherId: text('cipher_id').references(() => ciphers.id, { onDelete: 'cascade' }),
+    type: integer('type').notNull(), // 0 = UpdateAtRiskCredential
+    status: integer('status').notNull().default(0), // 0 = Pending, 1 = Completed
+    revision: integer('revision').notNull().default(1),
+    completedByUserId: text('completed_by_user_id').references(() => users.id, { onDelete: 'set null' }),
+    completedDate: text('completed_date'),
+    creationDate: text('creation_date').notNull(),
+    revisionDate: text('revision_date').notNull(),
+}, (table) => [
+    index('idx_security_tasks_org_status').on(table.organizationId, table.status),
+    index('idx_security_tasks_cipher').on(table.cipherId),
+    uniqueIndex('idx_security_tasks_pending_org_cipher').on(table.organizationId, table.cipherId)
+        .where(sql`${table.status} = 0 AND ${table.cipherId} IS NOT NULL`),
 ]);
 
 // ==================== Notifications ====================
@@ -246,7 +299,11 @@ export const organizations = sqliteTable('organizations', {
     licenseKey: text('license_key'),
     creationDate: text('creation_date').notNull(),
     revisionDate: text('revision_date').notNull(),
-});
+}, (table) => [
+    uniqueIndex('idx_organizations_identifier_lower')
+        .on(sql`lower(${table.identifier})`)
+        .where(sql`${table.identifier} IS NOT NULL`),
+]);
 
 // ==================== Organization Invite Links ====================
 // 对应 Core/AdminConsole/Entities/OrganizationInviteLink.cs
@@ -287,11 +344,102 @@ export const ssoConfigs = sqliteTable('sso_configs', {
     id: text('id').primaryKey(),
     organizationId: text('organization_id').notNull().references(() => organizations.id, { onDelete: 'cascade' }),
     enabled: integer('enabled', { mode: 'boolean' }).notNull().default(false),
+    issuer: text('issuer'),
+    clientId: text('client_id'),
+    clientSecretEnv: text('client_secret_env'),
+    redirectUri: text('redirect_uri'),
+    claimMapping: text('claim_mapping'),
     data: text('data').notNull(),
     creationDate: text('creation_date').notNull(),
     revisionDate: text('revision_date').notNull(),
 }, (table) => [
     uniqueIndex('idx_sso_configs_org_id').on(table.organizationId),
+]);
+
+// ==================== OIDC Login Runtime ====================
+// 外部 IdP state 与下游授权码只保存哈希并且单次消费，避免数据库泄露后可直接重放。
+export const oidcLoginStates = sqliteTable('oidc_login_states', {
+    stateHash: text('state_hash').primaryKey(),
+    organizationId: text('organization_id').notNull().references(() => organizations.id, { onDelete: 'cascade' }),
+    nonce: text('nonce').notNull(),
+    providerPkceVerifier: text('provider_pkce_verifier').notNull(),
+    clientId: text('client_id').notNull(),
+    clientRedirectUri: text('client_redirect_uri').notNull(),
+    clientState: text('client_state'),
+    clientCodeChallenge: text('client_code_challenge').notNull(),
+    creationDate: text('creation_date').notNull(),
+    expirationDate: text('expiration_date').notNull(),
+    consumedDate: text('consumed_date'),
+}, (table) => [
+    index('idx_oidc_login_states_expiration').on(table.expirationDate),
+]);
+
+export const oidcAuthorizationCodes = sqliteTable('oidc_authorization_codes', {
+    codeHash: text('code_hash').primaryKey(),
+    organizationId: text('organization_id').notNull().references(() => organizations.id, { onDelete: 'cascade' }),
+    userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+    clientId: text('client_id').notNull(),
+    redirectUri: text('redirect_uri').notNull(),
+    codeChallenge: text('code_challenge').notNull(),
+    creationDate: text('creation_date').notNull(),
+    expirationDate: text('expiration_date').notNull(),
+    consumedDate: text('consumed_date'),
+}, (table) => [
+    index('idx_oidc_authorization_codes_expiration').on(table.expirationDate),
+]);
+
+export const oidcIdentities = sqliteTable('oidc_identities', {
+    organizationId: text('organization_id').notNull().references(() => organizations.id, { onDelete: 'cascade' }),
+    issuer: text('issuer').notNull(),
+    subject: text('subject').notNull(),
+    userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+    email: text('email').notNull(),
+    creationDate: text('creation_date').notNull(),
+    revisionDate: text('revision_date').notNull(),
+}, (table) => [
+    primaryKey({ columns: [table.organizationId, table.issuer, table.subject] }),
+    uniqueIndex('idx_oidc_identities_org_user').on(table.organizationId, table.userId),
+]);
+
+// ==================== Duo Universal Prompt ====================
+// Duo client secrets are encrypted with a Worker secret before being written to D1.
+// Exactly one of userId/organizationId owns each configuration.
+export const duoConfigs = sqliteTable('duo_configs', {
+    id: text('id').primaryKey(),
+    userId: text('user_id').references(() => users.id, { onDelete: 'cascade' }),
+    organizationId: text('organization_id').references(() => organizations.id, { onDelete: 'cascade' }),
+    clientId: text('client_id').notNull(),
+    host: text('host').notNull(),
+    clientSecretCiphertext: text('client_secret_ciphertext').notNull(),
+    clientSecretIv: text('client_secret_iv').notNull(),
+    clientSecretPrefix: text('client_secret_prefix').notNull(),
+    keyVersion: integer('key_version').notNull().default(1),
+    creationDate: text('creation_date').notNull(),
+    revisionDate: text('revision_date').notNull(),
+}, (table) => [
+    uniqueIndex('idx_duo_configs_user_id').on(table.userId)
+        .where(sql`${table.userId} IS NOT NULL`),
+    uniqueIndex('idx_duo_configs_organization_id').on(table.organizationId)
+        .where(sql`${table.organizationId} IS NOT NULL`),
+]);
+
+// Raw state values are returned to the client. D1 stores only SHA-256 hashes and
+// consumes each record atomically before exchanging the one-time Duo code.
+export const duoLoginStates = sqliteTable('duo_login_states', {
+    stateHash: text('state_hash').primaryKey(),
+    userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+    providerType: integer('provider_type').notNull(),
+    organizationId: text('organization_id').references(() => organizations.id, { onDelete: 'cascade' }),
+    configId: text('config_id').notNull().references(() => duoConfigs.id, { onDelete: 'cascade' }),
+    configRevision: text('config_revision').notNull(),
+    nonce: text('nonce').notNull(),
+    redirectUri: text('redirect_uri').notNull(),
+    creationDate: text('creation_date').notNull(),
+    expirationDate: text('expiration_date').notNull(),
+    consumedDate: text('consumed_date'),
+}, (table) => [
+    index('idx_duo_login_states_user').on(table.userId, table.providerType),
+    index('idx_duo_login_states_expiration').on(table.expirationDate),
 ]);
 
 // ==================== Organization Licenses ====================

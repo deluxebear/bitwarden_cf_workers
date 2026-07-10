@@ -13,7 +13,8 @@ export type VerificationTokenType =
     | 'two_factor'
     | 'send_access'
     | `send_access:${string}`
-    | 'organization_invite';
+    | 'organization_invite'
+    | 'emergency_access_invite';
 
 type EmailEnv = {
     EMAIL?: SendEmail;
@@ -77,6 +78,7 @@ function getEmailMessage(type: VerificationTokenType, data: Record<string, unkno
     const hint = String(data.hint ?? '');
     const organizationName = String(data.organizationName ?? 'your organization');
     const inviteUrl = String(data.inviteUrl ?? '');
+    const grantorName = String(data.grantorName ?? 'A Bitwarden user');
 
     switch (messageType) {
         case 'registration':
@@ -120,6 +122,12 @@ function getEmailMessage(type: VerificationTokenType, data: Record<string, unkno
                 subject: `You have been invited to join ${organizationName} on Bitwarden`,
                 text: `You have been invited to join ${organizationName} on Bitwarden.\n\nAccept the invitation:\n${inviteUrl}`,
                 html: `<p>You have been invited to join ${escapeHtml(organizationName)} on Bitwarden.</p><p><a href="${escapeHtml(inviteUrl)}">Accept invitation</a></p>`,
+            };
+        case 'emergency_access_invite':
+            return {
+                subject: `${grantorName} invited you to be an emergency contact`,
+                text: `${grantorName} invited you to be an emergency contact in Bitwarden.\n\nAccept the invitation:\n${inviteUrl}`,
+                html: `<p>${escapeHtml(grantorName)} invited you to be an emergency contact in Bitwarden.</p><p><a href="${escapeHtml(inviteUrl)}">Accept invitation</a></p>`,
             };
         default:
             throw new BadRequestError('Unsupported email type.');
@@ -370,6 +378,15 @@ export async function sendOrganizationInvite(
         organizationName,
         inviteUrl,
     });
+}
+
+export async function sendEmergencyAccessInvite(
+    env: EmailEnv,
+    email: string,
+    grantorName: string,
+    inviteUrl: string,
+): Promise<void> {
+    await deliverEmail(env, 'emergency_access_invite', email, { grantorName, inviteUrl });
 }
 
 export function buildDevTokenResponse(env: EmailEnv, result: VerificationTokenResult): Record<string, unknown> {

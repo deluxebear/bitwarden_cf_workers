@@ -11,19 +11,23 @@
     "db:migrate:local": "wrangler d1 migrations apply bitwarden-db --local",
     "db:migrate:remote": "wrangler d1 migrations apply bitwarden-db --remote",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "npm run test:unit && npm run test:integration",
+    "test:unit": "vitest run --config vitest.unit.config.ts",
+    "test:integration": "vitest run --config vitest.config.ts"
   },
   "dependencies": {
     "drizzle-orm": "^0.44.0",
     "hono": "^4.7.0",
+    "jose": "^6.2.3",
     "otpauth": "^9.5.0"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.18.4",
     "@cloudflare/workers-types": "^5.20260708.1",
     "@types/node": "^22.13.0",
     "drizzle-kit": "^0.30.0",
     "typescript": "^5.7.0",
-    "vitest": "^3.0.0",
+    "vitest": "^4.1.10",
     "wrangler": "^4.108.0"
   }
 }

@@ -30,8 +30,7 @@ export async function verifyAttachmentDownloadToken(
     if (parts.length !== 2) return null;
 
     const [encodedPayload, signature] = parts;
-    const expectedSignature = await hmacSign(encodedPayload, secret);
-    if (signature !== expectedSignature) return null;
+    if (!await hmacVerify(encodedPayload, signature, secret)) return null;
 
     try {
         const payload = JSON.parse(base64UrlDecode(encodedPayload)) as AttachmentTokenPayload;
@@ -66,6 +65,27 @@ async function hmacSign(data: string, secret: string): Promise<string> {
     return base64UrlEncodeBytes(new Uint8Array(signature));
 }
 
+async function hmacVerify(data: string, encodedSignature: string, secret: string): Promise<boolean> {
+    try {
+        const encoder = new TextEncoder();
+        const key = await crypto.subtle.importKey(
+            'raw',
+            encoder.encode(secret),
+            { name: 'HMAC', hash: 'SHA-256' },
+            false,
+            ['verify'],
+        );
+        return await crypto.subtle.verify(
+            'HMAC',
+            key,
+            base64UrlDecodeBytes(encodedSignature),
+            encoder.encode(data),
+        );
+    } catch {
+        return false;
+    }
+}
+
 function base64UrlEncode(input: string): string {
     return base64UrlEncodeBytes(new TextEncoder().encode(input));
 }
@@ -79,11 +99,15 @@ function base64UrlEncodeBytes(bytes: Uint8Array): string {
 }
 
 function base64UrlDecode(input: string): string {
+    return new TextDecoder().decode(base64UrlDecodeBytes(input));
+}
+
+function base64UrlDecodeBytes(input: string): Uint8Array<ArrayBuffer> {
     const padded = input.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - input.length % 4) % 4);
     const binary = atob(padded);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i += 1) {
         bytes[i] = binary.charCodeAt(i);
     }
-    return new TextDecoder().decode(bytes);
+    return bytes;
 }

@@ -16,6 +16,7 @@ import { BadRequestError, NotFoundError } from '../middleware/error';
 import { batchedInArrayQuery } from '../services/db';
 import { generateUuid } from '../services/crypto';
 import { buildAttachmentDownloadUrl } from '../services/attachment-token';
+import { putObjectThenPersist, removeMetadataThenDeleteObject } from '../services/storage-compensation';
 import type { Bindings, Variables, CipherRequest, CipherResponse, CipherType, CipherRepromptType } from '../types';
 import { pushSyncCipher, pushSyncUser } from '../services/push-notification';
 import { PushType } from '../types/push-notification';
@@ -286,7 +287,7 @@ async function extractFileFromRequest(c: any): Promise<{ file: File; formData: R
  * 将数据库记录转换为 Bitwarden API 响应格式
  * objectType: "cipher" 用于单个 CRUD 端点, "cipherDetails" 用于列表/sync, "cipherMiniDetails" 用于 GET .../admin
  */
-async function toCipherResponse(cipher: any, userId: string, baseUrl: string, secret: string, objectType: 'cipher' | 'cipherDetails' | 'cipherMiniDetails' = 'cipher'): Promise<CipherResponse> {
+export async function toCipherResponse(cipher: any, userId: string, baseUrl: string, secret: string, objectType: 'cipher' | 'cipherDetails' | 'cipherMiniDetails' = 'cipher'): Promise<CipherResponse> {
     const data = JSON.parse(cipher.data || '{}');
     const favorites = cipher.favorites ? JSON.parse(cipher.favorites) : {};
     const folders = cipher.folders ? JSON.parse(cipher.folders) : {};
@@ -606,10 +607,6 @@ const uploadAttachmentHandler = async (c: any) => {
     // 存储在 R2 的 key = {cipherId}/{attachmentId}
     const r2Key = `${cipherId}/${attachmentId}`;
 
-    await c.env.ATTACHMENTS.put(r2Key, file.stream(), {
-        httpMetadata: { contentType: file.type }
-    });
-
     const attachmentsMap = cipher.attachments ? JSON.parse(cipher.attachments) : {};
     attachmentsMap[attachmentId] = {
         fileName: formData.filename || file.name || 'file',
@@ -618,10 +615,16 @@ const uploadAttachmentHandler = async (c: any) => {
     };
 
     const now = new Date().toISOString();
-    await db.update(ciphers).set({
-        attachments: JSON.stringify(attachmentsMap),
-        revisionDate: now
-    }).where(eq(ciphers.id, cipherId));
+    await putObjectThenPersist(
+        c.env.ATTACHMENTS, r2Key, file.stream(),
+        { httpMetadata: { contentType: file.type } },
+        async () => {
+            await db.update(ciphers).set({
+                attachments: JSON.stringify(attachmentsMap),
+                revisionDate: now
+            }).where(eq(ciphers.id, cipherId));
+        },
+    );
 
     await logEvent(c.env.DB, 1103, { userId, cipherId });
 
@@ -716,21 +719,21 @@ ciphersRoute.post('/:id/attachment/:attachmentId', async (c) => {
 
     const { file } = await extractFileFromRequest(c);
 
-    // 上传到 R2
     const r2Key = `${cipherId}/${attachmentId}`;
-    await c.env.ATTACHMENTS.put(r2Key, file.stream(), {
-        httpMetadata: { contentType: file.type }
-    });
-
-    // 更新元数据：标记已验证，更新实际文件大小
     attachmentsMap[attachmentId].size = file.size.toString();
     attachmentsMap[attachmentId].validated = true;
 
     const now = new Date().toISOString();
-    await db.update(ciphers).set({
-        attachments: JSON.stringify(attachmentsMap),
-        revisionDate: now,
-    }).where(eq(ciphers.id, cipherId));
+    await putObjectThenPersist(
+        c.env.ATTACHMENTS, r2Key, file.stream(),
+        { httpMetadata: { contentType: file.type } },
+        async () => {
+            await db.update(ciphers).set({
+                attachments: JSON.stringify(attachmentsMap),
+                revisionDate: now,
+            }).where(eq(ciphers.id, cipherId));
+        },
+    );
 
     await logEvent(c.env.DB, 1103, { userId, cipherId });
 
@@ -808,17 +811,26 @@ const deleteAttachmentHandler = async (c: any) => {
         throw new NotFoundError('Attachment not found.');
     }
 
-    const r2Key = `${cipherId}/${attachmentId}`;
-    await c.env.ATTACHMENTS.delete(r2Key);
-
     delete attachmentsMap[attachmentId];
 
     const now = new Date().toISOString();
     const updatedAttachments = Object.keys(attachmentsMap).length > 0 ? JSON.stringify(attachmentsMap) : null;
-    await db.update(ciphers).set({
-        attachments: updatedAttachments,
-        revisionDate: now
-    }).where(eq(ciphers.id, cipherId));
+    const r2Key = `${cipherId}/${attachmentId}`;
+    await removeMetadataThenDeleteObject(
+        c.env.ATTACHMENTS, r2Key,
+        async () => {
+            await db.update(ciphers).set({
+                attachments: updatedAttachments,
+                revisionDate: now
+            }).where(eq(ciphers.id, cipherId));
+        },
+        async () => {
+            await db.update(ciphers).set({
+                attachments: cipher.attachments,
+                revisionDate: cipher.revisionDate,
+            }).where(eq(ciphers.id, cipherId));
+        },
+    );
 
     await logEvent(c.env.DB, 1104, { userId, cipherId });
 

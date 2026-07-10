@@ -1,9 +1,9 @@
 /**
  * Bitwarden Workers - Organization domains and SSO base routes.
  *
- * SSO runtime is intentionally not enabled here. The route stores disabled
- * configuration data and returns a clear error if a client attempts to enable
- * real SSO before an SSO login runtime exists.
+ * OIDC configuration is validated against provider discovery before it can be
+ * enabled. Client secrets are referenced through Worker secret bindings and
+ * are never persisted in D1 or returned by this API.
  */
 
 import { Hono } from 'hono';
@@ -22,6 +22,7 @@ import { authMiddleware } from '../middleware/auth';
 import { BadRequestError, ConflictError, NotFoundError } from '../middleware/error';
 import { generateSecureRandomString, generateUuid } from '../services/crypto';
 import { logEvent } from '../services/events';
+import { fetchOidcDiscovery, validateOidcIssuer, validateSsoBaseUrl } from '../services/oidc';
 import { PolicyType } from '../services/policy-validators';
 import type { Bindings, Variables } from '../types';
 import { getDeviceTypeFromRequest } from './events';
@@ -44,6 +45,23 @@ interface DnsJsonResponse {
 
 interface OrganizationUserPermissions {
     manageSso?: boolean;
+}
+
+export interface OrganizationOidcConfig {
+    issuer: string | null;
+    clientId: string | null;
+    clientSecretEnv: string | null;
+    redirectUri: string;
+    claimMapping: Record<string, string[]>;
+}
+
+interface ExistingOidcConfig {
+    issuer?: string | null;
+    clientId?: string | null;
+    clientSecretEnv?: string | null;
+    redirectUri?: string | null;
+    claimMapping?: string | null;
+    data?: Record<string, unknown>;
 }
 
 function parsePermissions(permissions: string | null): OrganizationUserPermissions | null {
@@ -209,10 +227,19 @@ function getRequestString(body: Record<string, unknown>, ...keys: string[]): str
 }
 
 function getSsoBaseUrl(c: OrgDomainContext): string {
-    const envValue = (c.env as { SSO_BASE_URL?: string }).SSO_BASE_URL?.trim();
-    if (envValue) return envValue.replace(/\/$/, '');
+    const envValue = c.env.SSO_BASE_URL?.trim();
+    if (envValue) {
+        try {
+            return validateSsoBaseUrl(
+                envValue,
+                c.env.SSO_ALLOW_INSECURE_LOCALHOST?.toLowerCase() === 'true',
+            );
+        } catch (error) {
+            throw new BadRequestError(error instanceof Error ? error.message : 'SSO_BASE_URL is invalid.');
+        }
+    }
     const url = new URL(c.req.url);
-    return url.origin;
+    return validateSsoBaseUrl(url.origin, ['localhost', '127.0.0.1', '::1'].includes(url.hostname));
 }
 
 function buildSsoUrls(c: OrgDomainContext, orgId: string) {
@@ -236,7 +263,6 @@ function defaultSsoData() {
         keyConnectorUrl: null,
         authority: null,
         clientId: null,
-        clientSecret: null,
         metadataAddress: null,
         redirectBehavior: 0,
         getClaimsFromUserInfoEndpoint: false,
@@ -266,14 +292,177 @@ function defaultSsoData() {
     };
 }
 
-function normalizeSsoData(value: unknown): Record<string, unknown> {
+function stripClientSecretFields(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(stripClientSecretFields);
+    if (!value || typeof value !== 'object') return value;
+
+    const sanitized: Record<string, unknown> = {};
+    for (const [key, nestedValue] of Object.entries(value)) {
+        if (key.replace(/[-_]/g, '').toLowerCase() === 'clientsecret') continue;
+        sanitized[key] = stripClientSecretFields(nestedValue);
+    }
+    return sanitized;
+}
+
+export function normalizeSsoData(value: unknown): Record<string, unknown> {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
         return defaultSsoData();
     }
+    const sanitized = stripClientSecretFields(value) as Record<string, unknown>;
     return {
         ...defaultSsoData(),
-        ...(value as Record<string, unknown>),
+        ...sanitized,
     };
+}
+
+function parseClaimMapping(value: unknown): Record<string, string[]> {
+    if (typeof value === 'string') {
+        try {
+            return parseClaimMapping(JSON.parse(value));
+        } catch {
+            throw new BadRequestError('OIDC claimMapping must be valid JSON.');
+        }
+    }
+    if (value == null) return {};
+    if (typeof value !== 'object' || Array.isArray(value)) {
+        throw new BadRequestError('OIDC claimMapping must be an object.');
+    }
+
+    const result: Record<string, string[]> = {};
+    for (const [target, claims] of Object.entries(value)) {
+        if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(target)) {
+            throw new BadRequestError('OIDC claimMapping contains an invalid target name.');
+        }
+        const values = typeof claims === 'string' ? [claims] : claims;
+        if (!Array.isArray(values) || values.length === 0 || values.length > 10) {
+            throw new BadRequestError('Each OIDC claimMapping target must contain between 1 and 10 claims.');
+        }
+        result[target] = values.map((claim) => {
+            if (typeof claim !== 'string' || claim.trim().length === 0 || claim.length > 256 || /[\u0000-\u001f]/.test(claim)) {
+                throw new BadRequestError('OIDC claimMapping contains an invalid claim name.');
+            }
+            return claim.trim();
+        });
+    }
+    return result;
+}
+
+function getNestedSsoData(body: Record<string, unknown>): Record<string, unknown> {
+    const value = body.data ?? body.Data;
+    return value && typeof value === 'object' && !Array.isArray(value)
+        ? value as Record<string, unknown>
+        : {};
+}
+
+function getOptionalString(...values: unknown[]): string | null {
+    for (const value of values) {
+        if (typeof value === 'string' && value.trim().length > 0) return value.trim();
+    }
+    return null;
+}
+
+/** Normalizes the OIDC subset while preserving omitted values from older rows. */
+export function normalizeOrganizationOidcConfig(
+    body: Record<string, unknown>,
+    expectedRedirectUri: string,
+    existing: ExistingOidcConfig = {},
+): OrganizationOidcConfig {
+    const data = getNestedSsoData(body);
+    const plaintextSecret = body.clientSecret ?? body.ClientSecret ?? data.clientSecret ?? data.ClientSecret;
+    if (typeof plaintextSecret === 'string' && plaintextSecret.trim().length > 0) {
+        throw new BadRequestError('OIDC clientSecret must be configured as a Worker secret binding reference.');
+    }
+
+    const issuerInput = getOptionalString(
+        body.issuer,
+        body.Issuer,
+        data.issuer,
+        data.Issuer,
+        data.authority,
+        data.Authority,
+        existing.issuer,
+        existing.data?.issuer,
+        existing.data?.authority,
+    );
+    let issuer: string | null = null;
+    if (issuerInput) {
+        try {
+            issuer = validateOidcIssuer(issuerInput).toString();
+        } catch (error) {
+            throw new BadRequestError(error instanceof Error ? error.message : 'OIDC issuer is invalid.');
+        }
+    }
+
+    const clientId = getOptionalString(
+        body.clientId,
+        body.ClientId,
+        data.clientId,
+        data.ClientId,
+        existing.clientId,
+        existing.data?.clientId,
+    );
+    if (clientId && (clientId.length > 255 || /[\u0000-\u001f]/.test(clientId))) {
+        throw new BadRequestError('OIDC clientId is invalid.');
+    }
+
+    const clientSecretEnv = getOptionalString(
+        body.clientSecretEnv,
+        body.ClientSecretEnv,
+        data.clientSecretEnv,
+        data.ClientSecretEnv,
+        existing.clientSecretEnv,
+        existing.data?.clientSecretEnv,
+    );
+    if (clientSecretEnv && !/^SSO_OIDC_[A-Z0-9_]{1,119}$/.test(clientSecretEnv)) {
+        throw new BadRequestError('OIDC clientSecretEnv must name an SSO_OIDC_* Worker secret binding.');
+    }
+
+    const requestedRedirectUri = getOptionalString(
+        body.redirectUri,
+        body.RedirectUri,
+        data.redirectUri,
+        data.RedirectUri,
+        existing.redirectUri,
+        existing.data?.redirectUri,
+    );
+    if (requestedRedirectUri && requestedRedirectUri !== expectedRedirectUri) {
+        throw new BadRequestError('OIDC redirectUri must match this server callback URL.');
+    }
+
+    const claimMappingInput = body.claimMapping
+        ?? body.ClaimMapping
+        ?? data.claimMapping
+        ?? data.ClaimMapping
+        ?? existing.claimMapping
+        ?? existing.data?.claimMapping;
+
+    return {
+        issuer,
+        clientId,
+        clientSecretEnv,
+        redirectUri: expectedRedirectUri,
+        claimMapping: parseClaimMapping(claimMappingInput),
+    };
+}
+
+export async function validateOrganizationOidcEnable(
+    config: OrganizationOidcConfig,
+    secretLookup: (bindingName: string) => unknown,
+    fetcher: Fetcher = fetch,
+): Promise<void> {
+    if (!config.issuer || !config.clientId || !config.clientSecretEnv) {
+        throw new BadRequestError('Enabled OIDC requires issuer, clientId, and clientSecretEnv.');
+    }
+    const secret = secretLookup(config.clientSecretEnv);
+    if (typeof secret !== 'string' || secret.trim().length === 0) {
+        throw new BadRequestError('The configured OIDC Worker secret binding is missing.');
+    }
+    try {
+        await fetchOidcDiscovery(config.issuer, { fetch: fetcher });
+    } catch (error) {
+        const reason = error instanceof Error ? error.message : 'unknown provider response';
+        throw new BadRequestError(`OIDC discovery validation failed: ${reason}`);
+    }
 }
 
 function parseSsoConfigData(config: SsoConfigRow | undefined): Record<string, unknown> {
@@ -285,15 +474,31 @@ function parseSsoConfigData(config: SsoConfigRow | undefined): Record<string, un
     }
 }
 
+function parseStoredClaimMapping(config: SsoConfigRow | undefined): Record<string, string[]> {
+    if (!config?.claimMapping) return {};
+    try {
+        return parseClaimMapping(config.claimMapping);
+    } catch {
+        return {};
+    }
+}
+
 function toOrganizationSsoResponse(
     c: OrgDomainContext,
     organization: OrganizationRow,
     config?: SsoConfigRow,
 ) {
+    const data = parseSsoConfigData(config);
+    if (config?.issuer) data.authority = config.issuer;
+    if (config?.clientId) data.clientId = config.clientId;
+    if (config?.clientSecretEnv) data.clientSecretEnv = config.clientSecretEnv;
+    if (config?.redirectUri) data.redirectUri = config.redirectUri;
+    if (config?.claimMapping) data.claimMapping = parseStoredClaimMapping(config);
+    data.clientSecretConfigured = Boolean(config?.clientSecretEnv);
     return {
         enabled: config?.enabled ?? false,
         identifier: organization.identifier ?? null,
-        data: parseSsoConfigData(config),
+        data,
         urls: buildSsoUrls(c, organization.id),
         object: 'organizationSso',
     };
@@ -571,24 +776,64 @@ organizationDomainsRoutes.post('/:id/sso', async (c) => {
 
     const body = await c.req.json<Record<string, unknown>>();
     const enabled = body.enabled === true || body.Enabled === true;
-    if (enabled) {
-        throw new BadRequestError('SSO login runtime is not implemented for this Workers deployment. Save SSO configuration with enabled=false.');
-    }
 
-    const identifier = getRequestString(body, 'identifier', 'Identifier');
+    const requestedIdentifier = getRequestString(body, 'identifier', 'Identifier');
+    const identifier = requestedIdentifier ?? organization.identifier;
     if (identifier && identifier.length > 50) {
         throw new BadRequestError('Identifier must be at most 50 characters.');
     }
 
-    const data = normalizeSsoData(body.data ?? body.Data);
     const now = new Date().toISOString();
     const existing = await db.select().from(ssoConfigs)
         .where(eq(ssoConfigs.organizationId, orgId))
         .get();
+    const existingData = parseSsoConfigData(existing);
+    const urls = buildSsoUrls(c, orgId);
+    const oidc = normalizeOrganizationOidcConfig(body, urls.callbackPath, {
+        issuer: existing?.issuer,
+        clientId: existing?.clientId,
+        clientSecretEnv: existing?.clientSecretEnv,
+        redirectUri: existing?.redirectUri,
+        claimMapping: existing?.claimMapping,
+        data: existingData,
+    });
+    if (enabled) {
+        if (!identifier) throw new BadRequestError('Identifier is required when OIDC is enabled.');
+        const requestedData = getNestedSsoData(body);
+        const configType = requestedData.configType ?? existingData.configType ?? 0;
+        if (configType !== 0) {
+            throw new BadRequestError('This Workers deployment currently supports OIDC SSO configuration only.');
+        }
+        const identifierConflict = await db.select({ id: organizations.id }).from(organizations)
+            .where(and(
+                ne(organizations.id, orgId),
+                sql`lower(${organizations.identifier}) = lower(${identifier})`,
+            ))
+            .get();
+        if (identifierConflict) {
+            throw new ConflictError('The organization SSO identifier is already in use.');
+        }
+        await validateOrganizationOidcEnable(
+            oidc,
+            (bindingName) => Reflect.get(c.env, bindingName),
+        );
+    }
+
+    const data = normalizeSsoData(body.data ?? body.Data ?? existingData);
+    data.authority = oidc.issuer;
+    data.clientId = oidc.clientId;
+    data.clientSecretEnv = oidc.clientSecretEnv;
+    data.redirectUri = oidc.redirectUri;
+    data.claimMapping = oidc.claimMapping;
 
     if (existing) {
         await db.update(ssoConfigs).set({
-            enabled: false,
+            enabled,
+            issuer: oidc.issuer,
+            clientId: oidc.clientId,
+            clientSecretEnv: oidc.clientSecretEnv,
+            redirectUri: oidc.redirectUri,
+            claimMapping: JSON.stringify(oidc.claimMapping),
             data: JSON.stringify(data),
             revisionDate: now,
         }).where(eq(ssoConfigs.id, existing.id));
@@ -596,7 +841,12 @@ organizationDomainsRoutes.post('/:id/sso', async (c) => {
         await db.insert(ssoConfigs).values({
             id: generateUuid(),
             organizationId: orgId,
-            enabled: false,
+            enabled,
+            issuer: oidc.issuer,
+            clientId: oidc.clientId,
+            clientSecretEnv: oidc.clientSecretEnv,
+            redirectUri: oidc.redirectUri,
+            claimMapping: JSON.stringify(oidc.claimMapping),
             data: JSON.stringify(data),
             creationDate: now,
             revisionDate: now,

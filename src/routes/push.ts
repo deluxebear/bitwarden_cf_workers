@@ -5,13 +5,14 @@
 
 import { Hono } from 'hono';
 import { drizzle } from 'drizzle-orm/d1';
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, lte } from 'drizzle-orm';
 import { devices, organizationUsers } from '../db/schema';
 import { authMiddleware } from '../middleware/auth';
 import { BadRequestError, NotFoundError } from '../middleware/error';
 import { pushNotification } from '../services/push-notification';
 import { PushType } from '../types/push-notification';
 import type { Bindings, Variables } from '../types';
+import { validateWebPushEndpoint } from '../services/web-push';
 
 const pushRoutes = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
@@ -25,6 +26,9 @@ type PushRegistrationRequest = {
     type?: number;
     identifier?: string;
     organizationIds?: string[];
+    endpoint?: string;
+    p256dh?: string;
+    auth?: string;
 };
 
 type PushDeviceRequest = {
@@ -46,6 +50,7 @@ type PushSendRequest = {
     type?: number;
     payload?: unknown;
     clientType?: number | null;
+    eventId?: string;
 };
 
 type WebPushAuth = {
@@ -150,7 +155,20 @@ pushRoutes.post('/register', async (c) => {
     if (body.userId && body.userId !== userId) {
         throw new BadRequestError('UserId does not match current user.');
     }
-    if (!body.pushToken) throw new BadRequestError('PushToken is required.');
+    if (!body.pushToken && (!body.endpoint || !body.p256dh || !body.auth)) {
+        throw new BadRequestError('PushToken or Web Push subscription is required.');
+    }
+    if ([body.endpoint, body.p256dh, body.auth].some(Boolean)
+        && ![body.endpoint, body.p256dh, body.auth].every(Boolean)) {
+        throw new BadRequestError('Endpoint, p256dh, and auth must be provided together.');
+    }
+    if (body.endpoint) {
+        try {
+            validateWebPushEndpoint(body.endpoint);
+        } catch {
+            throw new BadRequestError('Web Push endpoint must be a valid HTTPS URL without credentials.');
+        }
+    }
 
     const key = body.deviceId || body.id || body.identifier || c.get('jwtPayload')?.device || '';
     const device = await getDeviceForCurrentUser(db, userId, key);
@@ -159,9 +177,13 @@ pushRoutes.post('/register', async (c) => {
     const organizationIds = Array.isArray(body.organizationIds) ? body.organizationIds : auth.organizationIds;
 
     await db.update(devices).set({
-        pushToken: body.pushToken,
+        pushToken: body.pushToken ?? device.pushToken,
         type: body.type ?? device.type,
-        webPushAuth: JSON.stringify({ ...auth, organizationIds }),
+        webPushAuth: JSON.stringify({
+            ...auth,
+            ...(body.endpoint ? { endpoint: body.endpoint, p256dh: body.p256dh, auth: body.auth } : {}),
+            organizationIds,
+        }),
         revisionDate: now,
     }).where(eq(devices.id, device.id));
 
@@ -180,6 +202,7 @@ pushRoutes.post('/delete', async (c) => {
 
     await db.update(devices).set({
         pushToken: null,
+        webPushAuth: null,
         revisionDate: new Date().toISOString(),
     }).where(eq(devices.id, device.id));
 
@@ -214,7 +237,13 @@ pushRoutes.post('/send', async (c) => {
     const userId = c.get('userId');
     const body = await c.req.json().catch(() => ({})) as PushSendRequest;
     const type = body.type ?? PushType.Notification;
+    if (type !== PushType.Notification) throw new BadRequestError('Unsupported push type.');
     const contextId = body.deviceId || body.identifier || c.get('jwtPayload')?.device || null;
+    if (body.eventId !== undefined && (body.eventId.length > 36 ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.eventId))) {
+        throw new BadRequestError('EventId must be a valid UUID.');
+    }
+    const eventId = body.eventId || crypto.randomUUID();
 
     if (body.userId) {
         if (body.userId !== userId) {
@@ -227,12 +256,20 @@ pushRoutes.post('/send', async (c) => {
             type,
             body.payload ?? {},
             contextId,
+            eventId,
         ));
         return c.body(null, 200);
     }
 
     if (body.organizationId) {
-        await assertOrganizationMembership(db, userId, body.organizationId);
+        const administrator = await db.select({ id: organizationUsers.id }).from(organizationUsers)
+            .where(and(
+                eq(organizationUsers.userId, userId),
+                eq(organizationUsers.organizationId, body.organizationId),
+                eq(organizationUsers.status, 2),
+                lte(organizationUsers.type, 1),
+            )).get();
+        if (!administrator) throw new BadRequestError('Organization Owner or Admin permission is required.');
         c.executionCtx.waitUntil(pushNotification(
             c.env,
             'organization',
@@ -240,6 +277,7 @@ pushRoutes.post('/send', async (c) => {
             type,
             body.payload ?? {},
             contextId,
+            eventId,
         ));
         return c.body(null, 200);
     }
@@ -252,7 +290,7 @@ pushRoutes.post('/send', async (c) => {
         .all();
     if (owned.length === 0) throw new NotFoundError('Device not found.');
 
-    c.executionCtx.waitUntil(pushNotification(c.env, 'user', userId, type, body.payload ?? {}, contextId));
+    c.executionCtx.waitUntil(pushNotification(c.env, 'user', userId, type, body.payload ?? {}, contextId, eventId));
     return c.body(null, 200);
 });
 

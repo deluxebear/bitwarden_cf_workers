@@ -6,8 +6,8 @@
 
 import { Hono } from 'hono';
 import { drizzle } from 'drizzle-orm/d1';
-import { eq, and } from 'drizzle-orm';
-import { users, devices, refreshTokens, organizationUsers, sends } from '../db/schema';
+import { eq, and, isNull, sql } from 'drizzle-orm';
+import { users, devices, refreshTokens, organizationUsers, sends, organizations, ssoConfigs, oidcIdentities } from '../db/schema';
 import { signJwt, signJwtClaims } from '../middleware/auth';
 import { generateUuid, generateSecureRandomString, generateRefreshToken, sha256, verifyPassword, verifySendPassword, verifyInviteToken } from '../services/crypto';
 import { verifyAuthenticatorCode } from '../services/totp';
@@ -25,7 +25,7 @@ import {
     sendSendAccessOtp,
     verifyVerificationToken,
 } from '../services/email';
-import { AuthRequestType } from '../types';
+import { AuthRequestType, DeviceType } from '../types';
 import type { Bindings, Variables, KdfType, PreloginRequest, PreloginResponse, RegisterRequest, TokenRequest, TokenResponse } from '../types';
 import type { OrganizationUserRow } from '../db/schema';
 import {
@@ -33,9 +33,45 @@ import {
     getMasterPasswordPolicyForUser,
 } from '../services/policy-requirements';
 import { getDeviceTypeFromRequest } from './events';
+import { isLoginBackoffActive } from '../services/login-security';
+import { getYubicoValidationConfig, parseYubiKeyOtp, verifyYubicoOtp } from '../services/yubikey';
+import {
+    exchangeOidcAuthorizationCode,
+    fetchOidcDiscovery,
+    fetchOidcJwks,
+    generateOidcNonce,
+    generatePkcePair,
+    verifyOidcIdToken,
+} from '../services/oidc';
+import {
+    consumeOidcAuthorizationCode,
+    consumeOidcLoginState,
+    createOidcAuthorizationCode,
+    createOidcLoginState,
+    createSsoPrevalidationToken,
+    hasVerifiedOidcEmailClaim,
+    readMappedStringClaim,
+    validateClientRedirectUri,
+    verifySsoPrevalidationToken,
+} from '../services/oidc-login';
+import {
+    buildDuoRedirectUri,
+    checkDuoHealth,
+    createDuoAuthorizationUrl,
+    exchangeDuoAuthorizationCode,
+} from '../services/duo';
+import {
+    consumeDuoLoginState,
+    createDuoLoginState,
+    getDuoConfigById,
+    getDuoConfigByOwner,
+} from '../services/duo-storage';
+import { canAccessPremium } from '../services/premium';
 
 const identity = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 const SEND_ACCESS_TOKEN_LIFETIME_SECONDS = 15 * 60;
+const OFFICIAL_CLIENT_IDS = new Set(['web', 'browser', 'desktop', 'mobile', 'cli', 'connector']);
+const CLIENT_BOUND_GRANTS = new Set(['password', 'refresh_token', 'authorization_code', 'webauthn']);
 
 type RegisterFinishInvite = {
     organizationUserId?: string;
@@ -135,6 +171,78 @@ function unsupportedSsoResponse(c: any) {
     }, 400);
 }
 
+type RuntimeSsoConfig = {
+    organizationId: string;
+    issuer: string;
+    clientId: string;
+    clientSecretEnv: string;
+    redirectUri: string;
+    claimMapping: Record<string, string[]>;
+};
+
+function oidcError(c: any, error: string, description: string, status = 400) {
+    return c.json({
+        error,
+        error_description: description,
+        ErrorModel: { Message: description, Object: 'error' },
+    }, status);
+}
+
+function parseClaimMapping(value: string | null): Record<string, string[]> {
+    if (!value) return {};
+    try {
+        const parsed = JSON.parse(value) as unknown;
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+        const result: Record<string, string[]> = {};
+        for (const [target, names] of Object.entries(parsed)) {
+            if (Array.isArray(names) && names.every((name) => typeof name === 'string')) {
+                result[target] = names as string[];
+            }
+        }
+        return result;
+    } catch {
+        return {};
+    }
+}
+
+async function getRuntimeSsoConfigByIdentifier(db: D1Db, identifier: string): Promise<RuntimeSsoConfig | null> {
+    const row = await db.select({
+        organizationId: organizations.id,
+        issuer: ssoConfigs.issuer,
+        clientId: ssoConfigs.clientId,
+        clientSecretEnv: ssoConfigs.clientSecretEnv,
+        redirectUri: ssoConfigs.redirectUri,
+        claimMapping: ssoConfigs.claimMapping,
+    }).from(organizations).innerJoin(ssoConfigs, eq(ssoConfigs.organizationId, organizations.id))
+        .where(and(
+            sql`lower(${organizations.identifier}) = ${identifier.toLowerCase()}`,
+            eq(organizations.useSso, true),
+            eq(organizations.enabled, true),
+            eq(ssoConfigs.enabled, true),
+        )).get();
+    if (!row?.issuer || !row.clientId || !row.clientSecretEnv || !row.redirectUri) return null;
+    return { ...row, claimMapping: parseClaimMapping(row.claimMapping) } as RuntimeSsoConfig;
+}
+
+async function getRuntimeSsoConfigByOrganization(db: D1Db, organizationId: string): Promise<RuntimeSsoConfig | null> {
+    const row = await db.select({
+        organizationId: organizations.id,
+        issuer: ssoConfigs.issuer,
+        clientId: ssoConfigs.clientId,
+        clientSecretEnv: ssoConfigs.clientSecretEnv,
+        redirectUri: ssoConfigs.redirectUri,
+        claimMapping: ssoConfigs.claimMapping,
+    }).from(organizations).innerJoin(ssoConfigs, eq(ssoConfigs.organizationId, organizations.id))
+        .where(and(
+            eq(organizations.id, organizationId),
+            eq(organizations.useSso, true),
+            eq(organizations.enabled, true),
+            eq(ssoConfigs.enabled, true),
+        )).get();
+    if (!row?.issuer || !row.clientId || !row.clientSecretEnv || !row.redirectUri) return null;
+    return { ...row, claimMapping: parseClaimMapping(row.claimMapping) } as RuntimeSsoConfig;
+}
+
 /**
  * POST /identity/accounts/prelogin
  * POST /identity/accounts/prelogin/password (新版端点)
@@ -184,17 +292,227 @@ async function handlePrelogin(c: any) {
 identity.post('/accounts/prelogin', handlePrelogin);
 identity.post('/accounts/prelogin/password', handlePrelogin);
 
-/**
- * GET /identity/sso/prevalidate
- * 当前阶段不实现完整 SSO runtime。显式返回 unsupported，避免 Web 客户端进入半成功状态。
- */
-identity.get('/sso/prevalidate', (c) => unsupportedSsoResponse(c));
+/** GET /identity/sso/prevalidate */
+identity.get('/sso/prevalidate', async (c) => {
+    const domainHint = c.req.query('domainHint')?.trim().toLowerCase();
+    if (!domainHint) return oidcError(c, 'invalid_request', 'No domain hint was provided.');
+    const db = drizzle(c.env.DB);
+    const config = await getRuntimeSsoConfigByIdentifier(db, domainHint);
+    if (!config) return oidcError(c, 'invalid_request', 'SSO identifier is invalid or disabled.');
+    const secret = c.env[config.clientSecretEnv];
+    if (typeof secret !== 'string' || !secret.trim()) {
+        return oidcError(c, 'server_error', 'SSO configuration is unavailable.', 503);
+    }
+    const token = await createSsoPrevalidationToken(config.organizationId, c.env.JWT_SECRET);
+    return c.json({ token, object: 'ssoPreValidate' });
+});
 
-/**
- * GET /identity/connect/authorize
- * SSO/OIDC Auth Code + PKCE 入口。完整 IdP runtime 属后续企业能力，当前明确失败。
- */
-identity.get('/connect/authorize', (c) => unsupportedSsoResponse(c));
+/** GET /identity/connect/authorize */
+identity.get('/connect/authorize', async (c) => {
+    const domainHint = c.req.query('domain_hint')?.trim().toLowerCase();
+    const ssoToken = c.req.query('ssoToken') ?? c.req.query('sso_token');
+    const clientId = c.req.query('client_id')?.trim();
+    const redirectUriRaw = c.req.query('redirect_uri');
+    const codeChallenge = c.req.query('code_challenge')?.trim();
+    const challengeMethod = c.req.query('code_challenge_method');
+    if (!domainHint || !ssoToken || !clientId || !redirectUriRaw || !codeChallenge) {
+        return oidcError(c, 'invalid_request', 'Required authorization parameters are missing.');
+    }
+    if (c.req.query('response_type') !== 'code' || challengeMethod !== 'S256' || !/^[A-Za-z0-9_-]{43}$/.test(codeChallenge)) {
+        return oidcError(c, 'invalid_request', 'Authorization code flow with PKCE S256 is required.');
+    }
+    let clientRedirectUri: string;
+    try {
+        clientRedirectUri = validateClientRedirectUri(redirectUriRaw, clientId, c.env.VAULT_BASE_URL);
+    } catch {
+        return oidcError(c, 'invalid_request', 'redirect_uri is invalid.');
+    }
+
+    const db = drizzle(c.env.DB);
+    const config = await getRuntimeSsoConfigByIdentifier(db, domainHint);
+    const tokenOrganizationId = await verifySsoPrevalidationToken(ssoToken, c.env.JWT_SECRET);
+    if (!config || tokenOrganizationId !== config.organizationId) {
+        return oidcError(c, 'access_denied', 'SSO prevalidation token is invalid or expired.');
+    }
+    const secret = c.env[config.clientSecretEnv];
+    if (typeof secret !== 'string' || !secret.trim()) {
+        return oidcError(c, 'server_error', 'SSO configuration is unavailable.', 503);
+    }
+
+    try {
+        const discovery = await fetchOidcDiscovery(config.issuer);
+        const nonce = generateOidcNonce();
+        const providerPkce = await generatePkcePair();
+        const state = await createOidcLoginState(c.env.DB, {
+            organizationId: config.organizationId,
+            nonce,
+            providerPkceVerifier: providerPkce.verifier,
+            clientId,
+            clientRedirectUri,
+            clientState: c.req.query('state') ?? null,
+            clientCodeChallenge: codeChallenge,
+        });
+        const authorizationUrl = new URL(discovery.authorization_endpoint);
+        authorizationUrl.searchParams.set('client_id', config.clientId);
+        authorizationUrl.searchParams.set('response_type', 'code');
+        authorizationUrl.searchParams.set('scope', 'openid email profile');
+        authorizationUrl.searchParams.set('redirect_uri', config.redirectUri);
+        authorizationUrl.searchParams.set('state', state);
+        authorizationUrl.searchParams.set('nonce', nonce);
+        authorizationUrl.searchParams.set('code_challenge', providerPkce.challenge);
+        authorizationUrl.searchParams.set('code_challenge_method', 'S256');
+        return c.redirect(authorizationUrl.toString(), 302);
+    } catch {
+        return oidcError(c, 'server_error', 'Unable to start SSO authentication.', 502);
+    }
+});
+
+function redirectOidcClient(
+    redirectUri: string,
+    params: { code?: string; error?: string; errorDescription?: string; state?: string | null },
+) {
+    const url = new URL(redirectUri);
+    if (params.code) url.searchParams.set('code', params.code);
+    if (params.error) url.searchParams.set('error', params.error);
+    if (params.errorDescription) url.searchParams.set('error_description', params.errorDescription);
+    if (params.state) url.searchParams.set('state', params.state);
+    return url.toString();
+}
+
+async function resolveOidcUser(
+    db: D1Db,
+    d1: D1Database,
+    input: { organizationId: string; issuer: string; subject: string; email: string },
+) {
+    const existingIdentity = await db.select().from(oidcIdentities).where(and(
+        eq(oidcIdentities.organizationId, input.organizationId),
+        eq(oidcIdentities.issuer, input.issuer),
+        eq(oidcIdentities.subject, input.subject),
+    )).get();
+
+    const user = existingIdentity
+        ? await db.select().from(users).where(eq(users.id, existingIdentity.userId)).get()
+        : await db.select().from(users).where(eq(users.email, input.email)).get();
+    if (!user || !user.emailVerified || user.email.toLowerCase() !== input.email) return null;
+
+    const membership = await db.select().from(organizationUsers).where(and(
+        eq(organizationUsers.organizationId, input.organizationId),
+        eq(organizationUsers.email, input.email),
+    )).get();
+    if (!membership || membership.status < 0 || membership.status > 2) return null;
+    if (membership.userId && membership.userId !== user.id) return null;
+
+    if (existingIdentity) {
+        return existingIdentity.userId === user.id ? user : null;
+    }
+
+    const now = new Date().toISOString();
+    await d1.batch([
+        d1.prepare(`
+            INSERT INTO oidc_identities
+                (organization_id, issuer, subject, user_id, email, creation_date, revision_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).bind(input.organizationId, input.issuer, input.subject, user.id, input.email, now, now),
+        d1.prepare(`
+            UPDATE organization_users
+            SET user_id = ?, external_id = ?, status = ?, revision_date = ?
+            WHERE id = ? AND (user_id IS NULL OR user_id = ?)
+        `).bind(user.id, input.subject, membership.status === 0 ? 1 : membership.status, now, membership.id, user.id),
+    ]);
+    return user;
+}
+
+/** IdP callback; also mounted by index.ts at the configured /oidc-signin path. */
+export async function handleOidcCallback(c: any) {
+    let code: string | undefined;
+    let state: string | undefined;
+    let providerError: string | undefined;
+    if (c.req.method === 'POST') {
+        const form = await c.req.parseBody();
+        code = typeof form.code === 'string' ? form.code : undefined;
+        state = typeof form.state === 'string' ? form.state : undefined;
+        providerError = typeof form.error === 'string' ? form.error : undefined;
+    } else {
+        code = c.req.query('code');
+        state = c.req.query('state');
+        providerError = c.req.query('error');
+    }
+    if (!state) return oidcError(c, 'invalid_request', 'OIDC state is required.');
+
+    const loginState = await consumeOidcLoginState(c.env.DB, state);
+    if (!loginState) return oidcError(c, 'invalid_request', 'OIDC state is invalid, expired, or already used.');
+    if (providerError || !code) {
+        return c.redirect(redirectOidcClient(loginState.clientRedirectUri, {
+            error: 'access_denied',
+            errorDescription: 'The identity provider denied authentication.',
+            state: loginState.clientState,
+        }), 302);
+    }
+
+    const db = drizzle(c.env.DB);
+    const config = await getRuntimeSsoConfigByOrganization(db, loginState.organizationId);
+    if (!config) {
+        return c.redirect(redirectOidcClient(loginState.clientRedirectUri, {
+            error: 'server_error', errorDescription: 'SSO configuration is unavailable.', state: loginState.clientState,
+        }), 302);
+    }
+    const clientSecret = c.env[config.clientSecretEnv];
+    if (typeof clientSecret !== 'string' || !clientSecret.trim()) {
+        return c.redirect(redirectOidcClient(loginState.clientRedirectUri, {
+            error: 'server_error', errorDescription: 'SSO configuration is unavailable.', state: loginState.clientState,
+        }), 302);
+    }
+
+    try {
+        const discovery = await fetchOidcDiscovery(config.issuer);
+        const tokenResponse = await exchangeOidcAuthorizationCode(discovery.token_endpoint, {
+            code,
+            clientId: config.clientId,
+            clientSecret,
+            redirectUri: config.redirectUri,
+            codeVerifier: loginState.providerPkceVerifier,
+        });
+        const jwks = await fetchOidcJwks(discovery.jwks_uri);
+        const claims = await verifyOidcIdToken(tokenResponse.id_token, jwks, {
+            issuer: discovery.issuer,
+            audience: config.clientId,
+            nonce: loginState.nonce,
+        });
+        const claimRecord: Record<string, unknown> = { ...claims };
+        const subject = typeof claims.sub === 'string' ? claims.sub : null;
+        const email = readMappedStringClaim(claimRecord, config.claimMapping, 'email', ['email'])?.toLowerCase() ?? null;
+        const emailVerified = hasVerifiedOidcEmailClaim(claimRecord, config.claimMapping);
+        if (!subject || !email || !emailVerified) throw new Error('OIDC identity is missing a verified email.');
+
+        const user = await resolveOidcUser(db, c.env.DB, {
+            organizationId: config.organizationId,
+            issuer: discovery.issuer.replace(/\/$/, ''),
+            subject,
+            email,
+        });
+        if (!user) throw new Error('OIDC identity is not linked to an eligible organization member.');
+
+        const authorizationCode = await createOidcAuthorizationCode(c.env.DB, {
+            organizationId: config.organizationId,
+            userId: user.id,
+            clientId: loginState.clientId,
+            redirectUri: loginState.clientRedirectUri,
+            codeChallenge: loginState.clientCodeChallenge,
+        });
+        return c.redirect(redirectOidcClient(loginState.clientRedirectUri, {
+            code: authorizationCode,
+            state: loginState.clientState,
+        }), 302);
+    } catch {
+        return c.redirect(redirectOidcClient(loginState.clientRedirectUri, {
+            error: 'access_denied',
+            errorDescription: 'SSO authentication could not be completed.',
+            state: loginState.clientState,
+        }), 302);
+    }
+}
+
+identity.on(['GET', 'POST'], '/connect/callback', handleOidcCallback);
 
 /**
  * GET /identity/accounts/webauthn/assertion-options
@@ -481,6 +799,7 @@ type NewDeviceTokenRequest = TokenRequest & {
     newDeviceOtp?: string;
     NewDeviceOtp?: string;
     new_device_otp?: string;
+    deeplinkScheme?: string;
 };
 
 type LoginDeviceInfo = {
@@ -516,7 +835,7 @@ async function upsertLoginDevice(db: any, userId: string, body: object): Promise
     if (!identifier || !name || type === undefined) {
         throw new BadRequestError('deviceIdentifier, deviceType, and deviceName are required.');
     }
-    if (type < 0 || type > 25) {
+    if (type < 0 || type > DeviceType.DuckDuckGoBrowser) {
         throw new BadRequestError('deviceType is invalid.');
     }
 
@@ -633,12 +952,8 @@ identity.post('/connect/token', async (c) => {
     let webAuthnToken: string | undefined;
     let webAuthnDeviceResponse: string | undefined;
 
-    console.log(`[TOKEN] Content-Type: ${contentType}`);
-
     if (contentType.includes('application/x-www-form-urlencoded')) {
         const formData = await c.req.parseBody();
-        console.log(`[TOKEN] Form fields: ${Object.keys(formData).join(', ')}`);
-        console.log(`[TOKEN] grant_type=${formData['grant_type']}, username=${formData['username'] ? '***' : 'MISSING'}, password=${formData['password'] ? '***' : 'MISSING'}`);
         body = {
             grant_type: formData['grant_type'] as any,
             username: formData['username'] as string,
@@ -649,12 +964,16 @@ identity.post('/connect/token', async (c) => {
             deviceIdentifier: (formData['deviceIdentifier'] || formData['DeviceIdentifier']) as string,
             deviceName: (formData['deviceName'] || formData['DeviceName']) as string,
             refresh_token: formData['refresh_token'] as string,
+            code: formData['code'] as string,
+            code_verifier: formData['code_verifier'] as string,
+            redirect_uri: formData['redirect_uri'] as string,
             authRequest: (formData['authRequest'] || formData['AuthRequest']) as string,
             send_id: formData['send_id'] as string,
             password_hash_b64: formData['password_hash_b64'] as string,
             email: formData['email'] as string,
             otp: formData['otp'] as string,
             newDeviceOtp: (formData['newDeviceOtp'] || formData['NewDeviceOtp'] || formData['new_device_otp']) as string,
+            deeplinkScheme: (formData['deeplinkScheme'] || formData['DeeplinkScheme']) as string,
             TwoFactorProvider: formData['TwoFactorProvider'] ? Number(formData['TwoFactorProvider']) : (formData['twoFactorProvider'] ? Number(formData['twoFactorProvider']) : undefined),
             TwoFactorToken: (formData['TwoFactorToken'] || formData['twoFactorToken']) as string,
         } as NewDeviceTokenRequest & SendAccessTokenRequest;
@@ -662,13 +981,14 @@ identity.post('/connect/token', async (c) => {
         webAuthnDeviceResponse = formData['deviceResponse'] as string;
     } else {
         const rawBody = await c.req.json<any>();
-        console.log(`[TOKEN] JSON body keys: ${Object.keys(rawBody).join(', ')}`);
         body = rawBody as NewDeviceTokenRequest & SendAccessTokenRequest;
         webAuthnToken = rawBody.token;
         webAuthnDeviceResponse = rawBody.deviceResponse;
     }
 
-    console.log(`[TOKEN] Parsed grant_type: ${body.grant_type}`);
+    if (CLIENT_BOUND_GRANTS.has(body.grant_type) && !OFFICIAL_CLIENT_IDS.has(body.client_id ?? '')) {
+        return oidcError(c, 'invalid_client', 'client_id is invalid.');
+    }
 
     const db = drizzle(c.env.DB);
 
@@ -681,11 +1001,110 @@ identity.post('/connect/token', async (c) => {
     } else if (body.grant_type === 'send_access') {
         return await handleSendAccessGrant(c, db, body as TokenRequest & SendAccessTokenRequest);
     } else if (body.grant_type === 'authorization_code') {
-        return unsupportedSsoResponse(c);
+        return await handleAuthorizationCodeGrant(c, db, body);
     }
 
     throw new BadRequestError('Unsupported grant_type.');
 });
+
+async function handleAuthorizationCodeGrant(c: any, db: D1Db, body: TokenRequest) {
+    if (!body.code || !body.code_verifier || !body.redirect_uri || !body.client_id) {
+        return oidcError(c, 'invalid_request', 'code, code_verifier, redirect_uri, and client_id are required.');
+    }
+    let redirectUri: string;
+    try {
+        redirectUri = validateClientRedirectUri(body.redirect_uri, body.client_id, c.env.VAULT_BASE_URL);
+    } catch {
+        return oidcError(c, 'invalid_grant', 'Authorization code is invalid.');
+    }
+    const grant = await consumeOidcAuthorizationCode(c.env.DB, {
+        code: body.code,
+        clientId: body.client_id,
+        redirectUri,
+        codeVerifier: body.code_verifier,
+    });
+    if (!grant) return oidcError(c, 'invalid_grant', 'Authorization code is invalid, expired, or already used.');
+
+    const user = await db.select().from(users).where(eq(users.id, grant.userId)).get();
+    const membership = await db.select().from(organizationUsers).where(and(
+        eq(organizationUsers.organizationId, grant.organizationId),
+        eq(organizationUsers.userId, grant.userId),
+    )).get();
+    if (!user || !user.emailVerified || !membership || membership.status < 1 || membership.status > 2) {
+        return oidcError(c, 'invalid_grant', 'SSO organization membership is no longer active.');
+    }
+
+    const loginDevice = await upsertLoginDevice(db, user.id, body);
+    const expiresIn = Number.parseInt(c.env.JWT_EXPIRATION || '3600', 10);
+    const accessToken = await signJwt({
+        sub: user.id,
+        email: user.email,
+        email_verified: true,
+        name: user.name || '',
+        premium: user.premium || String(c.env.GLOBAL_PREMIUM).toLowerCase() === 'true',
+        sstamp: user.securityStamp,
+        device: loginDevice.id,
+        scope: ['api', 'offline_access'],
+        amr: ['sso'],
+    }, c.env.JWT_SECRET, expiresIn);
+    const refreshToken = generateRefreshToken();
+    const refreshExpiresIn = Number.parseInt(c.env.JWT_REFRESH_EXPIRATION || '2592000', 10);
+    await db.insert(refreshTokens).values({
+        id: generateUuid(),
+        userId: user.id,
+        deviceId: loginDevice.id,
+        tokenHash: await sha256(refreshToken),
+        expirationDate: new Date(Date.now() + refreshExpiresIn * 1000).toISOString(),
+        creationDate: new Date().toISOString(),
+    });
+    await logEvent(c.env.DB, 1000, {
+        userId: user.id,
+        organizationId: grant.organizationId,
+        deviceType: loginDevice.type,
+        ipAddress: c.req.header('CF-Connecting-IP') || c.req.header('x-forwarded-for') || null,
+    });
+
+    const response: Record<string, any> = {
+        access_token: accessToken,
+        expires_in: expiresIn,
+        token_type: 'Bearer',
+        refresh_token: refreshToken,
+        Key: user.key,
+        PrivateKey: user.privateKey,
+        AccountKeys: {
+            publicKeyEncryptionKeyPair: {
+                wrappedPrivateKey: user.privateKey || '',
+                publicKey: user.publicKey || '',
+            },
+        },
+        Kdf: user.kdf,
+        KdfIterations: user.kdfIterations,
+        KdfMemory: user.kdfMemory,
+        KdfParallelism: user.kdfParallelism,
+        ResetMasterPassword: false,
+        ForcePasswordReset: user.forcePasswordReset,
+        scope: 'api offline_access',
+        unofficialServer: false,
+        UserDecryptionOptions: {
+            HasMasterPassword: !!user.masterPassword,
+            object: 'userDecryptionOptions',
+        },
+    };
+    if (user.masterPassword && user.key) {
+        response.UserDecryptionOptions.MasterPasswordUnlock = {
+            Kdf: {
+                KdfType: user.kdf,
+                Iterations: user.kdfIterations,
+                Memory: user.kdfMemory ?? null,
+                Parallelism: user.kdfParallelism ?? null,
+            },
+            MasterKeyEncryptedUserKey: user.key,
+            Salt: user.email.toLowerCase(),
+        };
+    }
+    await attachMasterPasswordPolicy(db, user.id, response);
+    return c.json(response);
+}
 
 async function handleSendAccessGrant(
     c: any,
@@ -766,6 +1185,129 @@ async function handleSendAccessGrant(
     });
 }
 
+export type DuoProviderContext = {
+    providerType: 2 | 6;
+    provider: any;
+    organizationId: string | null;
+};
+
+function parseTwoFactorProviders(value: string | null | undefined): Record<number, any> {
+    if (!value) return {};
+    try {
+        const parsed = JSON.parse(value) as unknown;
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+            ? parsed as Record<number, any>
+            : {};
+    } catch {
+        return {};
+    }
+}
+
+async function findOrganizationDuoProvider(db: D1Database, userId: string): Promise<DuoProviderContext | null> {
+    const rows = await db.prepare(`
+        SELECT o.id, o.two_factor_providers
+        FROM organizations o
+        INNER JOIN organization_users ou ON ou.organization_id = o.id
+        WHERE ou.user_id = ? AND ou.status = 2 AND o.enabled = 1 AND o.use_2fa = 1
+        ORDER BY o.id
+    `).bind(userId).all<{ id: string; two_factor_providers: string | null }>();
+    for (const row of rows.results) {
+        const provider = parseTwoFactorProviders(row.two_factor_providers)[6];
+        if (provider?.enabled === true) {
+            return { providerType: 6, provider, organizationId: row.id };
+        }
+    }
+    return null;
+}
+
+function requireDuoEncryptionKey(env: Bindings): string {
+    const key = env.DUO_CONFIG_ENCRYPTION_KEY?.trim();
+    if (!key) throw new Error('Duo configuration encryption key is unavailable.');
+    return key;
+}
+
+function providerConfigId(provider: any): string | null {
+    const value = provider?.metaData?.ConfigId ?? provider?.metaData?.configId;
+    return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+export async function createDuoTwoFactorParams(
+    env: Bindings,
+    user: typeof users.$inferSelect,
+    context: DuoProviderContext,
+    clientName: string | null,
+    deeplinkScheme: string | undefined,
+    healthCheck: typeof checkDuoHealth = checkDuoHealth,
+): Promise<Record<string, string>> {
+    const encryptionKey = requireDuoEncryptionKey(env);
+    const configId = providerConfigId(context.provider);
+    const config = configId
+        ? await getDuoConfigById(env.DB, encryptionKey, configId)
+        : await getDuoConfigByOwner(env.DB, encryptionKey,
+            context.providerType === 2 ? { userId: user.id } : { organizationId: context.organizationId! });
+    if (!config || (context.providerType === 2 && config.userId !== user.id) ||
+        (context.providerType === 6 && config.organizationId !== context.organizationId)) {
+        throw new Error('Duo configuration is unavailable.');
+    }
+    if (!await healthCheck(config)) throw new Error('Duo health check failed.');
+    if (!env.VAULT_BASE_URL) throw new Error('VAULT_BASE_URL is required for Duo.');
+    const redirectUri = buildDuoRedirectUri(env.VAULT_BASE_URL, clientName, deeplinkScheme);
+    const { state, nonce } = await createDuoLoginState(env.DB, {
+        userId: user.id,
+        providerType: context.providerType,
+        organizationId: context.organizationId,
+        configId: config.id,
+        configRevision: config.revisionDate,
+        redirectUri,
+    });
+    return {
+        Host: config.host,
+        AuthUrl: await createDuoAuthorizationUrl(config, {
+            username: user.email,
+            state,
+            nonce,
+            redirectUri,
+        }),
+    };
+}
+
+async function verifyDuoTwoFactorToken(
+    env: Bindings,
+    user: typeof users.$inferSelect,
+    context: DuoProviderContext,
+    token: string,
+): Promise<boolean> {
+    const separator = token.indexOf('|');
+    if (separator <= 0 || separator !== token.lastIndexOf('|')) return false;
+    const code = token.slice(0, separator);
+    const state = token.slice(separator + 1);
+    if (!code || !state) return false;
+
+    const loginState = await consumeDuoLoginState(env.DB, {
+        state,
+        userId: user.id,
+        providerType: context.providerType,
+    });
+    if (!loginState || loginState.organizationId !== context.organizationId) return false;
+    const config = await getDuoConfigById(env.DB, requireDuoEncryptionKey(env), loginState.configId);
+    if (!config || config.revisionDate !== loginState.configRevision ||
+        (context.providerType === 2 && config.userId !== user.id) ||
+        (context.providerType === 6 && config.organizationId !== context.organizationId)) {
+        return false;
+    }
+    try {
+        await exchangeDuoAuthorizationCode(config, {
+            code,
+            username: user.email,
+            nonce: loginState.nonce,
+            redirectUri: loginState.redirectUri,
+        });
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 /**
  * 构建 2FA provider 的元数据，用于 TwoFactorProviders2 响应
  * 对应 TwoFactorAuthenticationValidator.BuildTwoFactorParams
@@ -824,17 +1366,33 @@ async function buildTwoFactorParams(
 /**
  * Password grant - 用户名密码登录
  */
+async function recordFailedLogin(db: any, userId: string): Promise<void> {
+    await db.update(users).set({
+        failedLoginCount: sql`${users.failedLoginCount} + 1`,
+        lastFailedLoginDate: new Date().toISOString(),
+    }).where(eq(users.id, userId));
+}
+
 async function handlePasswordGrant(c: any, db: any, body: NewDeviceTokenRequest) {
     if (!body.username || !body.password) {
         throw new BadRequestError('Username and password are required.');
     }
 
     const email = body.username.toLowerCase().trim();
-    console.log(`[TOKEN] Looking up user: ${email}`);
     const user = await db.select().from(users).where(eq(users.email, email)).get();
-    console.log(`[TOKEN] User found: ${!!user}, hasPassword: ${!!user?.masterPassword}`);
 
     if (!user) {
+        // 与存在用户走相同的常量工作量 hash 比较，降低账号枚举时序差异。
+        await verifyPassword(body.password, 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=');
+        return c.json({
+            error: 'invalid_grant',
+            error_description: 'invalid_username_or_password',
+            ErrorModel: { Message: 'Username or password is incorrect. Try again.', Object: 'error' },
+        }, 400);
+    }
+
+    // 所有密码登录路径（包括 approved AuthRequest）共享账户退避，避免借 AuthRequest 暴力枚举 2FA。
+    if (isLoginBackoffActive(user.failedLoginCount, user.lastFailedLoginDate)) {
         return c.json({
             error: 'invalid_grant',
             error_description: 'invalid_username_or_password',
@@ -845,12 +1403,10 @@ async function handlePasswordGrant(c: any, db: any, body: NewDeviceTokenRequest)
     // Auth Request (设备登录) 流程：password 字段实际上是 access code
     let validatedAuthRequest: any = null;
     if (body.authRequest) {
-        console.log(`[TOKEN] Auth request flow detected: ${body.authRequest}`);
         const authRequest = await db.select().from(authRequests)
             .where(eq(authRequests.id, body.authRequest)).get();
 
         if (!authRequest) {
-            console.log(`[TOKEN] Auth request not found`);
             return c.json({
                 error: 'invalid_grant',
                 error_description: 'invalid_username_or_password',
@@ -867,8 +1423,6 @@ async function handlePasswordGrant(c: any, db: any, body: NewDeviceTokenRequest)
             && authRequest.userId === user.id
             && authRequest.accessCode === body.password;
 
-        console.log(`[TOKEN] Auth request valid: ${!!isValid} (responded=${!!authRequest.responseDate}, approved=${authRequest.approved}, expired=${isExpired}, used=${!!authRequest.authenticationDate}, userMatch=${authRequest.userId === user.id}, codeMatch=${authRequest.accessCode === body.password})`);
-
         if (!isValid) {
             return c.json({
                 error: 'invalid_grant',
@@ -881,12 +1435,8 @@ async function handlePasswordGrant(c: any, db: any, body: NewDeviceTokenRequest)
     } else {
         // 普通密码登录流程
         const passwordValid = await verifyPassword(body.password, user.masterPassword || '');
-        console.log(`[TOKEN] Password valid: ${passwordValid}`);
         if (!passwordValid) {
-            await db.update(users).set({
-                failedLoginCount: user.failedLoginCount + 1,
-                lastFailedLoginDate: new Date().toISOString(),
-            }).where(eq(users.id, user.id));
+            await recordFailedLogin(db, user.id);
 
             return c.json({
                 error: 'invalid_grant',
@@ -896,34 +1446,49 @@ async function handlePasswordGrant(c: any, db: any, body: NewDeviceTokenRequest)
         }
     }
 
-    // 登录成功，重置失败计数
-    await db.update(users).set({
-        failedLoginCount: 0,
-        lastFailedLoginDate: null,
-    }).where(eq(users.id, user.id));
-
     // ================= 检查二步验证 =================
-    let providers: any = {};
-    if (user.twoFactorProviders) {
-        try {
-            providers = JSON.parse(user.twoFactorProviders);
-        } catch { }
+    const providers = parseTwoFactorProviders(user.twoFactorProviders);
+    const premium = await canAccessPremium(c.env.DB, user, c.env.GLOBAL_PREMIUM);
+    const duoContexts = new Map<number, DuoProviderContext>();
+    if (providers[2]?.enabled === true && premium) {
+        duoContexts.set(2, { providerType: 2, provider: providers[2], organizationId: null });
     }
+    const organizationDuo = await findOrganizationDuoProvider(c.env.DB, user.id);
+    if (organizationDuo) duoContexts.set(6, organizationDuo);
 
-    const enabledProviders = Object.keys(providers).filter(k => providers[k].enabled).map(Number);
-    console.log(`[TOKEN] 2FA providers: ${JSON.stringify(providers)}, enabled: ${JSON.stringify(enabledProviders)}`);
+    const enabledProviders = Object.keys(providers)
+        .filter((key) => providers[Number(key)]?.enabled === true)
+        .map(Number)
+        .filter((providerType) => providerType !== 6 && (providerType !== 2 || premium));
+    if (organizationDuo && !enabledProviders.includes(6)) enabledProviders.push(6);
     if (enabledProviders.length > 0) {
         // 支持大小写
         const twoFactorProvider = body.TwoFactorProvider ?? body.twoFactorProvider;
         const twoFactorToken = body.TwoFactorToken ?? body.twoFactorToken;
-        console.log(`[TOKEN] 2FA required but twoFactorProvider=${twoFactorProvider}, twoFactorToken=${twoFactorToken ? '***' : 'MISSING'}`);
 
         if (twoFactorProvider === undefined || !twoFactorToken) {
             // 构建每个 provider 的元数据
             const origin = c.req.header('origin') || c.req.header('referer')?.replace(/\/$/, '') || `https://${c.req.header('host') || 'localhost'}`;
             const providers2: Record<string, any> = {};
-            for (const p of enabledProviders) {
-                providers2[String(p)] = await buildTwoFactorParams(p, providers[p], origin);
+            try {
+                for (const p of enabledProviders) {
+                    const duoContext = duoContexts.get(p);
+                    providers2[String(p)] = duoContext
+                        ? await createDuoTwoFactorParams(
+                            c.env,
+                            user,
+                            duoContext,
+                            c.req.header('Bitwarden-Client-Name') ?? body.client_id ?? null,
+                            body.deeplinkScheme,
+                        )
+                        : await buildTwoFactorParams(p, providers[p], origin);
+                }
+            } catch {
+                return c.json({
+                    error: 'temporarily_unavailable',
+                    error_description: 'Two factor provider is unavailable.',
+                    ErrorModel: { Message: 'Two factor provider is unavailable.', Object: 'error' },
+                }, 503);
             }
 
             const twoFactorResponse: Record<string, any> = {
@@ -932,7 +1497,6 @@ async function handlePasswordGrant(c: any, db: any, body: NewDeviceTokenRequest)
                 TwoFactorProviders: enabledProviders.map(String),
                 TwoFactorProviders2: providers2,
             };
-            console.log(`[TOKEN] Returning 2FA challenge: ${JSON.stringify(twoFactorResponse)}`);
             return c.json(twoFactorResponse, 400);
         }
 
@@ -955,7 +1519,11 @@ async function handlePasswordGrant(c: any, db: any, body: NewDeviceTokenRequest)
                 }).where(eq(users.id, user.id));
             }
         } else if (!enabledProviders.includes(providerType)) {
+            await recordFailedLogin(db, user.id);
             return c.json({ error: 'invalid_grant', error_description: 'invalid_two_factor_provider', ErrorModel: { Message: 'Invalid 2FA provider.', Object: 'error' } }, 400);
+        } else if (providerType === 2 || providerType === 6) { // Duo / Organization Duo
+            const duoContext = duoContexts.get(providerType);
+            isValid = !!duoContext && await verifyDuoTwoFactorToken(c.env, user, duoContext, String(token));
         } else if (providerType === 0) { // Authenticator
             const authProvider = providers[0];
             isValid = verifyAuthenticatorCode(authProvider.metaData.Key, token);
@@ -977,6 +1545,20 @@ async function handlePasswordGrant(c: any, db: any, body: NewDeviceTokenRequest)
                 await db.update(users).set({
                     twoFactorProviders: JSON.stringify(providers),
                 }).where(eq(users.id, user.id));
+            }
+        } else if (providerType === 3) { // YubiKey
+            const parsedOtp = parseYubiKeyOtp(String(token));
+            const yubiProvider = providers[3];
+            const metaData = yubiProvider?.metaData ?? {};
+            const registeredPublicIds = new Set(
+                ['Key1', 'Key2', 'Key3', 'Key4', 'Key5']
+                    .map((key) => typeof metaData[key] === 'string' ? metaData[key].trim().toLowerCase() : '')
+                    .filter(Boolean),
+            );
+            const config = getYubicoValidationConfig(c.env);
+            if (parsedOtp && config && registeredPublicIds.has(parsedOtp.publicId)) {
+                const result = await verifyYubicoOtp(parsedOtp.otp, config, fetch);
+                isValid = result.valid && result.publicId === parsedOtp.publicId;
             }
         } else if (providerType === 7) { // WebAuthn
             try {
@@ -1000,7 +1582,6 @@ async function handlePasswordGrant(c: any, db: any, body: NewDeviceTokenRequest)
                 }
 
                 if (!matchedKey) {
-                    console.log(`[TOKEN] WebAuthn 2FA: no matching credential for id=${credentialId}`);
                     isValid = false;
                 } else {
                     // 验证 clientDataJSON
@@ -1008,7 +1589,6 @@ async function handlePasswordGrant(c: any, db: any, body: NewDeviceTokenRequest)
                     const clientData = JSON.parse(new TextDecoder().decode(clientDataBytes));
 
                     if (clientData.type !== 'webauthn.get') {
-                        console.log(`[TOKEN] WebAuthn 2FA: invalid type ${clientData.type}`);
                         isValid = false;
                     } else {
                         // 验证 authenticatorData rpId hash
@@ -1020,7 +1600,6 @@ async function handlePasswordGrant(c: any, db: any, body: NewDeviceTokenRequest)
                         const rpIdMatch = rpIdHash.length === 32 && rpIdHash.every((b: number, i: number) => b === expectedRpIdHash[i]);
 
                         if (!rpIdMatch) {
-                            console.log(`[TOKEN] WebAuthn 2FA: RP ID mismatch`);
                             isValid = false;
                         } else {
                             // 验证签名
@@ -1035,19 +1614,19 @@ async function handlePasswordGrant(c: any, db: any, body: NewDeviceTokenRequest)
                             const publicKeyBytes = base64UrlToBytes(matchedKey.PublicKey);
                             const { verifySignatureWithCoseKey } = await import('../services/webauthn');
                             isValid = await verifySignatureWithCoseKey(publicKeyBytes, signedData, signatureBytes);
-                            console.log(`[TOKEN] WebAuthn 2FA: signature valid=${isValid}`);
                         }
                     }
                 }
-            } catch (e) {
-                console.log(`[TOKEN] WebAuthn 2FA verification error: ${e}`);
+            } catch {
                 isValid = false;
             }
         } else {
+            await recordFailedLogin(db, user.id);
             return c.json({ error: 'invalid_grant', error_description: 'unsupported_provider', ErrorModel: { Message: 'Unsupported 2FA provider.', Object: 'error' } }, 400);
         }
 
         if (!isValid) {
+            await recordFailedLogin(db, user.id);
             return c.json({
                 error: 'invalid_grant',
                 error_description: 'invalid_totp_code',
@@ -1056,8 +1635,6 @@ async function handlePasswordGrant(c: any, db: any, body: NewDeviceTokenRequest)
         }
     }
     // ================= 2FA 检查完毕 =================
-    console.log(`[TOKEN] 2FA check passed, proceeding to device/token generation`);
-
     const requiresNewDeviceVerification = !validatedAuthRequest &&
         enabledProviders.length === 0 &&
         !await isKnownActiveLoginDevice(db, user.id, body);
@@ -1070,6 +1647,29 @@ async function handlePasswordGrant(c: any, db: any, body: NewDeviceTokenRequest)
 
         await consumeVerificationToken(db, user.email, 'new_device', newDeviceOtp, user.id);
     }
+
+    // Auth Request 必须在签发任何 token 前原子消费，防止并发重放。
+    if (validatedAuthRequest) {
+        const consumed = await db.update(authRequests).set({
+            authenticationDate: new Date().toISOString(),
+        }).where(and(
+            eq(authRequests.id, validatedAuthRequest.id),
+            isNull(authRequests.authenticationDate),
+        ));
+        if (consumed.meta.changes !== 1) {
+            return c.json({
+                error: 'invalid_grant',
+                error_description: 'invalid_username_or_password',
+                ErrorModel: { Message: 'Username or password is incorrect. Try again.', Object: 'error' },
+            }, 400);
+        }
+    }
+
+    // 只有密码、二步验证和新设备验证全部成功后才清零失败计数。
+    await db.update(users).set({
+        failedLoginCount: 0,
+        lastFailedLoginDate: null,
+    }).where(eq(users.id, user.id));
 
     // 处理设备。revisionDate 同时作为 devices 响应中的 lastActivityDate。
     const loginDevice = await upsertLoginDevice(db, user.id, body);
@@ -1101,13 +1701,6 @@ async function handlePasswordGrant(c: any, db: any, body: NewDeviceTokenRequest)
         expirationDate: new Date(Date.now() + refreshExpiresIn * 1000).toISOString(),
         creationDate: new Date().toISOString(),
     });
-
-    // 标记 AuthRequest 已使用，防止重放
-    if (validatedAuthRequest) {
-        await db.update(authRequests).set({
-            authenticationDate: new Date().toISOString(),
-        }).where(eq(authRequests.id, validatedAuthRequest.id));
-    }
 
     // 记录审计日志
     await logEvent(c.env.DB, 1000, {
@@ -1157,8 +1750,6 @@ async function handlePasswordGrant(c: any, db: any, body: NewDeviceTokenRequest)
         };
     }
 
-    console.log(`[TOKEN] Response for user ${user.email}: Kdf=${user.kdf}, KdfIterations=${user.kdfIterations}, HasKey=${!!user.key}, HasMasterPasswordUnlock=${!!response.UserDecryptionOptions.MasterPasswordUnlock}`);
-
     await attachMasterPasswordPolicy(db, user.id, response);
     return c.json(response);
 }
@@ -1190,8 +1781,6 @@ async function handleRefreshTokenGrant(c: any, db: any, body: TokenRequest) {
         return c.json({ error: 'invalid_grant', error_description: 'User not found.' }, 400);
     }
 
-    // 删除旧 refresh token
-    await db.delete(refreshTokens).where(eq(refreshTokens.id, storedToken.id));
     if (storedToken.deviceId) {
         const tokenDevice = await db.select({
             id: devices.id,
@@ -1205,6 +1794,15 @@ async function handleRefreshTokenGrant(c: any, db: any, body: TokenRequest) {
         await db.update(devices).set({
             revisionDate: new Date().toISOString(),
         }).where(eq(devices.id, tokenDevice.id));
+    }
+
+    // 原子消费旧 refresh token；并发 rotation 只能有一个请求成功。
+    const consumed = await db.delete(refreshTokens).where(and(
+        eq(refreshTokens.id, storedToken.id),
+        eq(refreshTokens.tokenHash, tokenHash),
+    ));
+    if (consumed.meta.changes !== 1) {
+        return c.json({ error: 'invalid_grant', error_description: 'Invalid refresh token.' }, 400);
     }
 
     // 新的 access token

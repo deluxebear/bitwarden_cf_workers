@@ -6,6 +6,7 @@
 
 // Cloudflare Workers 环境绑定
 export type Bindings = {
+    [key: string]: unknown;
     DB: D1Database;
     JWT_SECRET: string;
     JWT_EXPIRATION: string;
@@ -13,6 +14,14 @@ export type Bindings = {
     ATTACHMENTS: R2Bucket;
     ICONS_CACHE: KVNamespace;
     NOTIFICATION_HUB: DurableObjectNamespace;
+    CF_VERSION_METADATA?: WorkerVersionMetadata;
+    WORKER_VERSION?: string;
+    /** 深度健康检查的 Bearer token；未配置时该端点不可用。 */
+    HEALTH_CHECK_TOKEN?: string;
+    WEB_PUSH_VAPID_PUBLIC_KEY?: string;
+    WEB_PUSH_VAPID_PRIVATE_KEY?: string;
+    WEB_PUSH_VAPID_SUBJECT?: string;
+    WEB_PUSH_QUEUE?: Queue<import('../services/push-notification').WebPushQueueMessage>;
     EMAIL?: SendEmail;
     GLOBAL_PREMIUM?: string;
     /**
@@ -26,6 +35,13 @@ export type Bindings = {
      * 未设置时邀请链接使用占位符，需管理员自行替换。
      */
     VAULT_BASE_URL?: string;
+    /**
+     * OIDC/SAML 对外回调地址的基础 URL，例如 https://vault.example.com。
+     * 未设置时使用当前请求的 origin。
+     */
+    SSO_BASE_URL?: string;
+    /** 仅本地开发：允许 SSO_BASE_URL 使用 http://localhost。 */
+    SSO_ALLOW_INSECURE_LOCALHOST?: string;
     /**
      * 可选：设为 "true" 时，邀请链接一律走「注册」流程（finish-signup），被邀请人需设置主密钥。
      * 适用于：被邀请邮箱尚未注册、或希望被邀请人用邀请链接重新设置密码的场景。
@@ -90,6 +106,22 @@ export type Bindings = {
      * 兼容开关：设为 "true" 时等价于 TWO_FACTOR_EMAIL_DELIVERY=console。
      */
     TWO_FACTOR_EMAIL_DEBUG?: string;
+    /**
+     * Yubico OTP Validation Protocol 凭据。只有三项配置均有效时，
+     * 用户才可以启用或更新 YubiKey 二步验证。
+     */
+    YUBICO_CLIENT_ID?: string;
+    YUBICO_SECRET?: string;
+    /**
+     * 可选的 Yubico OTP 验证端点；必须是公网 HTTPS 地址。
+     * 未设置时使用 Yubico 官方验证端点。
+     */
+    YUBICO_VALIDATION_URL?: string;
+    /**
+     * Base64/base64url encoded 32-byte AES key used only to encrypt Duo client
+     * secrets at rest in D1. Configure it as a Wrangler secret.
+     */
+    DUO_CONFIG_ENCRYPTION_KEY?: string;
     /**
      * Notification Center 内部 /send 入口的 Bearer token。
      * 未配置时 /send 返回 404，避免公开暴露通知投递入口。
@@ -181,6 +213,7 @@ export enum DeviceType {
     WindowsCLI = 23,
     MacOsCLI = 24,
     LinuxCLI = 25,
+    DuckDuckGoBrowser = 26,
 }
 
 // GrantType - OAuth2 grant types Bitwarden 使用的

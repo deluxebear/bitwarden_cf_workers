@@ -65,7 +65,7 @@ export async function verifyJwt(
 
         // 验证签名
         const expectedSignature = await hmacSign(data, secret);
-        if (signature !== expectedSignature) return null;
+        if (!constantTimeEqual(signature, expectedSignature)) return null;
 
         // 解码 payload
         const payload: JwtPayload = JSON.parse(base64UrlDecode(encodedPayload));
@@ -121,7 +121,7 @@ export const authMiddleware: MiddlewareHandler<{
     c.set('jwtPayload', payload);
 
     const requestId = c.get('requestId') || 'unknown';
-    console.log(`[AUTH ${requestId}] User: ${payload.email} (${payload.sub})`);
+    console.log(`[AUTH ${requestId}] Authenticated`);
 
     await next();
 };
@@ -139,6 +139,17 @@ async function hmacSign(data: string, secret: string): Promise<string> {
     );
     const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(data));
     return base64UrlEncodeBytes(new Uint8Array(signature));
+}
+
+function constantTimeEqual(left: string, right: string): boolean {
+    const leftBytes = new TextEncoder().encode(left);
+    const rightBytes = new TextEncoder().encode(right);
+    const length = Math.max(leftBytes.length, rightBytes.length);
+    let difference = leftBytes.length ^ rightBytes.length;
+    for (let index = 0; index < length; index += 1) {
+        difference |= (leftBytes[index] ?? 0) ^ (rightBytes[index] ?? 0);
+    }
+    return difference === 0;
 }
 
 /** Base64URL 编码字符串（UTF-8 安全，避免 btoa 对非 Latin1 字符报错） */
