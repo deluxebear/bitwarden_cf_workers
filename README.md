@@ -4,7 +4,7 @@
 
 > Bitwarden Server API 的 Cloudflare Workers 实现，完全兼容官方 Bitwarden 客户端（Web、桌面、浏览器扩展、移动端）。
 >
-> 零服务器、零运维，基于 Cloudflare 免费套餐即可运行个人/家庭密码管理器。
+> 零服务器、零运维。当前默认配置使用 Workers Paid（最低 $5 USD/月），并可在各产品包含额度内运行个人/家庭密码管理器。
 >
 > 所有密码库数据由客户端端到端加密后存储于 [Cloudflare D1](https://developers.cloudflare.com/d1/)——服务端只保存密文，即使数据库泄露也无法还原明文。D1 自身还提供 AES-256-GCM 静态加密（encryption at rest）和 TLS 传输加密，密钥由 Cloudflare 基础设施托管，无需额外配置。D1 每小时自动创建备份，支持还原到 30 天内的任意时间点——即使误操作清空了全部数据，也可以通过 Cloudflare Dashboard 或 `wrangler d1 time-travel` 一键回滚恢复。
 
@@ -52,13 +52,47 @@
 
 ---
 
+## Cloudflare 使用与费用
+
+本项目使用多个 Cloudflare Developer Platform 产品。以下内容按 **2026-07-10** 的官方价格说明整理；Cloudflare 可能调整套餐、额度和价格，部署前请以链接中的官方文档为准。
+
+### 当前默认配置
+
+当前仓库的生产部署应使用 **Workers Paid**：
+
+- `wrangler.toml` 中的 `NotificationHub` 使用 `new_classes`，即 KV 存储后端的 Durable Object。该后端仅支持 Workers Paid；Workers Free 只支持 SQLite 存储后端的 Durable Objects。
+- GitHub Actions 在未设置 `EMAIL_MODE` 时默认使用 `cloudflare`。通过 Cloudflare Email Service 向任意收件人发送邮件要求 Workers Paid。
+- Workers Paid 当前最低账户费用为 **$5 USD/月**。D1、KV、Durable Objects、Queues、日志等产品包含一定用量，超出后可能按量收费。
+
+如果是**从未部署过 Durable Object 的全新环境**，可以把首次迁移设计为 `new_sqlite_classes` 并禁用 Cloudflare Email Sending，从而尝试在 Workers Free 的限额内运行。已经部署的 `new_classes` 不能通过修改历史迁移直接切换存储后端，应新建类并迁移，或在确认可以丢失通知状态后重建。
+
+### 使用的产品
+
+| Cloudflare 产品 | 本项目用途 | 当前套餐与费用说明 |
+|-----------------|------------|--------------------|
+| Workers + Static Assets | API、Web Vault、Cron 入口 | 当前使用 Paid；静态资源请求免费且不限量，动态 Worker 请求和 CPU 使用量计入 Workers 套餐 |
+| D1 | 用户、密码库密文、组织及认证数据 | Paid 每月包含 250 亿行读取、5,000 万行写入和 5 GB 存储；超额按量收费，无数据传出费用 |
+| R2 Standard | 附件和 Send 文件 | 每月免费额度为 10 GB-month、100 万次 Class A、1,000 万次 Class B；超额按量收费，公网传出免费 |
+| Workers KV | 网站图标缓存 | Paid 每月包含 1,000 万次读取、100 万次写入/删除、1 GB 存储；超额按量收费 |
+| Durable Objects | SignalR 兼容 WebSocket 通知 Hub | 当前 KV 后端要求 Paid；Paid 每月包含 100 万请求和 400,000 GB-s，超额按量收费 |
+| Queues | Web Push 持久化重试和死信队列 | 需要主队列和 DLQ；Paid 每月包含 100 万次操作，超额 $0.40/百万次操作 |
+| Cron Triggers | 清理过期 Send、Cipher 和 Refresh Token | 调用计入 Workers 请求与 CPU 用量，不需要单独服务器 |
+| Workers Logs / Traces | 请求日志、错误和链路追踪 | Paid 包含日志/追踪事件额度；当前日志采样率为 100%，Trace 采样率为 10%，高流量部署应按需降低 |
+| Email Service | 邀请、验证码和安全通知邮件 | 任意收件人发送要求 Paid；每月包含 3,000 封，之后 $0.35/1,000 封。设置 `EMAIL_MODE=disabled` 可完全禁用 |
+
+官方价格文档：[Workers](https://developers.cloudflare.com/workers/platform/pricing/)、[D1](https://developers.cloudflare.com/d1/platform/pricing/)、[R2](https://developers.cloudflare.com/r2/pricing/)、[Email Service](https://developers.cloudflare.com/email-service/platform/pricing/)。
+
+建议在 Cloudflare Dashboard 中为 Workers、D1、R2、KV、Queues 和 Email 设置用量监控。Workers Paid 超出包含额度后可能产生额外费用；Workers Free 则通常在达到产品限额后拒绝后续操作。
+
+---
+
 ## 快速开始
 
 ### 前置条件
 
 - Node.js >= 22（Wrangler 4.x 要求）
 - npm
-- [Cloudflare 账户](https://dash.cloudflare.com/sign-up)（免费即可）
+- [Cloudflare 账户](https://dash.cloudflare.com/sign-up)；当前默认配置需要 Workers Paid
 
 ### 本地开发
 
@@ -121,6 +155,10 @@ npx wrangler r2 bucket create <your-attachments-bucket-name>
 # KV namespace，用于 Icons 缓存
 npx wrangler kv namespace create ICONS_CACHE
 npx wrangler kv namespace create ICONS_CACHE --preview
+
+# Web Push 主队列和死信队列（名称必须与 wrangler.toml 一致）
+npx wrangler queues create bitwarden-web-push-dlq-dev
+npx wrangler queues create bitwarden-web-push-dev
 ```
 
 记录以下值，但不要写入 `wrangler.toml`：
@@ -133,6 +171,8 @@ npx wrangler kv namespace create ICONS_CACHE --preview
 | R2 bucket 名 | `ATTACHMENTS_BUCKET_NAME` |
 | KV production ID | `ICONS_CACHE_ID` |
 | KV preview ID | `ICONS_CACHE_PREVIEW_ID` |
+| Web Push 主队列 | `bitwarden-web-push-dev` |
+| Web Push 死信队列 | `bitwarden-web-push-dlq-dev` |
 
 ### 生产密钥
 
@@ -262,6 +302,7 @@ Cloudflare API Token 至少需要这些权限：
 | 帐户 | D1 | 编辑 |
 | 帐户 | Workers KV 存储 | 编辑 |
 | 帐户 | Workers R2 存储 | 编辑 |
+| 帐户 | Workers Queues | 编辑 |
 | 帐户 | Workers 脚本 | 编辑 |
 | 帐户 | 帐户设置 | 读取 |
 | 用户 | 成员资格 | 读取 |

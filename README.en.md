@@ -4,7 +4,7 @@
 
 > A Cloudflare Workers implementation of the Bitwarden Server API, fully compatible with all official Bitwarden clients (Web Vault, Desktop, Browser Extension, Mobile).
 >
-> Zero servers, zero ops — run your own personal/family password manager on Cloudflare's free tier.
+> Zero servers, zero ops. The default configuration uses Workers Paid (minimum $5 USD/month) and is suitable for a personal or family password manager within the included usage allowances.
 >
 > All vault data is end-to-end encrypted by the client before being stored in [Cloudflare D1](https://developers.cloudflare.com/d1/) — the server only holds ciphertext, so even a full database leak cannot reveal your plaintext secrets. D1 itself provides AES-256-GCM encryption at rest and TLS encryption in transit, with keys managed by Cloudflare infrastructure — no extra configuration needed. D1 also creates automatic backups every hour, with point-in-time restore up to 30 days — even if you accidentally wipe all data, you can roll back instantly via the Cloudflare Dashboard or `wrangler d1 time-travel`.
 
@@ -52,13 +52,47 @@
 
 ---
 
+## Cloudflare Usage and Costs
+
+This project uses several Cloudflare Developer Platform products. The information below reflects Cloudflare's published pricing on **2026-07-10**. Plans, allowances, and prices may change, so check the linked official documentation before deploying.
+
+### Default configuration
+
+The repository's current production configuration requires **Workers Paid**:
+
+- `NotificationHub` is declared with `new_classes`, which creates a KV-backed Durable Object. This backend is available only on Workers Paid; Workers Free supports SQLite-backed Durable Objects only.
+- GitHub Actions defaults to `EMAIL_MODE=cloudflare` when the secret is unset. Sending email to arbitrary recipients through Cloudflare Email Service requires Workers Paid.
+- Workers Paid currently has a **$5 USD/month** minimum account charge. D1, KV, Durable Objects, Queues, and logs include usage allowances, with usage-based charges beyond them.
+
+For a **brand-new environment that has never deployed the Durable Object**, you can design the first migration with `new_sqlite_classes` and disable Cloudflare Email Sending to try running within Workers Free limits. Do not rewrite an already-applied `new_classes` migration to change its storage backend; migrate to a new class or rebuild only if losing notification state is acceptable.
+
+### Products used
+
+| Cloudflare product | Purpose | Current plan and cost notes |
+|--------------------|---------|-----------------------------|
+| Workers + Static Assets | API, Web Vault, and Cron entry point | Current setup uses Paid; static asset requests are free and unlimited, while dynamic requests and CPU count toward Workers usage |
+| D1 | Users, encrypted vault records, organizations, and authentication data | Paid includes 25 billion rows read, 50 million rows written, and 5 GB storage per month; overages are billed, with no data egress fees |
+| R2 Standard | Attachments and Send files | Monthly free tier: 10 GB-month, 1 million Class A operations, and 10 million Class B operations; overages are billed and Internet egress is free |
+| Workers KV | Website icon cache | Paid includes 10 million reads, 1 million writes/deletes, and 1 GB storage per month; overages are billed |
+| Durable Objects | SignalR-compatible WebSocket notification hub | The current KV backend requires Paid; Paid includes 1 million requests and 400,000 GB-s per month, then usage-based charges |
+| Queues | Durable Web Push retries and dead-letter handling | Requires a primary queue and DLQ; Paid includes 1 million operations per month, then $0.40 per million operations |
+| Cron Triggers | Expired Send, Cipher, and refresh-token cleanup | Counts toward Workers requests and CPU usage; no separate server is required |
+| Workers Logs / Traces | Request logs, errors, and tracing | Paid includes event allowances; the current configuration samples 100% of logs and 10% of traces, so high-traffic deployments should tune sampling |
+| Email Service | Invitations, verification codes, and security notices | Arbitrary recipients require Paid; 3,000 messages/month are included, then $0.35 per 1,000. Set `EMAIL_MODE=disabled` to disable sending |
+
+Official pricing: [Workers](https://developers.cloudflare.com/workers/platform/pricing/), [D1](https://developers.cloudflare.com/d1/platform/pricing/), [R2](https://developers.cloudflare.com/r2/pricing/), and [Email Service](https://developers.cloudflare.com/email-service/platform/pricing/).
+
+Configure usage monitoring for Workers, D1, R2, KV, Queues, and Email in the Cloudflare Dashboard. Workers Paid can incur overage charges; Workers Free generally rejects additional operations after a product limit is reached.
+
+---
+
 ## Quick Start
 
 ### Prerequisites
 
 - Node.js >= 22 (required by Wrangler 4.x)
 - npm
-- [Cloudflare account](https://dash.cloudflare.com/sign-up) (free tier is sufficient)
+- [Cloudflare account](https://dash.cloudflare.com/sign-up); the default configuration requires Workers Paid
 
 ### Local Development
 
@@ -93,6 +127,10 @@ npx wrangler r2 bucket create bitwarden-attachments
 # KV (Icons cache)
 npx wrangler kv namespace create ICONS_CACHE
 npx wrangler kv namespace create ICONS_CACHE --preview
+
+# Web Push primary queue and dead-letter queue (names must match wrangler.toml)
+npx wrangler queues create bitwarden-web-push-dlq-dev
+npx wrangler queues create bitwarden-web-push-dev
 ```
 
 #### 2. Update `wrangler.toml`
@@ -147,6 +185,8 @@ npx wrangler d1 create bitwarden-db
 npx wrangler r2 bucket create bitwarden-attachments
 npx wrangler kv namespace create ICONS_CACHE
 npx wrangler kv namespace create ICONS_CACHE --preview
+npx wrangler queues create bitwarden-web-push-dlq-dev
+npx wrangler queues create bitwarden-web-push-dev
 ```
 
 Note down the D1 `database_id`, KV `id`, and `preview_id` from the output.
@@ -160,6 +200,7 @@ Go to [Cloudflare Dashboard > API Tokens](https://dash.cloudflare.com/profile/ap
 | Account | D1 | Edit |
 | Account | Workers KV Storage | Edit |
 | Account | Workers R2 Storage | Edit |
+| Account | Workers Queues | Edit |
 | Account | Workers Scripts | Edit |
 | Account | Account Settings | Read |
 | User | Memberships | Read |
@@ -272,6 +313,7 @@ Cost optimization tips:
 | `ATTACHMENTS` | R2 | Attachment file storage |
 | `ICONS_CACHE` | KV | Icons cache (shared across users) |
 | `NOTIFICATION_HUB` | Durable Object | Real-time WebSocket push |
+| `WEB_PUSH_QUEUE` | Queue | Durable Web Push delivery, retries, and dead-letter handling |
 
 ---
 
