@@ -1420,10 +1420,6 @@ ciphersRoute.post('/import-organization', async (c) => {
             toInsert.push({ collectionId, cipherId });
         }
     }
-    console.log('[import-org] collections from request:', JSON.stringify(collectionsList.map((c, i) => ({ index: i, id: c.id, hasId: !!c.id }))));
-    console.log('[import-org] orgCollectionIds:', JSON.stringify([...orgCollectionIds]));
-    console.log('[import-org] newCollectionRows count:', newCollectionRows.length, 'total collections:', collectionsList.length);
-    console.log('[import-org] cipherIdMap size:', cipherIdMap.size, 'toInsert size:', toInsert.length);
     // D1 绑定变量上限约 100，每行 2 列，每批最多 50 条
     const COLLECTION_CIPHER_BATCH = 50;
     for (let i = 0; i < toInsert.length; i += COLLECTION_CIPHER_BATCH) {

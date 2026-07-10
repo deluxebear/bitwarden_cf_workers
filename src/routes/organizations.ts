@@ -1841,7 +1841,6 @@ orgs.post('/:id/users/reinvite', async (c) => {
         try {
             const link = await buildInviteLinkForOrgUser(c, db, orgId, target);
             await sendOrganizationInvite(c.env, target.email, orgName, link);
-            console.log(`[REINVITE] ${target.email} -> ${link}`);
             results.push({ id: orgUserId, error: null });
         } catch (error) {
             const message = error instanceof Error ? error.message : 'Failed to send invitation email.';
@@ -2501,7 +2500,6 @@ orgs.post('/:id/users/invite', async (c) => {
         const link = `${vaultBase}#/accept-organization?${params.toString()}`;
         inviteLinks.push({ email: targetEmail, link });
         await sendOrganizationInvite(c.env, targetEmail, orgName, link);
-        console.log(`[INVITE] ${targetEmail} -> ${link}`);
     }
 
     return c.json({ inviteLinks });
@@ -3085,7 +3083,6 @@ orgs.post('/:id/users/:orgUserId/reinvite', async (c) => {
     const link = await buildInviteLinkForOrgUser(c, db, orgId, targetOrgUser);
     const org = await db.select().from(organizations).where(eq(organizations.id, orgId)).get();
     await sendOrganizationInvite(c.env, targetOrgUser.email, org?.name || 'Organization', link);
-    console.log(`[REINVITE] ${targetOrgUser.email} -> ${link}`);
     return c.json({ email: targetOrgUser.email, link }, 200);
 });
 
