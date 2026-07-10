@@ -10,6 +10,7 @@ export default defineConfig({
             miniflare: {
                 bindings: {
                     TEST_MIGRATIONS: await readD1Migrations('./drizzle'),
+                    JWT_SECRET: 'integration-jwt-signing-secret',
                     SSO_OIDC_RUNTIME_SECRET: 'runtime-oidc-test-secret',
                     VAULT_BASE_URL: 'https://vault.example.com',
                     DUO_CONFIG_ENCRYPTION_KEY: 'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=',
