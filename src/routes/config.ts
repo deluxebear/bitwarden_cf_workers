@@ -60,8 +60,6 @@ config.get('/', async (c) => {
             'cxp-export-mobile': serverCapabilities.featureStates.credentialExchangeExportMobile,
             'cxp-import-mobile': serverCapabilities.featureStates.credentialExchangeImportMobile,
             'cipher-key-encryption': serverCapabilities.featureStates.cipherKeyEncryption,
-            // iOS SDK 使用 camelCase 键；与 PC 键同时声明以保持跨客户端一致。
-            enableCipherKeyEncryption: serverCapabilities.featureStates.cipherKeyEncryption,
             'pm-18021-force-update-kdf-settings': false, // Force KDF updates (keep off)
             'pm-20558-migrate-myvault-to-myitems': serverCapabilities.featureStates.migrateMyVaultToMyItems,
             'pm-23995-no-logout-on-kdf-change': serverCapabilities.featureStates.noLogoutOnKdfChange,
