@@ -34,6 +34,14 @@ function toJsonBool(v: unknown, defaultWhenNull = false): boolean {
     return defaultWhenNull;
 }
 
+/** Normalize legacy SQLite timestamps so strict mobile ISO-8601 decoders accept them. */
+export function toApiDate(value: string | null): string | null {
+    if (value == null || value.includes('T')) return value;
+    const normalized = value.replace(' ', 'T');
+    const date = new Date(normalized);
+    return Number.isNaN(date.getTime()) ? value : date.toISOString();
+}
+
 function getBaseUrl(c: any): string {
     const url = new URL(c.req.url);
     const proto = c.req.header('x-forwarded-proto') || url.protocol.replace(':', '');
@@ -454,7 +462,7 @@ sync.get('/', async (c) => {
                     type: p.type,
                     data,
                     enabled: p.enabled,
-                    revisionDate: p.revisionDate,
+                    revisionDate: toApiDate(p.revisionDate),
                     object: 'policy',
                 };
             });
