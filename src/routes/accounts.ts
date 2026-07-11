@@ -26,6 +26,7 @@ import {
 import type { Bindings, Variables, ProfileResponse, AccountKeysResponse } from '../types';
 import { pushLogOut, pushSyncUser } from '../services/push-notification';
 import { PushType } from '../types/push-notification';
+import { serverCapabilities } from '../services/server-capabilities';
 
 const accounts = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
@@ -242,7 +243,7 @@ accounts.get('/profile', async (c) => {
             enabled: d.org.enabled,
             useTotp: d.org.useTotp ?? true,
             use2fa: true,
-            useApi: true,
+            useApi: serverCapabilities.organization.api,
             useSso: false,
             useKeyConnector: false,
             useScim: false,

@@ -31,6 +31,7 @@ import { generateUuid, generateSecureRandomString, createInviteToken, verifyInvi
 import { sendOrganizationInvite } from '../services/email';
 import { toOrganizationResponse, toOrganizationSubscriptionResponse, toOrganizationUserResponse } from '../models/organization-responses';
 import type { Bindings, Variables } from '../types';
+import { serverCapabilities } from '../services/server-capabilities';
 import { batchedInArrayQuery, D1_BATCH_SIZE } from '../services/db';
 import { pushLogOut, pushNotification, pushSyncUser, pushSyncOrganizationStatus } from '../services/push-notification';
 import { PushType } from '../types/push-notification';
@@ -561,21 +562,21 @@ function buildOrgDefaults(planType: number) {
     return {
         usePolicies: true,
         useSso: isEnterprise,
-        useKeyConnector: isEnterprise,
-        useScim: isEnterprise,
+        useKeyConnector: isEnterprise && serverCapabilities.organization.keyConnector,
+        useScim: isEnterprise && serverCapabilities.organization.scim,
         useGroups: isEnterprise || isTeams,
-        useDirectory: isEnterprise || isTeams,
+        useDirectory: (isEnterprise || isTeams) && serverCapabilities.organization.directory,
         useEvents: isPaid,
         useTotp: true,
         use2fa: isPaid,
-        useApi: isPaid,
+        useApi: isPaid && serverCapabilities.organization.api,
         useResetPassword: isEnterprise,
         useSecretsManager: false,
         selfHost: true,
         usersGetPremium: isPaid || isFamilies,
         useCustomPermissions: isEnterprise,
         usePasswordManager: true,
-        useRiskInsights: isEnterprise,
+        useRiskInsights: isEnterprise && serverCapabilities.organization.riskInsights,
         useOrganizationDomains: isEnterprise,
         useAdminSponsoredFamilies: isEnterprise,
         useAutomaticUserConfirmation: false,
