@@ -47,7 +47,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: "22"
+          node-version: "24"
           cache: "npm"
           cache-dependency-path: |
             ${{ env.WORKERS_DIR }}/package-lock.json
@@ -62,7 +62,7 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ${{ env.CLIENTS_DIR }}/apps/web/build
-          key: web-vault-v1-${{ runner.os }}-node22-${{ steps.clients-revision.outputs.sha }}
+          key: web-vault-v1-${{ runner.os }}-node24-${{ steps.clients-revision.outputs.sha }}
 
       - name: Install Clients dependencies
         if: steps.web-vault-cache.outputs.cache-hit != 'true'
@@ -94,7 +94,7 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: ${{ env.CLIENTS_DIR }}/apps/web/build
-          key: web-vault-v1-${{ runner.os }}-node22-${{ steps.clients-revision.outputs.sha }}
+          key: web-vault-v1-${{ runner.os }}-node24-${{ steps.clients-revision.outputs.sha }}
 
       - name: Validate required deployment secrets
         run: |
